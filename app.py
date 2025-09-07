@@ -21,7 +21,7 @@ logging.basicConfig(level=logging.INFO)
 
 try:
     client = MongoClient(os.environ.get("MONGODB_URI"))
-    # --- FIX: Explicitly select the database ---
+    # --- FIX: Correct database name used as per your instruction ---
     db = client['party247'] 
     parties_collection: Collection = db.parties
     parties_collection.create_index("originalUrl", unique=True)

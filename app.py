@@ -13,7 +13,7 @@ from bson.objectid import ObjectId
 import requests
 from bs4 import BeautifulSoup
 
-# --- Initial Setup ---
+# --- App setup ---
 load_dotenv()
 app = Flask(__name__)
 CORS(app)
@@ -41,88 +41,93 @@ def normalize_url(raw: str) -> str:
     query = urlencode(cleaned_qs, doseq=True)
     return urlunparse((scheme, netloc, path, "", query, ""))
 
-# --- MongoDB connection and index hygiene ---
+# --- Mongo helpers ---
+def ensure_index(coll: Collection, keys, name: str, **kwargs):
+    """Create index if missing or mismatched. Drops by name on mismatch."""
+    info = coll.index_information()
+    if name in info:
+        meta = info[name]
+        same_keys = meta.get("key") == list(keys)
+        same_unique = bool(meta.get("unique", False)) == bool(kwargs.get("unique", False))
+        same_pfe = meta.get("partialFilterExpression") == kwargs.get("partialFilterExpression")
+        if same_keys and same_unique and same_pfe:
+            return
+        try:
+            coll.drop_index(name)
+        except Exception as e:
+            app.logger.warning(f"Drop index {name} failed: {e}")
+    coll.create_index(list(keys), name=name, **kwargs)
+
+def drop_conflicting_unique_on_field(coll: Collection, field: str, keep_name: str = ""):
+    """Drop any unique index on (field,1) except keep_name."""
+    for name, meta in coll.index_information().items():
+        if name == keep_name:
+            continue
+        if meta.get("unique") and meta.get("key") == [(field, 1)]:
+            try:
+                coll.drop_index(name)
+                app.logger.info(f"Dropped legacy unique index on {field}: {name}")
+            except Exception as e:
+                app.logger.warning(f"Could not drop index {name} on {field}: {e}")
+
+# --- Mongo connection + index hygiene ---
 try:
     client = MongoClient(os.environ.get("MONGODB_URI"))
     db = client["party247"]
     parties_collection: Collection = db.parties
 
-    idx_info = parties_collection.index_information()
-
-    # Drop legacy unique index on originalUrl if present
-    for name, meta in idx_info.items():
-        if meta.get("key") == [("originalUrl", 1)] and meta.get("unique"):
-            parties_collection.drop_index(name)
-            app.logger.info("Dropped legacy unique index on originalUrl")
-
-    # Drop legacy unique index on goOutUrl if present (it causes dup on null)
-    idx_info = parties_collection.index_information()
-    for name, meta in idx_info.items():
-        if meta.get("key") == [("goOutUrl", 1)] and meta.get("unique"):
-            parties_collection.drop_index(name)
-            app.logger.info("Dropped legacy unique index on goOutUrl")
-
-    # Make goOutUrl unique only when a non-empty string exists
-    try:
-        parties_collection.create_index(
-            [("goOutUrl", 1)],
-            name="unique_goOutUrl_nonempty",
-            unique=True,
-            partialFilterExpression={
-                "$and": [
-                    {"goOutUrl": {"$type": "string"}},
-                    {"goOutUrl": {"$ne": ""}}
-                ]
-            },
-        )
-    except Exception as e:
-        app.logger.warning(f"Could not ensure partial unique index on goOutUrl: {e}")
-
-    # Our canonical dedupe key
-    parties_collection.create_index(
-        [("canonicalUrl", 1)],
-        name="unique_canonicalUrl",
-        unique=True,
-        partialFilterExpression={"canonicalUrl": {"$type": "string"}}
-    )
-
-    # Sort helper
-    parties_collection.create_index([("date", 1)], name="date_asc")
-
-    # Data hygiene: unset null/empty goOutUrl to avoid future dup conflicts
+    # Clean bad values before creating partial unique indexes
     try:
         parties_collection.update_many(
             {"$or": [{"goOutUrl": None}, {"goOutUrl": ""}]},
             {"$unset": {"goOutUrl": ""}}
         )
     except Exception as e:
-        app.logger.warning(f"Cleanup goOutUrl null/empty failed: {e}")
+        app.logger.warning(f"goOutUrl cleanup failed: {e}")
 
-    # Backfill canonicalUrl where missing
-    try:
-        cursor = parties_collection.find(
-            {"canonicalUrl": {"$exists": False}, "originalUrl": {"$type": "string"}},
-            {"_id": 1, "originalUrl": 1},
-            no_cursor_timeout=True,
-        )
-        for doc in cursor:
+    # Drop any legacy unique index on originalUrl
+    for name, meta in parties_collection.index_information().items():
+        if meta.get("unique") and meta.get("key") == [("originalUrl", 1)]:
             try:
-                parties_collection.update_one(
-                    {"_id": doc["_id"]},
-                    {"$set": {"canonicalUrl": normalize_url(doc.get("originalUrl", ""))}}
-                )
-            except Exception as inner:
-                app.logger.warning(f"Backfill failed for {doc.get('_id')}: {inner}")
-        cursor.close()
-    except Exception as e:
-        app.logger.warning(f"Backfill pass skipped: {e}")
+                parties_collection.drop_index(name)
+                app.logger.info("Dropped legacy unique index on originalUrl")
+            except Exception as e:
+                app.logger.warning(f"Drop originalUrl index failed: {e}")
+
+    # Ensure canonicalUrl unique index. Match existing spec if present.
+    # Use PFE with $exists + $type to avoid future spec conflicts.
+    ensure_index(
+        parties_collection,
+        [("canonicalUrl", 1)],
+        name="unique_canonicalUrl",
+        unique=True,
+        partialFilterExpression={"canonicalUrl": {"$exists": True, "$type": "string"}}
+    )
+
+    # Remove any old unique index on goOutUrl, then create partial unique version
+    drop_conflicting_unique_on_field(parties_collection, "goOutUrl", keep_name="unique_goOutUrl_nonempty")
+    ensure_index(
+        parties_collection,
+        [("goOutUrl", 1)],
+        name="unique_goOutUrl_nonempty",
+        unique=True,
+        partialFilterExpression={
+            "$and": [
+                {"goOutUrl": {"$exists": True, "$type": "string"}},
+                {"goOutUrl": {"$ne": ""}}
+            ]
+        },
+    )
+
+    # Helper index for date sorting
+    ensure_index(parties_collection, [("date", 1)], name="date_asc")
 
     app.logger.info("Connected to MongoDB and ensured indexes.")
 except Exception as e:
     app.logger.error(f"Error connecting to MongoDB Atlas: {e}")
     raise
 
-# --- Security Decorator ---
+# --- Security ---
 def protect(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -132,7 +137,7 @@ def protect(f):
         return jsonify({"message": "Forbidden: Invalid or missing admin key."}), 403
     return decorated_function
 
-# --- Classification Helpers ---
+# --- Classification helpers ---
 def get_region(location: str) -> str:
     south_keywords = ["באר שבע", "אילת", "אשדוד", "אשקלון", "דרום"]
     north_keywords = ["חיפה", "טבריה", "צפון", "קריות", "כרמיאל", "עכו"]
@@ -199,58 +204,38 @@ def get_tags(text: str, location: str) -> list:
 
 # --- Scraper ---
 def scrape_party_details(url: str):
-    app.logger.info(f"[SCRAPER_LOG] --- Starting scrape for URL: {url} ---")
+    app.logger.info(f"[SCRAPER] start {url}")
     try:
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/91.0.4472.124 Safari/537.36"
-            )
-        }
+        headers = {"User-Agent": "Mozilla/5.0"}
         response = requests.get(url, headers=headers, timeout=15)
-        app.logger.info(f"[SCRAPER_LOG] HTTP Response Status: {response.status_code}")
+        app.logger.info(f"[SCRAPER] status {response.status_code}")
         response.raise_for_status()
 
         soup = BeautifulSoup(response.text, "html.parser")
-
-        app.logger.info("[SCRAPER_LOG] Searching for '__NEXT_DATA__' script tag...")
         script_tag = soup.find("script", {"id": "__NEXT_DATA__"})
         if not script_tag:
-            app.logger.error("[SCRAPER_ERROR] Could not find '__NEXT_DATA__' script tag.")
             raise ValueError("Could not find party data script (__NEXT_DATA__).")
-        app.logger.info("[SCRAPER_LOG] Found '__NEXT_DATA__'.")
 
-        app.logger.info("[SCRAPER_LOG] Parsing JSON data...")
         json_data = json.loads(script_tag.string)
-        app.logger.info("[SCRAPER_LOG] JSON parsed successfully.")
-
         event_data = json_data.get("props", {}).get("pageProps", {}).get("event")
         if not event_data:
-            app.logger.error("[SCRAPER_ERROR] 'event' object not found in JSON.")
             raise ValueError("Event data not in expected format inside JSON.")
-        app.logger.info("[SCRAPER_LOG] Found 'event' object.")
 
-        # Image extraction logic
         image_path = ""
         if event_data.get("CoverImage") and event_data["CoverImage"].get("Url"):
             image_path = event_data["CoverImage"]["Url"]
         elif event_data.get("WhatsappImage") and event_data["WhatsappImage"].get("Url"):
             image_path = event_data["WhatsappImage"]["Url"]
 
-        app.logger.info(f"[SCRAPER_LOG] Initial image path: {image_path if image_path else 'None'}")
-
         if image_path:
             cover_image_path = image_path.replace("_whatsappImage.jpg", "_coverImage.jpg")
             image_url = f"https://d15q6k8l9pfut7.cloudfront.net/{cover_image_path}"
         else:
-            app.logger.warning("[SCRAPER_LOG] Fallback to og:image meta.")
             og_image_tag = soup.find("meta", {"property": "og:image"})
             og_image_url = og_image_tag["content"] if og_image_tag else ""
             if og_image_url:
                 image_url = og_image_url.replace("_whatsappImage.jpg", "_coverImage.jpg")
             else:
-                app.logger.error("[SCRAPER_ERROR] Could not find image URL.")
                 raise ValueError("Could not find party image URL.")
 
         description = event_data.get("Description", "")
@@ -274,24 +259,22 @@ def scrape_party_details(url: str):
             "tags": get_tags(full_text, location),
             "originalUrl": url,
             "canonicalUrl": normalize_url(url),
-            # store normalized goOutUrl to avoid nulls and align with any legacy code
             "goOutUrl": normalize_url(url),
         }
 
         if not all([party_details["name"], party_details["date"], party_details["location"]]):
-            app.logger.error("[SCRAPER_ERROR] Missing name/date/location.")
             raise ValueError("Scraped data is missing critical fields.")
 
         return party_details
 
     except requests.exceptions.RequestException as e:
-        app.logger.error(f"[SCRAPER_ERROR] HTTP Request failed: {e}")
+        app.logger.error(f"[SCRAPER] HTTP error: {e}")
         raise
     except Exception as e:
-        app.logger.error(f"[SCRAPER_ERROR] Unexpected scraping error: {e}")
+        app.logger.error(f"[SCRAPER] error: {e}")
         raise
 
-# --- API Routes ---
+# --- Routes ---
 @app.route("/api/admin/add-party", methods=["POST"])
 @protect
 def add_party():
@@ -304,7 +287,6 @@ def add_party():
         party_data = scrape_party_details(url)
         canonical = party_data["canonicalUrl"]
 
-        # Idempotent insert using either canonicalUrl or legacy goOutUrl
         res = parties_collection.update_one(
             {"$or": [{"canonicalUrl": canonical}, {"goOutUrl": canonical}]},
             {"$setOnInsert": party_data},
@@ -312,24 +294,20 @@ def add_party():
         )
 
         if res.matched_count == 1 and res.upserted_id is None:
-            existing = parties_collection.find_one(
+            doc = parties_collection.find_one(
                 {"$or": [{"canonicalUrl": canonical}, {"goOutUrl": canonical}]},
                 {"_id": 1}
             )
-            return jsonify({
-                "message": "This party has already been added.",
-                "id": str(existing["_id"])
-            }), 409
+            return jsonify({"message": "This party has already been added.", "id": str(doc["_id"])}), 409
 
         party_data["_id"] = str(res.upserted_id)
-        app.logger.info(f"[DB_LOG] Inserted party with ID: {party_data['_id']}")
         return jsonify({"message": "Party added successfully!", "party": party_data}), 201
 
     except errors.DuplicateKeyError as e:
-        app.logger.warning(f"[DB_ERROR] DuplicateKeyError: {getattr(e, 'details', None)}")
+        app.logger.warning(f"[DB] DuplicateKeyError: {getattr(e, 'details', None)}")
         return jsonify({"message": "This party has already been added."}), 409
     except Exception as e:
-        app.logger.error(f"[DB_ERROR] {str(e)}")
+        app.logger.error(f"[DB] {str(e)}")
         return jsonify({"message": f"An error occurred: {str(e)}"}), 500
 
 @app.route("/api/admin/delete-party/<party_id>", methods=["DELETE"])
@@ -347,11 +325,11 @@ def delete_party(party_id):
 @app.route("/api/parties", methods=["GET"])
 def get_parties():
     try:
-        all_parties = []
+        items = []
         for party in parties_collection.find().sort("date", 1):
             party["_id"] = str(party["_id"])
-            all_parties.append(party)
-        return jsonify(all_parties), 200
+            items.append(party)
+        return jsonify(items), 200
     except Exception as e:
         return jsonify({"message": "Error fetching parties", "error": str(e)}), 500
 

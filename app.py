@@ -27,11 +27,13 @@ def normalize_url(raw: str) -> str:
     p = urlparse((raw or "").strip())
     scheme = (p.scheme or "https").lower()
     netloc = p.netloc.lower()
+    # strip default ports
     if netloc.endswith(":80") and scheme == "http":
         netloc = netloc[:-3]
     if netloc.endswith(":443") and scheme == "https":
         netloc = netloc[:-4]
     path = p.path.rstrip("/") or "/"
+    # drop tracking params
     cleaned_qs = []
     for k, v in parse_qsl(p.query, keep_blank_values=True):
         kl = k.lower()
@@ -41,9 +43,13 @@ def normalize_url(raw: str) -> str:
     query = urlencode(cleaned_qs, doseq=True)
     return urlunparse((scheme, netloc, path, "", query, ""))
 
+def normalized_or_none_for_dedupe(raw: str) -> str | None:
+    n = normalize_url(raw)
+    # require a host to be considered valid
+    return n if urlparse(n).netloc else None
+
 # --- Mongo helpers ---
 def ensure_index(coll: Collection, keys, name: str, **kwargs):
-    """Create index if missing or mismatched. Drops by name on mismatch."""
     info = coll.index_information()
     if name in info:
         meta = info[name]
@@ -58,25 +64,13 @@ def ensure_index(coll: Collection, keys, name: str, **kwargs):
             app.logger.warning(f"Drop index {name} failed: {e}")
     coll.create_index(list(keys), name=name, **kwargs)
 
-def drop_conflicting_unique_on_field(coll: Collection, field: str, keep_name: str = ""):
-    """Drop any unique index on (field,1) except keep_name."""
-    for name, meta in coll.index_information().items():
-        if name == keep_name:
-            continue
-        if meta.get("unique") and meta.get("key") == [(field, 1)]:
-            try:
-                coll.drop_index(name)
-                app.logger.info(f"Dropped legacy unique index on {field}: {name}")
-            except Exception as e:
-                app.logger.warning(f"Could not drop index {name} on {field}: {e}")
-
 # --- Mongo connection + index hygiene ---
 try:
     client = MongoClient(os.environ.get("MONGODB_URI"))
     db = client["party247"]
     parties_collection: Collection = db.parties
 
-    # Clean bad values before creating partial unique indexes
+    # Cleanup bad goOutUrl values before enforcing unique indexes
     try:
         parties_collection.update_many(
             {"$or": [{"goOutUrl": None}, {"goOutUrl": ""}]},
@@ -86,16 +80,24 @@ try:
         app.logger.warning(f"goOutUrl cleanup failed: {e}")
 
     # Drop any legacy unique index on originalUrl
-    for name, meta in parties_collection.index_information().items():
-        if meta.get("unique") and meta.get("key") == [("originalUrl", 1)]:
-            try:
+    try:
+        for name, meta in parties_collection.index_information().items():
+            if meta.get("unique") and meta.get("key") == [("originalUrl", 1)]:
                 parties_collection.drop_index(name)
-                app.logger.info("Dropped legacy unique index on originalUrl")
-            except Exception as e:
-                app.logger.warning(f"Drop originalUrl index failed: {e}")
+                app.logger.info(f"Dropped legacy unique index on originalUrl: {name}")
+    except Exception as e:
+        app.logger.warning(f"Drop originalUrl index failed: {e}")
 
-    # Ensure canonicalUrl unique index. Match existing spec if present.
-    # Use PFE with $exists + $type to avoid future spec conflicts.
+    # Drop any legacy indexes on goOutUrl (including ones with unsupported partial specs)
+    try:
+        for name, meta in parties_collection.index_information().items():
+            if meta.get("key") == [("goOutUrl", 1)]:
+                parties_collection.drop_index(name)
+                app.logger.info(f"Dropped legacy index on goOutUrl: {name}")
+    except Exception as e:
+        app.logger.warning(f"Drop goOutUrl index failed: {e}")
+
+    # Ensure canonicalUrl unique partial index (allow only when field exists and is string)
     ensure_index(
         parties_collection,
         [("canonicalUrl", 1)],
@@ -104,19 +106,13 @@ try:
         partialFilterExpression={"canonicalUrl": {"$exists": True, "$type": "string"}}
     )
 
-    # Remove any old unique index on goOutUrl, then create partial unique version
-    drop_conflicting_unique_on_field(parties_collection, "goOutUrl", keep_name="unique_goOutUrl_nonempty")
+    # Ensure goOutUrl unique partial index WITHOUT $ne (avoid unsupported $not in partial index)
     ensure_index(
         parties_collection,
         [("goOutUrl", 1)],
-        name="unique_goOutUrl_nonempty",
+        name="unique_goOutUrl",
         unique=True,
-        partialFilterExpression={
-            "$and": [
-                {"goOutUrl": {"$exists": True, "$type": "string"}},
-                {"goOutUrl": {"$ne": ""}}
-            ]
-        },
+        partialFilterExpression={"goOutUrl": {"$exists": True, "$type": "string"}}
     )
 
     # Helper index for date sorting
@@ -246,6 +242,9 @@ def scrape_party_details(url: str):
         full_text = f"{event_data.get('Title', '')} {description}"
         location = event_data.get("Adress", "")
 
+        canonical = normalize_url(url)
+        go_out = normalized_or_none_for_dedupe(url)
+
         party_details = {
             "name": event_data.get("Title"),
             "imageUrl": image_url,
@@ -258,9 +257,10 @@ def scrape_party_details(url: str):
             "age": get_age(full_text, event_data.get("MinimumAge", 0)),
             "tags": get_tags(full_text, location),
             "originalUrl": url,
-            "canonicalUrl": normalize_url(url),
-            "goOutUrl": normalize_url(url),
+            "canonicalUrl": canonical,
         }
+        if go_out:
+            party_details["goOutUrl"] = go_out
 
         if not all([party_details["name"], party_details["date"], party_details["location"]]):
             raise ValueError("Scraped data is missing critical fields.")

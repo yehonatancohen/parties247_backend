@@ -1,0 +1,6 @@
+Flask
+pymongo
+playwright
+python-dotenv
+Flask-Cors
+gunicorn

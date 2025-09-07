@@ -1,5 +1,5 @@
 import os
-import asyncio
+import json
 from functools import wraps
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
@@ -7,30 +7,26 @@ from flask_cors import CORS
 from pymongo import MongoClient, errors
 from pymongo.collection import Collection
 from bson.objectid import ObjectId
-from playwright.async_api import async_playwright
+import requests
+from bs4 import BeautifulSoup
 
 # --- Initial Setup ---
-load_dotenv() # Load environment variables from .env file
+load_dotenv()
 
 app = Flask(__name__)
-# Allow requests from your frontend (adjust origin in production if needed)
 CORS(app) 
 
-# --- Database Connection ---
 try:
     client = MongoClient(os.environ.get("MONGODB_URI"))
-    db = client.get_default_database() # The DB name is usually in the URI
+    db = client.get_default_database()
     parties_collection: Collection = db.parties
-    # Create a unique index to prevent duplicate party URLs
-    parties_collection.create_index("goOutUrl", unique=True)
+    parties_collection.create_index("originalUrl", unique=True)
     print("Successfully connected to MongoDB Atlas!")
 except Exception as e:
     print(f"Error connecting to MongoDB Atlas: {e}")
     exit()
 
-
 # --- Security Decorator ---
-# This function checks for the admin secret key in the request headers
 def protect(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -41,26 +37,128 @@ def protect(f):
             return jsonify({"message": "Forbidden: Invalid or missing admin key."}), 403
     return decorated_function
 
+# --- Classification Helpers (Ported from your JS code) ---
 
-# --- Web Scraping Logic (Async) ---
-async def scrape_party_data(url: str):
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
-        page = await browser.new_page()
-        await page.goto(url, wait_until='networkidle')
+def get_region(location: str) -> str:
+    south_keywords = ['באר שבע', 'אילת', 'אשדוד', 'אשקלון', 'דרום']
+    north_keywords = ['חיפה', 'טבריה', 'צפון', 'קריות', 'כרמיאל', 'עכו']
+    center_keywords = ['תל אביב', 'ירושלים', 'ראשון לציון', 'הרצליה', 'נתניה', 'מרכז', 'י-ם', 'tlv']
+    
+    loc = location.lower()
+    if any(k in loc for k in south_keywords): return 'דרום'
+    if any(k in loc for k in north_keywords): return 'צפון'
+    if any(k in loc for k in center_keywords): return 'מרכז'
+    return 'לא ידוע'
 
-        # --- IMPORTANT: You must inspect go-out.co.il to find the correct selectors ---
-        party_data = await page.evaluate('''() => {
-            // These are EXAMPLE selectors. You need to replace them with the real ones.
-            const title = document.querySelector('h1.event-title')?.innerText;
-            const imageUrl = document.querySelector('.event-banner img')?.src;
-            const date = document.querySelector('.event-date-time-class')?.innerText;
-            const location = document.querySelector('.event-location-class')?.innerText;
-            return { title, imageUrl, date, location };
-        }''')
+def get_music_type(text: str) -> str:
+    techno_keywords = ['טכנו', 'techno', 'after', 'אפטר', 'house', 'האוס', 'electronic', 'אלקטרונית']
+    trance_keywords = ['טראנס', 'trance', 'פסיי', 'psy-trance', 'psytrance']
+    mainstream_keywords = ['מיינסטרים', 'mainstream', 'היפ הופ', 'hip hop', 'רגאטון', 'reggaeton', 'pop', 'פופ']
+    
+    txt = text.lower()
+    if any(k in txt for k in techno_keywords): return 'טכנו'
+    if any(k in txt for k in trance_keywords): return 'טראנס'
+    if any(k in txt for k in mainstream_keywords): return 'מיינסטרים'
+    return 'אחר'
+
+def get_event_type(text: str) -> str:
+    festival_keywords = ['פסטיבל', 'festival']
+    nature_keywords = ['טבע', 'nature', 'יער', 'forest', 'חוף', 'beach', 'open air', 'בחוץ']
+    club_keywords = ['מועדון', 'club', 'גגרין', 'בלוק', 'האומן 17', 'gagarin', 'block', 'haoman 17', 'rooftop', 'גג']
+
+    txt = text.lower()
+    if any(k in txt for k in festival_keywords): return 'פסטיבל'
+    if any(k in txt for k in nature_keywords): return 'מסיבת טבע'
+    if any(k in txt for k in club_keywords): return 'מסיבת מועדון'
+    return 'אחר'
+
+def get_age(text: str, minimum_age: int) -> str:
+    if minimum_age >= 21: return '21+'
+    if minimum_age >= 18: return '18+'
+    if 'נוער' in text.lower(): return 'נוער'
+    if minimum_age > 0: return '18+'
+    return 'כל הגילאים'
+
+def get_tags(text: str, location: str) -> list:
+    tags = []
+    tag_map = {
+        'אלכוהול חופשי': ['אלכוהול חופשי', 'free alcohol', 'בר חופשי', 'free bar'],
+        'בחוץ': ['open air', 'בחוץ', 'טבע', 'חוף', 'יער', 'rooftop', 'גג'],
+        'אילת': ['אילת', 'eilat'],
+        'תל אביב': ['תל אביב', 'tel aviv', 'tlv'],
+    }
+    combined_text = (text + ' ' + location).lower()
+    for tag, keywords in tag_map.items():
+        if any(keyword in combined_text for keyword in keywords):
+            tags.append(tag)
+    return list(set(tags))
+
+
+# --- Main Scraping Function (Updated Logic) ---
+
+def scrape_party_details(url: str):
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+    response = requests.get(url, headers=headers)
+    response.raise_for_status() # Will raise an error for bad status codes
+
+    soup = BeautifulSoup(response.text, 'html.parser')
+    
+    script_tag = soup.find('script', {'id': '__NEXT_DATA__'})
+    if not script_tag:
+        raise ValueError("Could not find party data script (__NEXT_DATA__).")
+
+    json_data = json.loads(script_tag.string)
+    event_data = json_data.get('props', {}).get('pageProps', {}).get('event')
+    if not event_data:
+        raise ValueError("Event data not in expected format inside JSON.")
+
+    # Image extraction logic
+    image_path = ''
+    if event_data.get('CoverImage') and event_data['CoverImage'].get('Url'):
+        image_path = event_data['CoverImage']['Url']
+    elif event_data.get('WhatsappImage') and event_data['WhatsappImage'].get('Url'):
+        image_path = event_data['WhatsappImage']['Url']
+    
+    if image_path:
+        cover_image_path = image_path.replace('_whatsappImage.jpg', '_coverImage.jpg')
+        image_url = f"https://d15q6k8l9pfut7.cloudfront.net/{cover_image_path}"
+    else:
+        # Fallback to og:image meta tag
+        og_image_tag = soup.find('meta', {'property': 'og:image'})
+        og_image_url = og_image_tag['content'] if og_image_tag else ''
+        if og_image_url:
+            image_url = og_image_url.replace('_whatsappImage.jpg', '_coverImage.jpg')
+        else:
+            raise ValueError("Could not find party image URL.")
+
+    # Description cleanup
+    description = event_data.get('Description', '')
+    cleaned_desc = ' '.join(filter(None, description.split('\n'))[:3]).strip()
+    if len(cleaned_desc) > 250:
+        cleaned_desc = cleaned_desc[:247] + '...'
+    
+    full_text = f"{event_data.get('Title', '')} {description}"
+    location = event_data.get('Adress', '')
+
+    # Assemble final party object
+    party_details = {
+        "name": event_data.get('Title'),
+        "imageUrl": image_url,
+        "date": event_data.get('StartingDate'),
+        "location": location,
+        "description": cleaned_desc or 'No description available.',
+        "region": get_region(location),
+        "musicType": get_music_type(full_text),
+        "eventType": get_event_type(full_text),
+        "age": get_age(full_text, event_data.get('MinimumAge', 0)),
+        "tags": get_tags(full_text, location),
+        "originalUrl": url,
+    }
+
+    if not all([party_details['name'], party_details['date'], party_details['location']]):
+        raise ValueError("Scraped data is missing critical fields (name, date, or location).")
         
-        await browser.close()
-        return party_data
+    return party_details
 
 
 # --- API Routes ---
@@ -74,60 +172,38 @@ def add_party():
         return jsonify({"message": "URL is required."}), 400
 
     try:
-        # Run the async scraping function within our sync Flask route
-        party_data = asyncio.run(scrape_party_data(url))
-
-        if not party_data or not party_data.get('title'):
-             return jsonify({"message": "Could not scrape party data. Selectors might be wrong or page structure changed."}), 404
-        
-        # Prepare data for database insertion
-        party_to_save = {
-            **party_data,
-            "goOutUrl": url
-        }
-
-        result = parties_collection.insert_one(party_to_save)
-        # Convert ObjectId to string for JSON response
-        party_to_save['_id'] = str(result.inserted_id)
-        
-        return jsonify({"message": "Party added successfully!", "party": party_to_save}), 201
+        party_data = scrape_party_details(url)
+        result = parties_collection.insert_one(party_data)
+        party_data['_id'] = str(result.inserted_id)
+        return jsonify({"message": "Party added successfully!", "party": party_data}), 201
 
     except errors.DuplicateKeyError:
         return jsonify({"message": "This party has already been added."}), 409
     except Exception as e:
         return jsonify({"message": "An error occurred during scraping", "error": str(e)}), 500
 
-
 @app.route('/api/admin/delete-party/<party_id>', methods=['DELETE'])
 @protect
 def delete_party(party_id):
     try:
-        # Convert string ID from URL to MongoDB ObjectId
         obj_id = ObjectId(party_id)
         result = parties_collection.delete_one({"_id": obj_id})
-
         if result.deleted_count == 0:
             return jsonify({"message": "Party not found."}), 404
-        
         return jsonify({"message": "Party deleted successfully!"}), 200
-
     except Exception as e:
         return jsonify({"message": "Error deleting party", "error": str(e)}), 500
 
-# Public route to get all parties (for your frontend to display)
 @app.route('/api/parties', methods=['GET'])
 def get_parties():
     try:
         all_parties = []
-        for party in parties_collection.find().sort("createdAt", -1):
-            party["_id"] = str(party["_id"]) # Convert ObjectId for JSON compatibility
+        for party in parties_collection.find().sort("date", 1): # Sort by date ascending
+            party["_id"] = str(party["_id"])
             all_parties.append(party)
         return jsonify(all_parties), 200
     except Exception as e:
         return jsonify({"message": "Error fetching parties", "error": str(e)}), 500
 
-
-# To run this app locally: `flask run`
-# For deployment, a Gunicorn server is recommended.
 if __name__ == '__main__':
     app.run(debug=True, port=int(os.environ.get("PORT", 3001)))

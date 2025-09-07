@@ -1,6 +1,7 @@
 Flask
 pymongo
-playwright
 python-dotenv
 Flask-Cors
 gunicorn
+requests
+beautifulsoup4

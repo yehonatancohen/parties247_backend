@@ -17,7 +17,6 @@ from bs4 import BeautifulSoup
 load_dotenv()
 app = Flask(__name__)
 CORS(app)
-
 logging.basicConfig(level=logging.INFO)
 
 # --- URL canonicalization ---
@@ -28,20 +27,11 @@ def normalize_url(raw: str) -> str:
     p = urlparse((raw or "").strip())
     scheme = (p.scheme or "https").lower()
     netloc = p.netloc.lower()
-
-    # drop default ports
     if netloc.endswith(":80") and scheme == "http":
         netloc = netloc[:-3]
     if netloc.endswith(":443") and scheme == "https":
         netloc = netloc[:-4]
-
-    # normalize path
     path = p.path.rstrip("/") or "/"
-
-    # drop fragments
-    fragment = ""
-
-    # drop tracking params and keep stable order
     cleaned_qs = []
     for k, v in parse_qsl(p.query, keep_blank_values=True):
         kl = k.lower()
@@ -49,39 +39,66 @@ def normalize_url(raw: str) -> str:
             continue
         cleaned_qs.append((k, v))
     query = urlencode(cleaned_qs, doseq=True)
+    return urlunparse((scheme, netloc, path, "", query, ""))
 
-    return urlunparse((scheme, netloc, path, "", query, fragment))
-
-
-# --- MongoDB ---
+# --- MongoDB connection and index hygiene ---
 try:
     client = MongoClient(os.environ.get("MONGODB_URI"))
     db = client["party247"]
     parties_collection: Collection = db.parties
 
-    # Drop legacy unique index on originalUrl if present
-    try:
-        idx_info = parties_collection.index_information()
-        for name, meta in idx_info.items():
-            key = meta.get("key", [])
-            if key == [("originalUrl", 1)] and meta.get("unique", False):
-                parties_collection.drop_index(name)
-                app.logger.info("Dropped legacy unique index on originalUrl")
-    except Exception as e:
-        app.logger.warning(f"Index inspection/drop skipped: {e}")
+    idx_info = parties_collection.index_information()
 
-    # Create safe unique index on canonicalUrl (partial)
+    # Drop legacy unique index on originalUrl if present
+    for name, meta in idx_info.items():
+        if meta.get("key") == [("originalUrl", 1)] and meta.get("unique"):
+            parties_collection.drop_index(name)
+            app.logger.info("Dropped legacy unique index on originalUrl")
+
+    # Drop legacy unique index on goOutUrl if present (it causes dup on null)
+    idx_info = parties_collection.index_information()
+    for name, meta in idx_info.items():
+        if meta.get("key") == [("goOutUrl", 1)] and meta.get("unique"):
+            parties_collection.drop_index(name)
+            app.logger.info("Dropped legacy unique index on goOutUrl")
+
+    # Make goOutUrl unique only when a non-empty string exists
+    try:
+        parties_collection.create_index(
+            [("goOutUrl", 1)],
+            name="unique_goOutUrl_nonempty",
+            unique=True,
+            partialFilterExpression={
+                "$and": [
+                    {"goOutUrl": {"$type": "string"}},
+                    {"goOutUrl": {"$ne": ""}}
+                ]
+            },
+        )
+    except Exception as e:
+        app.logger.warning(f"Could not ensure partial unique index on goOutUrl: {e}")
+
+    # Our canonical dedupe key
     parties_collection.create_index(
-        "canonicalUrl",
+        [("canonicalUrl", 1)],
         name="unique_canonicalUrl",
         unique=True,
-        partialFilterExpression={"canonicalUrl": {"$exists": True, "$type": "string"}}
+        partialFilterExpression={"canonicalUrl": {"$type": "string"}}
     )
 
-    # Optional helper index for sorting by date
+    # Sort helper
     parties_collection.create_index([("date", 1)], name="date_asc")
 
-    # One-time light backfill of canonicalUrl for existing docs
+    # Data hygiene: unset null/empty goOutUrl to avoid future dup conflicts
+    try:
+        parties_collection.update_many(
+            {"$or": [{"goOutUrl": None}, {"goOutUrl": ""}]},
+            {"$unset": {"goOutUrl": ""}}
+        )
+    except Exception as e:
+        app.logger.warning(f"Cleanup goOutUrl null/empty failed: {e}")
+
+    # Backfill canonicalUrl where missing
     try:
         cursor = parties_collection.find(
             {"canonicalUrl": {"$exists": False}, "originalUrl": {"$type": "string"}},
@@ -105,7 +122,6 @@ except Exception as e:
     app.logger.error(f"Error connecting to MongoDB Atlas: {e}")
     raise
 
-
 # --- Security Decorator ---
 def protect(f):
     @wraps(f)
@@ -115,7 +131,6 @@ def protect(f):
             return f(*args, **kwargs)
         return jsonify({"message": "Forbidden: Invalid or missing admin key."}), 403
     return decorated_function
-
 
 # --- Classification Helpers ---
 def get_region(location: str) -> str:
@@ -182,8 +197,7 @@ def get_tags(text: str, location: str) -> list:
             tags.append(tag)
     return list(set(tags))
 
-
-# --- Main Scraping Function with Logging ---
+# --- Scraper ---
 def scrape_party_details(url: str):
     app.logger.info(f"[SCRAPER_LOG] --- Starting scrape for URL: {url} ---")
     try:
@@ -203,9 +217,9 @@ def scrape_party_details(url: str):
         app.logger.info("[SCRAPER_LOG] Searching for '__NEXT_DATA__' script tag...")
         script_tag = soup.find("script", {"id": "__NEXT_DATA__"})
         if not script_tag:
-            app.logger.error("[SCRAPER_ERROR] CRITICAL: Could not find '__NEXT_DATA__' script tag in HTML.")
+            app.logger.error("[SCRAPER_ERROR] Could not find '__NEXT_DATA__' script tag.")
             raise ValueError("Could not find party data script (__NEXT_DATA__).")
-        app.logger.info("[SCRAPER_LOG] Found '__NEXT_DATA__' script tag.")
+        app.logger.info("[SCRAPER_LOG] Found '__NEXT_DATA__'.")
 
         app.logger.info("[SCRAPER_LOG] Parsing JSON data...")
         json_data = json.loads(script_tag.string)
@@ -213,9 +227,9 @@ def scrape_party_details(url: str):
 
         event_data = json_data.get("props", {}).get("pageProps", {}).get("event")
         if not event_data:
-            app.logger.error("[SCRAPER_ERROR] CRITICAL: 'event' object not found in the expected JSON path.")
+            app.logger.error("[SCRAPER_ERROR] 'event' object not found in JSON.")
             raise ValueError("Event data not in expected format inside JSON.")
-        app.logger.info("[SCRAPER_LOG] Found 'event' object in JSON data.")
+        app.logger.info("[SCRAPER_LOG] Found 'event' object.")
 
         # Image extraction logic
         image_path = ""
@@ -224,28 +238,25 @@ def scrape_party_details(url: str):
         elif event_data.get("WhatsappImage") and event_data["WhatsappImage"].get("Url"):
             image_path = event_data["WhatsappImage"]["Url"]
 
-        app.logger.info(f"[SCRAPER_LOG] Initial image path found: {image_path if image_path else 'None'}")
+        app.logger.info(f"[SCRAPER_LOG] Initial image path: {image_path if image_path else 'None'}")
 
         if image_path:
             cover_image_path = image_path.replace("_whatsappImage.jpg", "_coverImage.jpg")
             image_url = f"https://d15q6k8l9pfut7.cloudfront.net/{cover_image_path}"
         else:
-            app.logger.warning("[SCRAPER_LOG] No image path in JSON, falling back to meta tag.")
+            app.logger.warning("[SCRAPER_LOG] Fallback to og:image meta.")
             og_image_tag = soup.find("meta", {"property": "og:image"})
             og_image_url = og_image_tag["content"] if og_image_tag else ""
             if og_image_url:
                 image_url = og_image_url.replace("_whatsappImage.jpg", "_coverImage.jpg")
             else:
-                app.logger.error("[SCRAPER_ERROR] CRITICAL: Could not find image URL in JSON or meta tags.")
+                app.logger.error("[SCRAPER_ERROR] Could not find image URL.")
                 raise ValueError("Could not find party image URL.")
-
-        app.logger.info(f"[SCRAPER_LOG] Final image URL: {image_url}")
 
         description = event_data.get("Description", "")
         cleaned_desc = " ".join(list(filter(None, description.split("\n")))[:3]).strip()
         if len(cleaned_desc) > 250:
             cleaned_desc = cleaned_desc[:247] + "..."
-        app.logger.info("[SCRAPER_LOG] Cleaned description successfully.")
 
         full_text = f"{event_data.get('Title', '')} {description}"
         location = event_data.get("Adress", "")
@@ -263,11 +274,12 @@ def scrape_party_details(url: str):
             "tags": get_tags(full_text, location),
             "originalUrl": url,
             "canonicalUrl": normalize_url(url),
+            # store normalized goOutUrl to avoid nulls and align with any legacy code
+            "goOutUrl": normalize_url(url),
         }
-        app.logger.info(f"[SCRAPER_LOG] Assembled party object: {party_details['name']}")
 
         if not all([party_details["name"], party_details["date"], party_details["location"]]):
-            app.logger.error("[SCRAPER_ERROR] CRITICAL: Final object is missing name, date, or location.")
+            app.logger.error("[SCRAPER_ERROR] Missing name/date/location.")
             raise ValueError("Scraped data is missing critical fields.")
 
         return party_details
@@ -276,9 +288,8 @@ def scrape_party_details(url: str):
         app.logger.error(f"[SCRAPER_ERROR] HTTP Request failed: {e}")
         raise
     except Exception as e:
-        app.logger.error(f"[SCRAPER_ERROR] An unexpected error occurred during scraping: {e}")
+        app.logger.error(f"[SCRAPER_ERROR] Unexpected scraping error: {e}")
         raise
-
 
 # --- API Routes ---
 @app.route("/api/admin/add-party", methods=["POST"])
@@ -291,16 +302,18 @@ def add_party():
 
     try:
         party_data = scrape_party_details(url)
-        # Idempotent insert using canonicalUrl
+        canonical = party_data["canonicalUrl"]
+
+        # Idempotent insert using either canonicalUrl or legacy goOutUrl
         res = parties_collection.update_one(
-            {"canonicalUrl": party_data["canonicalUrl"]},
+            {"$or": [{"canonicalUrl": canonical}, {"goOutUrl": canonical}]},
             {"$setOnInsert": party_data},
             upsert=True,
         )
 
         if res.matched_count == 1 and res.upserted_id is None:
             existing = parties_collection.find_one(
-                {"canonicalUrl": party_data["canonicalUrl"]},
+                {"$or": [{"canonicalUrl": canonical}, {"goOutUrl": canonical}]},
                 {"_id": 1}
             )
             return jsonify({
@@ -319,7 +332,6 @@ def add_party():
         app.logger.error(f"[DB_ERROR] {str(e)}")
         return jsonify({"message": f"An error occurred: {str(e)}"}), 500
 
-
 @app.route("/api/admin/delete-party/<party_id>", methods=["DELETE"])
 @protect
 def delete_party(party_id):
@@ -332,7 +344,6 @@ def delete_party(party_id):
     except Exception as e:
         return jsonify({"message": "Error deleting party", "error": str(e)}), 500
 
-
 @app.route("/api/parties", methods=["GET"])
 def get_parties():
     try:
@@ -343,7 +354,6 @@ def get_parties():
         return jsonify(all_parties), 200
     except Exception as e:
         return jsonify({"message": "Error fetching parties", "error": str(e)}), 500
-
 
 if __name__ == "__main__":
     app.run(debug=True, port=int(os.environ.get("PORT", 3001)))

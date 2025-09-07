@@ -148,8 +148,10 @@ def scrape_party_details(url: str):
         app.logger.info(f"[SCRAPER_LOG] Final image URL: {image_url}")
 
         description = event_data.get('Description', '')
-        cleaned_desc = ' '.join(filter(None, description.split('\n'))[:3]).strip()
+        # FIX: Convert filter object to a list before slicing
+        cleaned_desc = ' '.join(list(filter(None, description.split('\n')))[:3]).strip()
         if len(cleaned_desc) > 250: cleaned_desc = cleaned_desc[:247] + '...'
+        app.logger.info(f"[SCRAPER_LOG] Cleaned description successfully.")
         
         full_text = f"{event_data.get('Title', '')} {description}"
         location = event_data.get('Adress', '')

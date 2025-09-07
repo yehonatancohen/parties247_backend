@@ -21,10 +21,11 @@ logging.basicConfig(level=logging.INFO)
 
 try:
     client = MongoClient(os.environ.get("MONGODB_URI"))
-    db = client.get_default_database()
+    # --- FIX: Explicitly select the database ---
+    db = client['party247db'] 
     parties_collection: Collection = db.parties
     parties_collection.create_index("originalUrl", unique=True)
-    app.logger.info("Successfully connected to MongoDB Atlas!")
+    app.logger.info("Successfully connected to MongoDB Atlas and ensured index exists!")
 except Exception as e:
     app.logger.error(f"Error connecting to MongoDB Atlas: {e}")
     exit()
@@ -179,7 +180,7 @@ def scrape_party_details(url: str):
         raise
 
 
-# --- API Routes (remain the same) ---
+# --- API Routes (Updated with DB Logs) ---
 @app.route('/api/admin/add-party', methods=['POST'])
 @protect
 def add_party():
@@ -190,14 +191,17 @@ def add_party():
 
     try:
         party_data = scrape_party_details(url)
+        app.logger.info(f"[DB_LOG] Attempting to insert party with originalUrl: {party_data['originalUrl']}")
         result = parties_collection.insert_one(party_data)
         party_data['_id'] = str(result.inserted_id)
+        app.logger.info(f"[DB_LOG] Successfully inserted party with ID: {party_data['_id']}")
         return jsonify({"message": "Party added successfully!", "party": party_data}), 201
 
     except errors.DuplicateKeyError:
+        app.logger.warning(f"[DB_ERROR] DuplicateKeyError: A party with URL '{url}' already exists in the database.")
         return jsonify({"message": "This party has already been added."}), 409
     except Exception as e:
-        # The specific error from the scraper will be passed here
+        app.logger.error(f"[DB_ERROR] An unexpected error occurred during database operation: {str(e)}")
         return jsonify({"message": f"An error occurred: {str(e)}"}), 500
 
 @app.route('/api/admin/delete-party/<party_id>', methods=['DELETE'])

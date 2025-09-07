@@ -69,6 +69,7 @@ try:
     client = MongoClient(os.environ.get("MONGODB_URI"))
     db = client["party247"]
     parties_collection: Collection = db.parties
+    carousels_collection: Collection = db.carousels # New collection for carousels
 
     # Cleanup bad goOutUrl values before enforcing unique indexes
     try:
@@ -117,6 +118,10 @@ try:
 
     # Helper index for date sorting
     ensure_index(parties_collection, [("date", 1)], name="date_asc")
+    
+    # Index for carousels
+    ensure_index(carousels_collection, [("title", 1)], name="title_asc")
+
 
     app.logger.info("Connected to MongoDB and ensured indexes.")
 except Exception as e:
@@ -275,6 +280,8 @@ def scrape_party_details(url: str):
         raise
 
 # --- Routes ---
+
+# Parties
 @app.route("/api/admin/add-party", methods=["POST"])
 @protect
 def add_party():
@@ -321,6 +328,31 @@ def delete_party(party_id):
         return jsonify({"message": "Party deleted successfully!"}), 200
     except Exception as e:
         return jsonify({"message": "Error deleting party", "error": str(e)}), 500
+        
+@app.route("/api/admin/update-party/<party_id>", methods=["PUT"])
+@protect
+def update_party(party_id):
+    try:
+        data = request.get_json()
+        obj_id = ObjectId(party_id)
+
+        # Basic validation: ensure data is a dict
+        if not isinstance(data, dict):
+            return jsonify({"message": "Invalid payload format."}), 400
+
+        # Prevent updating the _id field
+        data.pop("_id", None)
+        
+        result = parties_collection.update_one({"_id": obj_id}, {"$set": data})
+
+        if result.matched_count == 0:
+            return jsonify({"message": "Party not found."}), 404
+        
+        return jsonify({"message": "Party updated successfully!"}), 200
+
+    except Exception as e:
+        app.logger.error(f"Error updating party {party_id}: {e}")
+        return jsonify({"message": "An error occurred", "error": str(e)}), 500
 
 @app.route("/api/parties", methods=["GET"])
 def get_parties():
@@ -332,6 +364,78 @@ def get_parties():
         return jsonify(items), 200
     except Exception as e:
         return jsonify({"message": "Error fetching parties", "error": str(e)}), 500
+        
+# Carousels
+@app.route("/api/admin/carousels", methods=["POST"])
+@protect
+def add_carousel():
+    data = request.get_json()
+    if not data or 'title' not in data:
+        return jsonify({"message": "Title is required"}), 400
+    
+    try:
+        carousel = {
+            "title": data["title"],
+            "partyIds": data.get("partyIds", [])
+        }
+        result = carousels_collection.insert_one(carousel)
+        carousel["_id"] = str(result.inserted_id)
+        return jsonify(carousel), 201
+    except Exception as e:
+        return jsonify({"message": "Error adding carousel", "error": str(e)}), 500
+
+
+@app.route("/api/admin/carousels/<carousel_id>", methods=["PUT"])
+@protect
+def update_carousel(carousel_id):
+    data = request.get_json()
+    if not data:
+        return jsonify({"message": "Invalid data"}), 400
+        
+    try:
+        obj_id = ObjectId(carousel_id)
+        update_data = {}
+        if 'title' in data:
+            update_data['title'] = data['title']
+        if 'partyIds' in data:
+            update_data['partyIds'] = data['partyIds']
+
+        result = carousels_collection.update_one(
+            {"_id": obj_id},
+            {"$set": update_data}
+        )
+        if result.matched_count == 0:
+            return jsonify({"message": "Carousel not found"}), 404
+        return jsonify({"message": "Carousel updated successfully!"}), 200
+    except Exception as e:
+        return jsonify({"message": "Error updating carousel", "error": str(e)}), 500
+
+
+@app.route("/api/admin/carousels/<carousel_id>", methods=["DELETE"])
+@protect
+def delete_carousel(carousel_id):
+    try:
+        obj_id = ObjectId(carousel_id)
+        result = carousels_collection.delete_one({"_id": obj_id})
+        if result.deleted_count == 0:
+            return jsonify({"message": "Carousel not found."}), 404
+        return jsonify({"message": "Carousel deleted successfully!"}), 200
+    except Exception as e:
+        return jsonify({"message": "Error deleting carousel", "error": str(e)}), 500
+
+
+@app.route("/api/carousels", methods=["GET"])
+def get_carousels():
+    try:
+        items = []
+        for carousel in carousels_collection.find():
+            carousel["id"] = str(carousel["_id"])
+            carousel.pop("_id")
+            items.append(carousel)
+        return jsonify(items), 200
+    except Exception as e:
+        return jsonify({"message": "Error fetching carousels", "error": str(e)}), 500
+
 
 if __name__ == "__main__":
     app.run(debug=True, port=int(os.environ.get("PORT", 3001)))

@@ -436,6 +436,12 @@ def get_carousels():
     except Exception as e:
         return jsonify({"message": "Error fetching carousels", "error": str(e)}), 500
 
+@app.route('/api/admin/verify-key', methods=['POST'])
+@protect
+def verify_key():
+    # If the @protect decorator passes, the key is valid.
+    # We just need to return a success message.
+    return jsonify({"message": "Admin key is valid."}), 200
 
 if __name__ == "__main__":
     app.run(debug=True, port=int(os.environ.get("PORT", 3001)))

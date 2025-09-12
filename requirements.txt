@@ -5,3 +5,5 @@ Flask-Cors
 gunicorn
 requests
 beautifulsoup4
+PyJWT
+bcrypt

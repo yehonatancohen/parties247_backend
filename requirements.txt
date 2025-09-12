@@ -5,6 +5,7 @@ Flask-Cors
 gunicorn
 requests
 beautifulsoup4
+pydantic
 Flask-Limiter
 PyJWT
 bcrypt

@@ -20,6 +20,7 @@ from pymongo.collection import Collection
 from bson.objectid import ObjectId
 import requests
 from bs4 import BeautifulSoup
+from pydantic import BaseModel, ValidationError
 
 # --- App setup ---
 load_dotenv()
@@ -287,6 +288,49 @@ def get_tags(text: str, location: str) -> list:
             tags.append(tag)
     return list(set(tags))
 
+
+# --- Schemas ---
+class AddPartyRequest(BaseModel):
+    url: str
+
+    class Config:
+        extra = "forbid"
+
+
+class PartyUpdateSchema(BaseModel):
+    name: str | None = None
+    imageUrl: str | None = None
+    date: str | None = None
+    location: str | None = None
+    description: str | None = None
+    region: str | None = None
+    musicType: str | None = None
+    eventType: str | None = None
+    age: str | None = None
+    tags: list[str] | None = None
+    originalUrl: str | None = None
+    canonicalUrl: str | None = None
+    goOutUrl: str | None = None
+
+    class Config:
+        extra = "forbid"
+
+
+class CarouselCreateSchema(BaseModel):
+    title: str
+    partyIds: list[str] = []
+
+    class Config:
+        extra = "forbid"
+
+
+class CarouselUpdateSchema(BaseModel):
+    title: str | None = None
+    partyIds: list[str] | None = None
+
+    class Config:
+        extra = "forbid"
+
 # --- Scraper ---
 def scrape_party_details(url: str):
     if not is_url_allowed(url):
@@ -372,10 +416,13 @@ def scrape_party_details(url: str):
 @limiter.limit("10 per minute")
 @protect
 def add_party():
-    data = request.get_json(silent=True) or {}
-    url = data.get("url")
-    if not url:
-        return jsonify({"message": "URL is required."}), 400
+    payload = request.get_json(silent=True) or {}
+    try:
+        req = AddPartyRequest(**payload)
+    except ValidationError as ve:
+        app.logger.warning(f"[VALIDATION] {ve}")
+        return jsonify({"message": "Invalid request", "errors": ve.errors()}), 400
+    url = req.url
 
     if not is_url_allowed(url):
         return jsonify({"message": "URL is not allowed."}), 400
@@ -425,23 +472,23 @@ def delete_party(party_id):
 @protect
 def update_party(party_id):
     try:
-        data = request.get_json()
+        payload = request.get_json(silent=True) or {}
         obj_id = ObjectId(party_id)
+        update = PartyUpdateSchema(**payload)
+        data = update.dict(exclude_unset=True)
+        if not data:
+            return jsonify({"message": "No valid fields provided."}), 400
 
-        # Basic validation: ensure data is a dict
-        if not isinstance(data, dict):
-            return jsonify({"message": "Invalid payload format."}), 400
-
-        # Prevent updating the _id field
-        data.pop("_id", None)
-        
         result = parties_collection.update_one({"_id": obj_id}, {"$set": data})
 
         if result.matched_count == 0:
             return jsonify({"message": "Party not found."}), 404
-        
+
         return jsonify({"message": "Party updated successfully!"}), 200
 
+    except ValidationError as ve:
+        app.logger.warning(f"[VALIDATION] {ve}")
+        return jsonify({"message": "Invalid party data", "errors": ve.errors()}), 400
     except Exception as e:
         app.logger.error(f"Error updating party {party_id}: {e}")
         return jsonify({"message": "An error occurred", "error": str(e)}), 500
@@ -463,18 +510,18 @@ def get_parties():
 @limiter.limit("10 per minute")
 @protect
 def add_carousel():
-    data = request.get_json()
-    if not data or 'title' not in data:
-        return jsonify({"message": "Title is required"}), 400
-    
+    payload = request.get_json(silent=True) or {}
     try:
-        carousel = {
-            "title": data["title"],
-            "partyIds": data.get("partyIds", [])
-        }
-        result = carousels_collection.insert_one(carousel)
-        carousel["_id"] = str(result.inserted_id)
-        return jsonify(carousel), 201
+        carousel = CarouselCreateSchema(**payload)
+    except ValidationError as ve:
+        app.logger.warning(f"[VALIDATION] {ve}")
+        return jsonify({"message": "Invalid carousel data", "errors": ve.errors()}), 400
+
+    try:
+        doc = carousel.dict()
+        result = carousels_collection.insert_one(doc)
+        doc["_id"] = str(result.inserted_id)
+        return jsonify(doc), 201
     except Exception as e:
         return jsonify({"message": "Error adding carousel", "error": str(e)}), 500
 
@@ -483,18 +530,19 @@ def add_carousel():
 @limiter.limit("10 per minute")
 @protect
 def update_carousel(carousel_id):
-    data = request.get_json()
-    if not data:
-        return jsonify({"message": "Invalid data"}), 400
-        
+    payload = request.get_json(silent=True) or {}
+    try:
+        update = CarouselUpdateSchema(**payload)
+    except ValidationError as ve:
+        app.logger.warning(f"[VALIDATION] {ve}")
+        return jsonify({"message": "Invalid carousel data", "errors": ve.errors()}), 400
+
+    update_data = update.dict(exclude_unset=True)
+    if not update_data:
+        return jsonify({"message": "No valid fields provided."}), 400
+
     try:
         obj_id = ObjectId(carousel_id)
-        update_data = {}
-        if 'title' in data:
-            update_data['title'] = data['title']
-        if 'partyIds' in data:
-            update_data['partyIds'] = data['partyIds']
-
         result = carousels_collection.update_one(
             {"_id": obj_id},
             {"$set": update_data}

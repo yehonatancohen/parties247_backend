@@ -6,3 +6,5 @@ gunicorn
 requests
 beautifulsoup4
 Flask-Limiter
+PyJWT
+bcrypt

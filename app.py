@@ -1,12 +1,20 @@
 import os
 import json
 import logging
+import hmac
+from datetime import datetime, timedelta
 from functools import wraps
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+import socket
+import ipaddress
 
+import bcrypt
+import jwt
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from pymongo import MongoClient, errors
 from pymongo.collection import Collection
 from bson.objectid import ObjectId
@@ -18,10 +26,12 @@ load_dotenv()
 app = Flask(__name__)
 ALLOWED_ORIGINS = [
     "http://localhost:3000",  # Local development
-    "https://staging.parties247.com",  # Staging
+    "https://parties247-website.vercel.app/",  # Staging
     "https://parties247.com",  # Production
 ]
+app.config["RATELIMIT_HEADERS_ENABLED"] = True
 CORS(app, origins=ALLOWED_ORIGINS, supports_credentials=False)
+limiter = Limiter(get_remote_address, app=app)
 logging.basicConfig(level=logging.INFO)
 
 # --- URL canonicalization ---
@@ -52,6 +62,38 @@ def normalized_or_none_for_dedupe(raw: str) -> str | None:
     n = normalize_url(raw)
     # require a host to be considered valid
     return n if urlparse(n).netloc else None
+
+ALLOWED_SCHEMES = {"http", "https"}
+ALLOWED_PORTS = {80, 443}
+
+
+def is_url_allowed(raw: str) -> bool:
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return False
+
+    if parsed.scheme.lower() not in ALLOWED_SCHEMES:
+        return False
+
+    if parsed.port and parsed.port not in ALLOWED_PORTS:
+        return False
+
+    host = parsed.hostname
+    if not host:
+        return False
+
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or (80 if parsed.scheme == "http" else 443))
+    except socket.gaierror:
+        return False
+
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_link_local or ip.is_multicast:
+            return False
+
+    return True
 
 # --- Mongo helpers ---
 def ensure_index(coll: Collection, keys, name: str, **kwargs):
@@ -131,17 +173,54 @@ try:
     app.logger.info("Connected to MongoDB and ensured indexes.")
 except Exception as e:
     app.logger.error(f"Error connecting to MongoDB Atlas: {e}")
-    raise
+    parties_collection = None
+    carousels_collection = None
 
 # --- Security ---
+JWT_SECRET = os.environ.get("JWT_SECRET_KEY", "")
+ADMIN_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "").encode()
+
+
 def protect(f):
+    """Protect admin endpoints using a JWT token in the Authorization header."""
+
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        provided_key = request.headers.get("x-admin-secret-key")
-        if provided_key and provided_key == os.environ.get("ADMIN_SECRET_KEY"):
-            return f(*args, **kwargs)
-        return jsonify({"message": "Forbidden: Invalid or missing admin key."}), 403
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header.split(" ", 1)[1].strip()
+            try:
+                jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+                return f(*args, **kwargs)
+            except jwt.ExpiredSignatureError:
+                return jsonify({"message": "Token expired."}), 401
+            except jwt.InvalidTokenError:
+                return jsonify({"message": "Invalid token."}), 401
+        return jsonify({"message": "Unauthorized."}), 401
+
     return decorated_function
+
+
+@app.route("/api/admin/login", methods=["POST"])
+def admin_login():
+    """Authenticate admin and issue a short-lived JWT."""
+    data = request.get_json(silent=True) or {}
+    password = (data.get("password") or "").encode()
+
+    if not ADMIN_HASH:
+        return jsonify({"message": "Server misconfigured."}), 500
+
+    try:
+        hashed_attempt = bcrypt.hashpw(password, ADMIN_HASH)
+        if hmac.compare_digest(hashed_attempt, ADMIN_HASH):
+            exp = datetime.utcnow() + timedelta(minutes=15)
+            token = jwt.encode({"exp": exp}, JWT_SECRET, algorithm="HS256")
+            if isinstance(token, bytes):
+                token = token.decode()
+            return jsonify({"token": token}), 200
+    except ValueError:
+        pass
+    return jsonify({"message": "Invalid credentials."}), 401
 
 # --- Classification helpers ---
 def get_region(location: str) -> str:
@@ -210,6 +289,8 @@ def get_tags(text: str, location: str) -> list:
 
 # --- Scraper ---
 def scrape_party_details(url: str):
+    if not is_url_allowed(url):
+        raise ValueError("URL is not allowed.")
     app.logger.info(f"[SCRAPER] start {url}")
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -288,12 +369,16 @@ def scrape_party_details(url: str):
 
 # Parties
 @app.route("/api/admin/add-party", methods=["POST"])
+@limiter.limit("10 per minute")
 @protect
 def add_party():
     data = request.get_json(silent=True) or {}
     url = data.get("url")
     if not url:
         return jsonify({"message": "URL is required."}), 400
+
+    if not is_url_allowed(url):
+        return jsonify({"message": "URL is not allowed."}), 400
 
     try:
         party_data = scrape_party_details(url)
@@ -323,6 +408,7 @@ def add_party():
         return jsonify({"message": f"An error occurred: {str(e)}"}), 500
 
 @app.route("/api/admin/delete-party/<party_id>", methods=["DELETE"])
+@limiter.limit("10 per minute")
 @protect
 def delete_party(party_id):
     try:
@@ -335,6 +421,7 @@ def delete_party(party_id):
         return jsonify({"message": "Error deleting party", "error": str(e)}), 500
         
 @app.route("/api/admin/update-party/<party_id>", methods=["PUT"])
+@limiter.limit("10 per minute")
 @protect
 def update_party(party_id):
     try:
@@ -360,6 +447,7 @@ def update_party(party_id):
         return jsonify({"message": "An error occurred", "error": str(e)}), 500
 
 @app.route("/api/parties", methods=["GET"])
+@limiter.limit("100 per minute")
 def get_parties():
     try:
         items = []
@@ -372,6 +460,7 @@ def get_parties():
         
 # Carousels
 @app.route("/api/admin/carousels", methods=["POST"])
+@limiter.limit("10 per minute")
 @protect
 def add_carousel():
     data = request.get_json()
@@ -391,6 +480,7 @@ def add_carousel():
 
 
 @app.route("/api/admin/carousels/<carousel_id>", methods=["PUT"])
+@limiter.limit("10 per minute")
 @protect
 def update_carousel(carousel_id):
     data = request.get_json()
@@ -417,6 +507,7 @@ def update_carousel(carousel_id):
 
 
 @app.route("/api/admin/carousels/<carousel_id>", methods=["DELETE"])
+@limiter.limit("10 per minute")
 @protect
 def delete_carousel(carousel_id):
     try:
@@ -430,6 +521,7 @@ def delete_carousel(carousel_id):
 
 
 @app.route("/api/carousels", methods=["GET"])
+@limiter.limit("100 per minute")
 def get_carousels():
     try:
         items = []
@@ -441,12 +533,12 @@ def get_carousels():
     except Exception as e:
         return jsonify({"message": "Error fetching carousels", "error": str(e)}), 500
 
-@app.route('/api/admin/verify-key', methods=['POST'])
+@app.route('/api/admin/verify-token', methods=['POST'])
+@limiter.limit("10 per minute")
 @protect
-def verify_key():
-    # If the @protect decorator passes, the key is valid.
-    # We just need to return a success message.
-    return jsonify({"message": "Admin key is valid."}), 200
+def verify_token():
+    """Simple endpoint to verify that a provided JWT is valid."""
+    return jsonify({"message": "Token is valid."}), 200
 
 if __name__ == "__main__":
     app.run(debug=True, port=int(os.environ.get("PORT", 3001)))

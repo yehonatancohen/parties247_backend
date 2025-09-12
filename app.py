@@ -444,4 +444,10 @@ def verify_key():
     return jsonify({"message": "Admin key is valid."}), 200
 
 if __name__ == "__main__":
-    app.run(debug=True, port=int(os.environ.get("PORT", 3001)))
+    # Enable debug mode only when explicitly requested and not in production
+    flask_env = os.environ.get("FLASK_ENV", "production").lower()
+    debug = flask_env == "development" or (
+        flask_env != "production"
+        and os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")
+    )
+    app.run(debug=debug, port=int(os.environ.get("PORT", 3001)))

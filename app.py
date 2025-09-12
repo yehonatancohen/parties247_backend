@@ -25,13 +25,13 @@ from pydantic import BaseModel, ValidationError
 # --- App setup ---
 load_dotenv()
 app = Flask(__name__)
-ALLOWED_ORIGINS = [
-    "http://localhost:3000",  # Local development
-    "https://parties247-website.vercel.app/",  # Staging
-    "https://parties247.com",  # Production
-]
+# ALLOWED_ORIGINS = [
+#     "http://localhost:3000",  # Local development
+#     "https://parties247-website.vercel.app/",  # Staging
+#     "https://parties247.com",  # Production
+# ]
 app.config["RATELIMIT_HEADERS_ENABLED"] = True
-CORS(app, origins=ALLOWED_ORIGINS, supports_credentials=False)
+CORS(app)
 limiter = Limiter(get_remote_address, app=app)
 logging.basicConfig(level=logging.INFO)
 

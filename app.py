@@ -7,6 +7,8 @@ from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from pymongo import MongoClient, errors
 from pymongo.collection import Collection
 from bson.objectid import ObjectId
@@ -16,7 +18,9 @@ from bs4 import BeautifulSoup
 # --- App setup ---
 load_dotenv()
 app = Flask(__name__)
+app.config["RATELIMIT_HEADERS_ENABLED"] = True
 CORS(app)
+limiter = Limiter(get_remote_address, app=app)
 logging.basicConfig(level=logging.INFO)
 
 # --- URL canonicalization ---
@@ -283,6 +287,7 @@ def scrape_party_details(url: str):
 
 # Parties
 @app.route("/api/admin/add-party", methods=["POST"])
+@limiter.limit("10 per minute")
 @protect
 def add_party():
     data = request.get_json(silent=True) or {}
@@ -318,6 +323,7 @@ def add_party():
         return jsonify({"message": f"An error occurred: {str(e)}"}), 500
 
 @app.route("/api/admin/delete-party/<party_id>", methods=["DELETE"])
+@limiter.limit("10 per minute")
 @protect
 def delete_party(party_id):
     try:
@@ -330,6 +336,7 @@ def delete_party(party_id):
         return jsonify({"message": "Error deleting party", "error": str(e)}), 500
         
 @app.route("/api/admin/update-party/<party_id>", methods=["PUT"])
+@limiter.limit("10 per minute")
 @protect
 def update_party(party_id):
     try:
@@ -355,6 +362,7 @@ def update_party(party_id):
         return jsonify({"message": "An error occurred", "error": str(e)}), 500
 
 @app.route("/api/parties", methods=["GET"])
+@limiter.limit("100 per minute")
 def get_parties():
     try:
         items = []
@@ -367,6 +375,7 @@ def get_parties():
         
 # Carousels
 @app.route("/api/admin/carousels", methods=["POST"])
+@limiter.limit("10 per minute")
 @protect
 def add_carousel():
     data = request.get_json()
@@ -386,6 +395,7 @@ def add_carousel():
 
 
 @app.route("/api/admin/carousels/<carousel_id>", methods=["PUT"])
+@limiter.limit("10 per minute")
 @protect
 def update_carousel(carousel_id):
     data = request.get_json()
@@ -412,6 +422,7 @@ def update_carousel(carousel_id):
 
 
 @app.route("/api/admin/carousels/<carousel_id>", methods=["DELETE"])
+@limiter.limit("10 per minute")
 @protect
 def delete_carousel(carousel_id):
     try:
@@ -425,6 +436,7 @@ def delete_carousel(carousel_id):
 
 
 @app.route("/api/carousels", methods=["GET"])
+@limiter.limit("100 per minute")
 def get_carousels():
     try:
         items = []
@@ -437,6 +449,7 @@ def get_carousels():
         return jsonify({"message": "Error fetching carousels", "error": str(e)}), 500
 
 @app.route('/api/admin/verify-key', methods=['POST'])
+@limiter.limit("10 per minute")
 @protect
 def verify_key():
     # If the @protect decorator passes, the key is valid.

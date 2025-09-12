@@ -5,6 +5,8 @@ import hmac
 from datetime import datetime, timedelta
 from functools import wraps
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+import socket
+import ipaddress
 
 import bcrypt
 import jwt
@@ -55,6 +57,38 @@ def normalized_or_none_for_dedupe(raw: str) -> str | None:
     n = normalize_url(raw)
     # require a host to be considered valid
     return n if urlparse(n).netloc else None
+
+ALLOWED_SCHEMES = {"http", "https"}
+ALLOWED_PORTS = {80, 443}
+
+
+def is_url_allowed(raw: str) -> bool:
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return False
+
+    if parsed.scheme.lower() not in ALLOWED_SCHEMES:
+        return False
+
+    if parsed.port and parsed.port not in ALLOWED_PORTS:
+        return False
+
+    host = parsed.hostname
+    if not host:
+        return False
+
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or (80 if parsed.scheme == "http" else 443))
+    except socket.gaierror:
+        return False
+
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_link_local or ip.is_multicast:
+            return False
+
+    return True
 
 # --- Mongo helpers ---
 def ensure_index(coll: Collection, keys, name: str, **kwargs):
@@ -134,7 +168,8 @@ try:
     app.logger.info("Connected to MongoDB and ensured indexes.")
 except Exception as e:
     app.logger.error(f"Error connecting to MongoDB Atlas: {e}")
-    raise
+    parties_collection = None
+    carousels_collection = None
 
 # --- Security ---
 JWT_SECRET = os.environ.get("JWT_SECRET_KEY", "")
@@ -249,6 +284,8 @@ def get_tags(text: str, location: str) -> list:
 
 # --- Scraper ---
 def scrape_party_details(url: str):
+    if not is_url_allowed(url):
+        raise ValueError("URL is not allowed.")
     app.logger.info(f"[SCRAPER] start {url}")
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -334,6 +371,9 @@ def add_party():
     url = data.get("url")
     if not url:
         return jsonify({"message": "URL is required."}), 400
+
+    if not is_url_allowed(url):
+        return jsonify({"message": "URL is not allowed."}), 400
 
     try:
         party_data = scrape_party_details(url)

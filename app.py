@@ -1,9 +1,13 @@
 import os
 import json
 import logging
+import hmac
+from datetime import datetime, timedelta
 from functools import wraps
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
+import bcrypt
+import jwt
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -129,14 +133,50 @@ except Exception as e:
     raise
 
 # --- Security ---
+JWT_SECRET = os.environ.get("JWT_SECRET_KEY", "")
+ADMIN_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "").encode()
+
+
 def protect(f):
+    """Protect admin endpoints using a JWT token in the Authorization header."""
+
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        provided_key = request.headers.get("x-admin-secret-key")
-        if provided_key and provided_key == os.environ.get("ADMIN_SECRET_KEY"):
-            return f(*args, **kwargs)
-        return jsonify({"message": "Forbidden: Invalid or missing admin key."}), 403
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header.split(" ", 1)[1].strip()
+            try:
+                jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+                return f(*args, **kwargs)
+            except jwt.ExpiredSignatureError:
+                return jsonify({"message": "Token expired."}), 401
+            except jwt.InvalidTokenError:
+                return jsonify({"message": "Invalid token."}), 401
+        return jsonify({"message": "Unauthorized."}), 401
+
     return decorated_function
+
+
+@app.route("/api/admin/login", methods=["POST"])
+def admin_login():
+    """Authenticate admin and issue a short-lived JWT."""
+    data = request.get_json(silent=True) or {}
+    password = (data.get("password") or "").encode()
+
+    if not ADMIN_HASH:
+        return jsonify({"message": "Server misconfigured."}), 500
+
+    try:
+        hashed_attempt = bcrypt.hashpw(password, ADMIN_HASH)
+        if hmac.compare_digest(hashed_attempt, ADMIN_HASH):
+            exp = datetime.utcnow() + timedelta(minutes=15)
+            token = jwt.encode({"exp": exp}, JWT_SECRET, algorithm="HS256")
+            if isinstance(token, bytes):
+                token = token.decode()
+            return jsonify({"token": token}), 200
+    except ValueError:
+        pass
+    return jsonify({"message": "Invalid credentials."}), 401
 
 # --- Classification helpers ---
 def get_region(location: str) -> str:
@@ -436,12 +476,11 @@ def get_carousels():
     except Exception as e:
         return jsonify({"message": "Error fetching carousels", "error": str(e)}), 500
 
-@app.route('/api/admin/verify-key', methods=['POST'])
+@app.route('/api/admin/verify-token', methods=['POST'])
 @protect
-def verify_key():
-    # If the @protect decorator passes, the key is valid.
-    # We just need to return a success message.
-    return jsonify({"message": "Admin key is valid."}), 200
+def verify_token():
+    """Simple endpoint to verify that a provided JWT is valid."""
+    return jsonify({"message": "Token is valid."}), 200
 
 if __name__ == "__main__":
     app.run(debug=True, port=int(os.environ.get("PORT", 3001)))

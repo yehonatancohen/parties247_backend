@@ -16,7 +16,12 @@ from bs4 import BeautifulSoup
 # --- App setup ---
 load_dotenv()
 app = Flask(__name__)
-CORS(app)
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",  # Local development
+    "https://staging.parties247.com",  # Staging
+    "https://parties247.com",  # Production
+]
+CORS(app, origins=ALLOWED_ORIGINS, supports_credentials=False)
 logging.basicConfig(level=logging.INFO)
 
 # --- URL canonicalization ---

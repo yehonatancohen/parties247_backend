@@ -603,10 +603,8 @@ def reorder_carousels():
     ops = [UpdateOne({"_id": oid}, {"$set": {"order": idx}}) for idx, oid in enumerate(ids)]
     if not ops:
         return jsonify({"message": "No items to reorder"}), 400
-    carousels_collection.bulk_write(ops, ordered=True)
     try:
-        if ops:
-            carousels_collection.bulk_write(ops)
+        carousels_collection.bulk_write(ops, ordered=True)
         return jsonify({"message": "Reordered"}), 200
     except Exception as e:
         return jsonify({"message": "Error reordering carousels", "error": str(e)}), 500
@@ -624,7 +622,7 @@ def list_tags():
         return jsonify({"message": "Error fetching tags", "error": str(e)}), 500
 
 @app.route("/api/admin/tags/order", methods=["POST"])
-@limiter.limit("10 per minute")
+@limiter.limit("100 per minute")
 @protect
 def reorder_tag():
     payload = request.get_json(silent=True) or {}
@@ -654,53 +652,41 @@ def reorder_tag():
     except Exception as e:
         return jsonify({"message": "Error updating tag order", "error": str(e)}), 500
 
-@app.route("/api/admin/tags/rename", methods=["POST"])
+@app.route("/api/admin/carousel/rename", methods=["POST"])
 @limiter.limit("100 per minute")
 @protect
-def rename_tag():
+def rename_carousel():
     payload = request.get_json(silent=True) or {}
-    tag_id = (payload.get("tagId") or "").strip()
-    new = (payload.get("newName") or "").strip()
-    if not tag_id or not new:
-        return jsonify({"message": "tagId and newName are required"}), 400
+    carousel_id = (payload.get("carouselId") or "").strip()
+    new_title = (payload.get("newName") or "").strip()
+    if not carousel_id or not new_title:
+        return jsonify({"message": "carouselId and newName are required"}), 400
 
-    tag_doc = None
-    obj_id = None
     try:
-        obj_id = ObjectId(tag_id)
-        tag_doc = tags_collection.find_one({"_id": obj_id})
-    except Exception:
-        tag_doc = None
-    if not tag_doc:
-        # Fall back to string _id lookup for tags stored with non-ObjectId identifiers
-        tag_doc = tags_collection.find_one({"_id": tag_id})
-        obj_id = tag_id
-    if not tag_doc:
-        return jsonify({"message": "Tag not found"}), 404
+        obj_id = ObjectId(carousel_id)
+    except Exception as e:
+        return jsonify({"message": "Invalid carouselId", "error": str(e)}), 400
 
-    old_name = tag_doc.get("name", tag_doc.get("slug"))
-    old_slug = tag_doc.get("slug")
-    new_slug = slugify_tag(new)
+    carousel = carousels_collection.find_one({"_id": obj_id})
+    if not carousel:
+        return jsonify({"message": "Carousel not found"}), 404
 
-    if old_slug == new_slug and old_name == new:
+    old_title = carousel.get("title", "")
+    if old_title == new_title:
         return jsonify({"message": "No change"}), 200
 
-    existing_new = tags_collection.find_one({"slug": new_slug})
-    if existing_new and existing_new["_id"] != tag_doc["_id"]:
-        return jsonify({"message": "A tag with the new name already exists"}), 409
+    existing = carousels_collection.find_one({"title": new_title})
+    if existing and existing["_id"] != carousel["_id"]:
+        return jsonify({"message": "A carousel with the new title already exists"}), 409
+
     try:
-        tags_collection.update_one(
-            {"_id": tag_doc["_id"]},
-            {"$set": {"name": new, "slug": new_slug}}
+        carousels_collection.update_one(
+            {"_id": carousel["_id"]},
+            {"$set": {"title": new_title}}
         )
-        parties_collection.update_many(
-            {"tags": old_name},
-            {"$set": {"tags.$[elem]": new}},
-            array_filters=[{"elem": old_name}]
-        )
-        return jsonify({"message": "Tag renamed"}), 200
+        return jsonify({"message": "Carousel renamed"}), 200
     except Exception as e:
-        return jsonify({"message": "Error renaming tag", "error": str(e)}), 500
+        return jsonify({"message": "Error renaming carousel", "error": str(e)}), 500
 
 # --- Referral APIs ---
 REFERRAL_KEY = "referral"

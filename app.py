@@ -6,6 +6,7 @@ import re
 from datetime import datetime, timedelta
 from functools import wraps
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+from pymongo import UpdateOne
 import socket
 import ipaddress
 
@@ -233,7 +234,7 @@ class TagRenameRequest(BaseModel):
 
 # --- Referral schemas ---
 class ReferralUpdateSchema(BaseModel):
-    referral: str
+    code: str
     class Config:
         extra = "forbid"
 
@@ -257,6 +258,7 @@ class PartyUpdateSchema(BaseModel):
     originalUrl: str | None = None
     canonicalUrl: str | None = None
     goOutUrl: str | None = None
+    referralCode: str | None = None
     class Config:
         extra = "forbid"
 
@@ -270,6 +272,7 @@ class CarouselCreateSchema(BaseModel):
 class CarouselUpdateSchema(BaseModel):
     title: str | None = None
     partyIds: list[str] | None = None
+    order: int | None = None
     class Config:
         extra = "forbid"
 
@@ -423,7 +426,7 @@ def scrape_party_details(url: str):
 
 # Parties
 @app.route("/api/admin/add-party", methods=["POST"])
-@limiter.limit("10 per minute")
+@limiter.limit("100 per minute")
 @protect
 def add_party():
     payload = request.get_json(silent=True) or {}
@@ -459,7 +462,7 @@ def add_party():
         return jsonify({"message": f"An error occurred: {str(e)}"}), 500
 
 @app.route("/api/admin/delete-party/<party_id>", methods=["DELETE"])
-@limiter.limit("10 per minute")
+@limiter.limit("100 per minute")
 @protect
 def delete_party(party_id):
     try:
@@ -472,7 +475,7 @@ def delete_party(party_id):
         return jsonify({"message": "Error deleting party", "error": str(e)}), 500
 
 @app.route("/api/admin/update-party/<party_id>", methods=["PUT"])
-@limiter.limit("10 per minute")
+@limiter.limit("100 per minute")
 @protect
 def update_party(party_id):
     try:
@@ -529,7 +532,6 @@ def add_carousel():
         return jsonify({"message": "Error adding carousel", "error": str(e)}), 500
 
 @app.route("/api/admin/carousels/<carousel_id>", methods=["PUT"])
-@limiter.limit("10 per minute")
 @protect
 def update_carousel(carousel_id):
     payload = request.get_json(silent=True) or {}
@@ -551,7 +553,6 @@ def update_carousel(carousel_id):
         return jsonify({"message": "Error updating carousel", "error": str(e)}), 500
 
 @app.route("/api/admin/carousels/<carousel_id>", methods=["DELETE"])
-@limiter.limit("10 per minute")
 @protect
 def delete_carousel(carousel_id):
     try:
@@ -577,7 +578,6 @@ def get_carousels():
         return jsonify({"message": "Error fetching carousels", "error": str(e)}), 500
 
 @app.route("/api/admin/carousels/reorder", methods=["POST"])
-@limiter.limit("10 per minute")
 @protect
 def reorder_carousels():
     payload = request.get_json(silent=True) or {}
@@ -593,9 +593,11 @@ def reorder_carousels():
     existing = list(carousels_collection.find({"_id": {"$in": ids}}, {"_id": 1}))
     if len(existing) != len(ids):
         return jsonify({"message": "Some carousel IDs do not exist."}), 400
-    ops = []
-    for idx, oid in enumerate(ids):
-        ops.append(carousels_collection.update_one({"_id": oid}, {"$set": {"order": idx}}))
+    ids = [ObjectId(i) for i in req.orderedIds]
+    ops = [UpdateOne({"_id": oid}, {"$set": {"order": idx}}) for idx, oid in enumerate(ids)]
+    if not ops:
+        return jsonify({"message": "No items to reorder"}), 400
+    carousels_collection.bulk_write(ops, ordered=True)
     try:
         if ops:
             carousels_collection.bulk_write(ops)
@@ -647,48 +649,46 @@ def reorder_tag():
         return jsonify({"message": "Error updating tag order", "error": str(e)}), 500
 
 @app.route("/api/admin/tags/rename", methods=["POST"])
-@limiter.limit("10 per minute")
+@limiter.limit("100 per minute")
 @protect
 def rename_tag():
     payload = request.get_json(silent=True) or {}
+    # Expect tagId and newName in the payload
+    tag_id = payload.get("tagId", "").strip()
+    new = (payload.get("newName") or "").strip()
+    if not tag_id or not new:
+        return jsonify({"message": "tagId and newName are required"}), 400
     try:
-        req = TagRenameRequest(**payload)
-    except ValidationError as ve:
-        return jsonify({"message": "Invalid payload", "errors": ve.errors()}), 400
-    old = (req.oldName or "").strip()
-    new = (req.newName or "").strip()
-    if not old or not new:
-        return jsonify({"message": "oldName and newName are required"}), 400
-    old_slug = slugify_tag(old)
+        obj_id = ObjectId(tag_id)
+    except Exception as e:
+        return jsonify({"message": "Invalid tagId", "error": str(e)}), 400
+
+    tag_doc = tags_collection.find_one({"_id": obj_id})
+    if not tag_doc:
+        return jsonify({"message": "Tag not found"}), 404
+
+    old_name = tag_doc.get("name", tag_doc.get("slug"))
+    old_slug = tag_doc.get("slug")
     new_slug = slugify_tag(new)
-    if old_slug == new_slug and old == new:
+
+    if old_slug == new_slug and old_name == new:
         return jsonify({"message": "No change"}), 200
-    # prevent collision
+
+    # prevent collision with other tags using the new slug
     existing_new = tags_collection.find_one({"slug": new_slug})
-    if existing_new and existing_new.get("name") != old:
+    if existing_new and existing_new["_id"] != obj_id:
         return jsonify({"message": "A tag with the new name already exists"}), 409
     try:
-        # upsert/update tag doc
-        src = tags_collection.find_one({"slug": old_slug})
-        if src:
-            tags_collection.update_one(
-                {"_id": src["_id"]},
-                {"$set": {"name": new, "slug": new_slug}}
-            )
-        else:
-            # create at end if old didn't exist
-            last = tags_collection.find().sort("order", -1).limit(1)
-            last_order = next(last, {}).get("order", -1)
-            tags_collection.update_one(
-                {"slug": new_slug},
-                {"$setOnInsert": {"name": new, "slug": new_slug, "order": last_order + 1}},
-                upsert=True
-            )
-        # rename inside parties.tags arrays
+        # update the tag document with the new values
+        tags_collection.update_one(
+            {"_id": obj_id},
+            {"$set": {"name": new, "slug": new_slug}}
+        )
+        # update parties to replace the old tag name with the new name in the tags array
         parties_collection.update_many(
-            {"tags": old},
+            {"tags": old_name},
             {"$set": {"tags.$[elem]": new}},
-            array_filters=[{"elem": old}]
+            array_filters=[{"elem": old_name}]
         )
         return jsonify({"message": "Tag renamed"}), 200
     except Exception as e:
@@ -698,7 +698,6 @@ def rename_tag():
 REFERRAL_KEY = "referral"
 
 @app.route("/api/referral", methods=["GET"])
-@limiter.limit("100 per minute")
 def get_referral():
     try:
         doc = settings_collection.find_one({"key": REFERRAL_KEY})
@@ -707,7 +706,6 @@ def get_referral():
         return jsonify({"message": "Error fetching referral", "error": str(e)}), 500
 
 @app.route("/api/admin/referral", methods=["POST"])
-@limiter.limit("10 per minute")
 @protect
 def set_referral():
     payload = request.get_json(silent=True) or {}
@@ -715,7 +713,7 @@ def set_referral():
         req = ReferralUpdateSchema(**payload)
     except ValidationError as ve:
         return jsonify({"message": "Invalid payload", "errors": ve.errors()}), 400
-    val = (req.referral or "").strip()
+    val = (req.code or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", val):
         return jsonify({"message": "Invalid referral format. Use 1-64 chars [A-Za-z0-9_-]."}), 400
     try:

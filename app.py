@@ -190,7 +190,7 @@ def protect(f):
         return jsonify({"message": "Unauthorized."}), 401
     return decorated_function
 
-@app.get("/health")
+@app.route("/api/health")
 async def health():
     return {"status": "ok"}
 

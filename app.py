@@ -192,7 +192,7 @@ def protect(f):
 
 @app.route("/api/health")
 async def health():
-    return {"status": "ok"}
+    return jsonify({"status": "ok"}), 200
 
 @app.route("/api/admin/login", methods=["POST"])
 def admin_login():

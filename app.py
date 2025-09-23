@@ -190,6 +190,10 @@ def protect(f):
         return jsonify({"message": "Unauthorized."}), 401
     return decorated_function
 
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
 @app.route("/api/admin/login", methods=["POST"])
 def admin_login():
     data = request.get_json(silent=True) or {}

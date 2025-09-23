@@ -177,6 +177,9 @@ ADMIN_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "").encode()
 def protect(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
+        if not JWT_SECRET:
+            app.logger.error("JWT secret not configured; rejecting protected request.")
+            return jsonify({"message": "Server misconfigured."}), 500
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header.split(" ", 1)[1].strip()
@@ -190,15 +193,57 @@ def protect(f):
         return jsonify({"message": "Unauthorized."}), 401
     return decorated_function
 
-@app.route("/api/health")
-async def health():
+def apply_security_headers(response):
+    """Apply a minimal set of security headers on every response."""
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return response
+    headers.setdefault("X-Content-Type-Options", "nosniff")
+    headers.setdefault("X-Frame-Options", "DENY")
+    headers.setdefault("Referrer-Policy", "same-origin")
+    headers.setdefault("X-XSS-Protection", "1; mode=block")
+    return response
+
+
+if hasattr(app, "after_request"):
+    app.after_request(apply_security_headers)
+
+
+@app.route("/api/health", methods=["GET"])
+def health():
+    """Lightweight health-check endpoint used by monitoring probes."""
     return jsonify({"status": "ok"}), 200
+
+
+@app.route("/api/docs", methods=["GET"])
+def docs():
+    """Return a minimal machine-readable description of public endpoints."""
+    return (
+        jsonify(
+            {
+                "endpoints": [
+                    {"path": "/api/health", "methods": ["GET"], "description": "Service liveness probe."},
+                    {"path": "/api/docs", "methods": ["GET"], "description": "This documentation payload."},
+                    {"path": "/api/parties", "methods": ["GET"], "description": "List public parties."},
+                    {"path": "/api/tags", "methods": ["GET"], "description": "List available tags."},
+                    {"path": "/api/referral", "methods": ["GET"], "description": "Get referral configuration."},
+                    {
+                        "path": "/api/admin/*",
+                        "methods": ["POST", "PUT", "DELETE"],
+                        "description": "Administrative APIs protected by JWT bearer tokens.",
+                    },
+                ]
+            }
+        ),
+        200,
+    )
 
 @app.route("/api/admin/login", methods=["POST"])
 def admin_login():
     data = request.get_json(silent=True) or {}
     password = (data.get("password") or "").encode()
-    if not ADMIN_HASH:
+    if not ADMIN_HASH or not JWT_SECRET:
+        app.logger.error("Admin credentials or JWT secret missing; refusing login attempt.")
         return jsonify({"message": "Server misconfigured."}), 500
     try:
         hashed_attempt = bcrypt.hashpw(password, ADMIN_HASH)
@@ -655,6 +700,47 @@ def reorder_tag():
         return jsonify({"message": "Tag order updated"}), 200
     except Exception as e:
         return jsonify({"message": "Error updating tag order", "error": str(e)}), 500
+
+@app.route("/api/admin/tags/rename", methods=["POST"])
+@limiter.limit("100 per minute")
+@protect
+def rename_tag():
+    payload = request.get_json(silent=True) or {}
+    tag_id_raw = (payload.get("tagId") or "").strip()
+    new_name = (payload.get("newName") or "").strip()
+    if not tag_id_raw or not new_name:
+        return jsonify({"message": "tagId and newName are required"}), 400
+
+    try:
+        tag_id = ObjectId(tag_id_raw)
+    except Exception as exc:
+        return jsonify({"message": "Invalid tagId", "error": str(exc)}), 400
+
+    tag_doc = tags_collection.find_one({"_id": tag_id})
+    if not tag_doc:
+        return jsonify({"message": "Tag not found"}), 404
+
+    new_slug = slugify_tag(new_name)
+    existing = tags_collection.find_one({"slug": new_slug})
+    if existing and existing.get("_id") != tag_doc.get("_id"):
+        return jsonify({"message": "A tag with that name already exists"}), 409
+
+    old_name = tag_doc.get("name", "")
+    try:
+        tags_collection.update_one(
+            {"_id": tag_doc["_id"]},
+            {"$set": {"name": new_name, "slug": new_slug}},
+        )
+        if old_name:
+            parties_collection.update_many(
+                {"tags": old_name},
+                {"$set": {"tags.$[elem]": new_name}},
+                array_filters=[{"elem": old_name}],
+            )
+        return jsonify({"message": "Tag renamed"}), 200
+    except Exception as exc:
+        return jsonify({"message": "Error renaming tag", "error": str(exc)}), 500
+
 
 @app.route("/api/admin/carousel/rename", methods=["POST"])
 @limiter.limit("100 per minute")

@@ -57,6 +57,7 @@ def test_get_region_music_event_age_tags():
 
 def test_protect_decorator():
     flask_mod = sys.modules['flask']
+    app.JWT_SECRET = 'secret'
 
     @app.protect
     def hello():

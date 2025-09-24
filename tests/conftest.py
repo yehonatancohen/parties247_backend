@@ -96,7 +96,10 @@ sys.modules['bson'] = types.SimpleNamespace(objectid=types.SimpleNamespace(Objec
 sys.modules['bson.objectid'] = sys.modules['bson'].objectid
 
 # stub requests
-sys.modules['requests'] = types.SimpleNamespace(get=lambda url, headers=None, timeout=None: types.SimpleNamespace(status_code=200, text='', raise_for_status=lambda: None))
+sys.modules['requests'] = types.SimpleNamespace(
+    get=lambda url, headers=None, timeout=None: types.SimpleNamespace(status_code=200, text='', raise_for_status=lambda: None),
+    post=lambda url, json=None, timeout=None: types.SimpleNamespace(status_code=200, text='', raise_for_status=lambda: None),
+)
 
 # stub bs4
 sys.modules['bs4'] = types.SimpleNamespace(BeautifulSoup=lambda text, parser: types.SimpleNamespace(find=lambda *a, **k: types.SimpleNamespace(string='{}', get=lambda x: None)))

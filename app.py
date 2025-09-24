@@ -3,9 +3,10 @@ import json
 import logging
 import hmac
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from functools import wraps
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode, quote_plus
 try:
     from pymongo import UpdateOne
 except Exception:  # pragma: no cover - used only when pymongo isn't available in tests
@@ -38,9 +39,162 @@ CORS(app)
 limiter = Limiter(get_remote_address, app=app)
 logging.basicConfig(level=logging.INFO)
 
+CANONICAL_BASE_URL = (os.environ.get("CANONICAL_BASE_URL") or "https://parties247-website.vercel.app").rstrip("/")
+INDEXNOW_KEY = os.environ.get("INDEXNOW_KEY")
+INDEXNOW_ENDPOINT = os.environ.get("INDEXNOW_ENDPOINT", "https://api.indexnow.org/indexnow")
+INDEXNOW_KEY_LOCATION = os.environ.get("INDEXNOW_KEY_LOCATION")
+REVALIDATE_ENDPOINT = os.environ.get("REVALIDATE_ENDPOINT")
+REVALIDATE_SECRET = os.environ.get("REVALIDATE_SECRET")
+
+EVENT_CACHE_SECONDS = 1800
+LIST_CACHE_SECONDS = 600
+FEED_CACHE_SECONDS = 900
+ICS_CACHE_SECONDS = 3600
+SITEMAP_CACHE_SECONDS = 900
+EVENT_SITEMAP_CHUNK = 500
+
 # --- URL canonicalization ---
 TRACKING_PREFIXES = ("utm_",)
 TRACKING_KEYS = {"fbclid", "gclid", "mc_cid", "mc_eid"}
+
+CANONICAL_PATTERNS = {
+    "event": "/event/{slug}",
+    "city": "/city/{slug}",
+    "venue": "/venue/{slug}",
+    "genre": "/genre/{slug}",
+    "date": "/date/{slug}",
+    "events_feed": "/feeds/events.{fmt}",
+    "scoped_feed": "/feeds/{slug}.{fmt}",
+    "events_ics": "/ics/event/{slug}.ics",
+    "city_ics": "/ics/city/{slug}.ics",
+    "sitemap_index": "/sitemap.xml",
+    "sitemap_child": "/sitemaps/{name}",
+}
+
+
+def build_canonical(kind: str, **params) -> str:
+    """Return an absolute canonical URL based on the configured host."""
+    pattern = CANONICAL_PATTERNS.get(kind)
+    if not pattern:
+        raise KeyError(f"Unsupported canonical kind: {kind}")
+    path = pattern.format(**params)
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"{CANONICAL_BASE_URL}{path}"
+
+
+def absolute_url(path: str) -> str:
+    """Build an absolute URL from an absolute or relative path."""
+    if not path:
+        return CANONICAL_BASE_URL
+    if path.startswith("http://") or path.startswith("https://"):
+        return path
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"{CANONICAL_BASE_URL}{path}"
+
+
+def slugify_value(value: str | None) -> str | None:
+    if not value:
+        return None
+    slug = re.sub(r"[^0-9a-zA-Z]+", "-", value.lower()).strip("-")
+    return slug or None
+
+
+def parse_datetime(value) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            if text.endswith("Z"):
+                return datetime.fromisoformat(text[:-1]).replace(tzinfo=timezone.utc)
+            return datetime.fromisoformat(text)
+        except ValueError:
+            pass
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(text, fmt)
+                if fmt == "%Y-%m-%d":
+                    return datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
+                return dt.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+    return None
+
+
+def isoformat_or_none(value) -> str | None:
+    dt = parse_datetime(value)
+    if not dt:
+        return None
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def extract_bilingual(source: dict, base_key: str, fallback: str | None = None) -> dict:
+    he_keys = [f"{base_key}He", f"{base_key}_he", f"{base_key}_hebrew"]
+    en_keys = [f"{base_key}En", f"{base_key}_en", f"{base_key}_english"]
+    he_val = None
+    en_val = None
+    for key in he_keys:
+        if key in source and source[key]:
+            he_val = source[key]
+            break
+    for key in en_keys:
+        if key in source and source[key]:
+            en_val = source[key]
+            break
+    base_val = source.get(base_key)
+    if isinstance(base_val, dict):
+        he_val = he_val or base_val.get("he")
+        en_val = en_val or base_val.get("en")
+    elif isinstance(base_val, str):
+        he_val = he_val or base_val
+        en_val = en_val or base_val
+    he_val = he_val or fallback or ""
+    en_val = en_val or fallback or ""
+    return {"he": he_val, "en": en_val}
+
+
+def extract_geo(doc: dict) -> dict:
+    geo = doc.get("geo") or {}
+    if isinstance(geo, dict):
+        lat = geo.get("lat") or geo.get("latitude")
+        lon = geo.get("lon") or geo.get("lng") or geo.get("longitude")
+        address = geo.get("address") or geo.get("street")
+        postal = geo.get("postalCode") or geo.get("zip")
+    else:
+        lat = lon = address = postal = None
+    lat = lat if isinstance(lat, (int, float)) else doc.get("lat") or doc.get("latitude")
+    lon = lon if isinstance(lon, (int, float)) else doc.get("lon") or doc.get("longitude")
+    address = address or doc.get("address") or doc.get("location")
+    postal = postal or doc.get("postalCode")
+    result = {
+        "lat": float(lat) if isinstance(lat, (int, float, str)) and str(lat).strip() else None,
+        "lon": float(lon) if isinstance(lon, (int, float, str)) and str(lon).strip() else None,
+        "address": address or "",
+        "postalCode": postal or "",
+    }
+    return result
+
+
+def derive_status(doc: dict) -> str:
+    status = (doc.get("status") or "").lower()
+    allowed = {"scheduled", "cancelled", "postponed", "past"}
+    if status in allowed:
+        return status
+    start = parse_datetime(doc.get("startsAt") or doc.get("date"))
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    if start and start < now:
+        return "past"
+    return "scheduled"
 
 def normalize_url(raw: str) -> str:
     p = urlparse((raw or "").strip())
@@ -88,6 +242,26 @@ def is_url_allowed(raw: str) -> bool:
         if ip.is_private or ip.is_loopback or ip.is_reserved or ip.is_link_local or ip.is_multicast:
             return False
     return True
+
+
+def json_response(payload, status: int = 200, cache_seconds: int | None = None, robots: str | None = "noindex"):
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if cache_seconds is not None:
+        headers["Cache-Control"] = f"public, max-age={cache_seconds}"
+    if robots:
+        headers["X-Robots-Tag"] = robots
+    return jsonify(payload), status, headers
+
+
+def text_response(body: str, content_type: str, cache_seconds: int | None = None, robots: str | None = None, status: int = 200):
+    headers = {"Content-Type": content_type}
+    if cache_seconds is not None:
+        headers["Cache-Control"] = f"public, max-age={cache_seconds}"
+    if robots:
+        headers["X-Robots-Tag"] = robots
+    return body, status, headers
 
 # --- Mongo helpers ---
 def ensure_index(coll: Collection, keys, name: str, **kwargs):
@@ -169,6 +343,405 @@ except Exception as e:
     carousels_collection = None
     tags_collection = None
     settings_collection = None
+
+
+def record_setting_hit(key: str, extra: dict | None = None):
+    if not settings_collection:
+        return
+    payload = {"key": key, "lastHit": datetime.utcnow()}
+    if extra:
+        payload.update(extra)
+    try:
+        settings_collection.update_one({"key": key}, {"$set": payload}, upsert=True)
+    except Exception as exc:  # pragma: no cover - best effort only
+        app.logger.warning(f"Failed to persist analytics hit {key}: {exc}")
+
+
+def all_events() -> list[dict]:
+    if not parties_collection:
+        return []
+    try:
+        docs = list(parties_collection.find())
+    except TypeError:  # pragma: no cover - compatibility with simple stubs
+        docs = list(parties_collection.find({}))
+    except Exception as exc:
+        app.logger.error(f"Failed to fetch events: {exc}")
+        return []
+    for doc in docs:
+        if "_id" in doc:
+            doc["_id"] = str(doc["_id"])
+    return docs
+
+
+def normalize_event(doc: dict) -> dict:
+    slug = doc.get("slug") or doc.get("slug_en") or doc.get("slug_he")
+    if not slug:
+        slug = slugify_value(doc.get("canonicalUrl")) or slugify_value(doc.get("name"))
+    title = extract_bilingual(doc, "name", fallback=doc.get("title"))
+    description = extract_bilingual(doc, "description")
+    summary = extract_bilingual(doc, "summary", fallback=description.get("en") or description.get("he"))
+    starts_at = isoformat_or_none(doc.get("startsAt") or doc.get("date"))
+    ends_at = isoformat_or_none(doc.get("endsAt") or doc.get("endDate"))
+    lastmod_candidates = [
+        doc.get("updatedAt"),
+        doc.get("modifiedAt"),
+        doc.get("lastModified"),
+        doc.get("lastmod"),
+        doc.get("createdAt"),
+        doc.get("date"),
+    ]
+    lastmod = None
+    for candidate in lastmod_candidates:
+        lastmod = isoformat_or_none(candidate)
+        if lastmod:
+            break
+    geo = extract_geo(doc)
+
+    city_raw = doc.get("city") or {}
+    if isinstance(city_raw, str):
+        city_name = city_raw
+        city_slug = slugify_value(city_raw)
+        city_geo = geo
+    elif isinstance(city_raw, dict):
+        city_name = city_raw.get("name") or city_raw.get("title") or ""
+        city_slug = city_raw.get("slug") or slugify_value(city_name)
+        city_geo = extract_geo(city_raw)
+    else:
+        city_name = ""
+        city_slug = None
+        city_geo = {"lat": None, "lon": None, "address": "", "postalCode": ""}
+    city = {
+        "slug": city_slug or "",
+        "name": extract_bilingual(city_raw if isinstance(city_raw, dict) else {}, "name", fallback=city_name),
+        "geo": city_geo,
+        "canonicalUrl": build_canonical("city", slug=city_slug or ""),
+    }
+
+    venue_raw = doc.get("venue") or {}
+    if isinstance(venue_raw, str):
+        venue_name = venue_raw
+        venue_slug = slugify_value(venue_raw)
+        venue_geo = geo
+    elif isinstance(venue_raw, dict):
+        venue_name = venue_raw.get("name") or venue_raw.get("title") or ""
+        venue_slug = venue_raw.get("slug") or slugify_value(venue_name)
+        venue_geo = extract_geo(venue_raw)
+    else:
+        venue_name = ""
+        venue_slug = None
+        venue_geo = {"lat": None, "lon": None, "address": "", "postalCode": ""}
+    venue = {
+        "slug": venue_slug or "",
+        "name": extract_bilingual(venue_raw if isinstance(venue_raw, dict) else {}, "name", fallback=venue_name),
+        "geo": venue_geo,
+        "canonicalUrl": build_canonical("venue", slug=venue_slug or ""),
+    }
+
+    genres = []
+    raw_genres = doc.get("genres") or doc.get("tags") or []
+    if isinstance(raw_genres, str):
+        raw_genres = [raw_genres]
+    for item in raw_genres:
+        if isinstance(item, dict):
+            name = item.get("name") or item.get("title") or ""
+            slug_val = item.get("slug") or slugify_value(name)
+            genres.append({
+                "slug": slug_val or "",
+                "name": extract_bilingual(item, "name", fallback=name),
+                "canonicalUrl": build_canonical("genre", slug=slug_val or ""),
+            })
+        elif isinstance(item, str):
+            slug_val = slugify_value(item)
+            genres.append({
+                "slug": slug_val or "",
+                "name": {"he": item, "en": item},
+                "canonicalUrl": build_canonical("genre", slug=slug_val or ""),
+            })
+
+    event_status = derive_status(doc)
+    canonical_url = build_canonical("event", slug=slug or "")
+    images = doc.get("images") or []
+    if isinstance(images, str):
+        images = [images]
+
+    return {
+        "slug": slug or "",
+        "status": event_status,
+        "title": title,
+        "summary": summary,
+        "description": description,
+        "canonicalUrl": canonical_url,
+        "lastmod": lastmod,
+        "startsAt": starts_at,
+        "endsAt": ends_at,
+        "geo": geo,
+        "city": city,
+        "venue": venue,
+        "genres": genres,
+        "images": images,
+        "language": doc.get("language") or {"primary": "he", "available": ["he", "en"]},
+    }
+
+
+def upcoming_events(events: list[dict]) -> list[dict]:
+    now = datetime.utcnow().replace(tzinfo=timezone.utc)
+    upcoming = []
+    for event in events:
+        status = derive_status(event)
+        start = parse_datetime(event.get("startsAt") or event.get("date"))
+        if status == "past":
+            continue
+        if start and start < now:
+            continue
+        upcoming.append(event)
+    return upcoming
+
+
+def aggregate_dimension(events: list[dict], key: str) -> list[dict]:
+    aggregates: dict[str, dict] = {}
+    for event in events:
+        resource = event.get(key) or {}
+        if not isinstance(resource, dict):
+            continue
+        slug = resource.get("slug") or ""
+        if not slug:
+            continue
+        entry = aggregates.setdefault(slug, {
+            "slug": slug,
+            "name": resource.get("name", {"he": "", "en": ""}),
+            "geo": resource.get("geo", {"lat": None, "lon": None, "address": "", "postalCode": ""}),
+            "lastmod": event.get("lastmod"),
+            "eventCount": 0,
+        })
+        entry["eventCount"] += 1
+        if event.get("lastmod"):
+            if not entry.get("lastmod") or event["lastmod"] > entry["lastmod"]:
+                entry["lastmod"] = event["lastmod"]
+    result = []
+    for slug, payload in aggregates.items():
+        payload["canonicalUrl"] = build_canonical(key[:-1] if key.endswith("s") else key, slug=slug)
+        result.append(payload)
+    result.sort(key=lambda item: item["slug"])
+    return result
+
+
+def serialize_events(include_past: bool = True) -> list[dict]:
+    docs = all_events()
+    serialized = [normalize_event(doc) for doc in docs]
+    if not include_past:
+        serialized = [event for event in serialized if event["status"] != "past"]
+    serialized.sort(key=lambda event: (event.get("startsAt") or "", event.get("slug")))
+    return serialized
+
+
+def unique_dates(events: list[dict]) -> list[dict]:
+    seen: dict[str, dict] = {}
+    for event in events:
+        start = event.get("startsAt")
+        if not start:
+            continue
+        day = start.split("T", 1)[0]
+        entry = seen.setdefault(day, {"slug": day, "lastmod": event.get("lastmod"), "eventCount": 0})
+        entry["eventCount"] += 1
+        if event.get("lastmod") and event["lastmod"] > (entry.get("lastmod") or ""):
+            entry["lastmod"] = event["lastmod"]
+    results = []
+    for slug, payload in seen.items():
+        payload["canonicalUrl"] = build_canonical("date", slug=slug)
+        results.append(payload)
+    results.sort(key=lambda item: item["slug"])
+    return results
+
+
+def aggregate_genres(events: list[dict]) -> list[dict]:
+    aggregates: dict[str, dict] = {}
+    for event in events:
+        for genre in event.get("genres", []):
+            slug = genre.get("slug") or ""
+            if not slug:
+                continue
+            entry = aggregates.setdefault(slug, {
+                "slug": slug,
+                "name": genre.get("name", {"he": "", "en": ""}),
+                "canonicalUrl": genre.get("canonicalUrl", build_canonical("genre", slug=slug)),
+                "lastmod": event.get("lastmod"),
+                "eventCount": 0,
+            })
+            entry["eventCount"] += 1
+            if event.get("lastmod") and event["lastmod"] > (entry.get("lastmod") or ""):
+                entry["lastmod"] = event["lastmod"]
+    items = list(aggregates.values())
+    items.sort(key=lambda item: item["slug"])
+    return items
+
+
+def shard_events(events: list[dict], chunk_size: int = EVENT_SITEMAP_CHUNK) -> list[list[dict]]:
+    if chunk_size <= 0:
+        return [events]
+    return [events[i : i + chunk_size] for i in range(0, len(events), chunk_size)] or [[]]
+
+
+def format_rfc822(date_str: str | None) -> str | None:
+    if not date_str:
+        return None
+    dt = parse_datetime(date_str)
+    if not dt:
+        return None
+    return format_datetime(dt)
+
+
+def format_ics(date_str: str | None) -> str | None:
+    if not date_str:
+        return None
+    dt = parse_datetime(date_str)
+    if not dt:
+        return None
+    return dt.strftime("%Y%m%dT%H%M%SZ")
+
+
+def build_feed(events: list[dict], title: str, url: str, fmt: str) -> str:
+    updated = None
+    for event in events:
+        if event.get("lastmod"):
+            if not updated or event["lastmod"] > updated:
+                updated = event["lastmod"]
+    updated_rfc = format_rfc822(updated) or format_rfc822(datetime.utcnow().replace(tzinfo=timezone.utc).isoformat())
+
+    if fmt == "rss":
+        items = []
+        for event in events:
+            pub = format_rfc822(event.get("startsAt") or event.get("lastmod")) or updated_rfc
+            description = event.get("summary", {}).get("en") or event.get("summary", {}).get("he")
+            items.append(
+                """<item><title>{title}</title><link>{link}</link><guid isPermaLink="true">{link}</guid><pubDate>{pub}</pubDate><description>{desc}</description></item>""".format(
+                    title=(event.get("title", {}).get("en") or event.get("title", {}).get("he") or ""),
+                    link=event.get("canonicalUrl"),
+                    pub=pub,
+                    desc=(description or ""),
+                )
+            )
+        return (
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            f"<rss version=\"2.0\"><channel><title>{title}</title><link>{url}</link><lastBuildDate>{updated_rfc}</lastBuildDate>"
+            + "".join(items)
+            + "</channel></rss>"
+        )
+    if fmt == "atom":
+        entries = []
+        for event in events:
+            updated_entry = event.get("lastmod") or updated or ""
+            entries.append(
+                """<entry><title>{title}</title><id>{link}</id><link href="{link}"/><updated>{updated}</updated><summary>{summary}</summary></entry>""".format(
+                    title=(event.get("title", {}).get("en") or event.get("title", {}).get("he") or ""),
+                    link=event.get("canonicalUrl"),
+                    updated=event.get("lastmod") or updated or "",
+                    summary=(event.get("summary", {}).get("en") or event.get("summary", {}).get("he") or ""),
+                )
+            )
+        return (
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            f"<feed xmlns=\"http://www.w3.org/2005/Atom\"><title>{title}</title><id>{url}</id><updated>{updated or ''}</updated>"
+            + "".join(entries)
+            + "</feed>"
+        )
+    # default to json feed
+    items = []
+    for event in events:
+        items.append(
+            {
+                "id": event.get("canonicalUrl"),
+                "url": event.get("canonicalUrl"),
+                "title": event.get("title", {}).get("en") or event.get("title", {}).get("he"),
+                "summary": event.get("summary", {}).get("en") or event.get("summary", {}).get("he"),
+                "date_published": event.get("startsAt"),
+                "date_modified": event.get("lastmod"),
+            }
+        )
+    feed = {
+        "version": "https://jsonfeed.org/version/1.1",
+        "title": title,
+        "home_page_url": url,
+        "feed_url": url,
+        "items": items,
+    }
+    return json.dumps(feed)
+
+
+def build_ics(events: list[dict], title: str) -> str:
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//parties247//Events//EN",
+        f"X-WR-CALNAME:{title}",
+    ]
+    generated = format_ics(datetime.utcnow().replace(tzinfo=timezone.utc).isoformat())
+    for event in events:
+        uid = f"{event.get('slug')}@parties247"
+        dtstart = format_ics(event.get("startsAt"))
+        dtend = format_ics(event.get("endsAt"))
+        dtstamp = format_ics(event.get("lastmod")) or generated
+        location = event.get("venue", {}).get("name", {}).get("en") or event.get("venue", {}).get("name", {}).get("he")
+        description = event.get("summary", {}).get("en") or event.get("summary", {}).get("he")
+        lines.extend(
+            [
+                "BEGIN:VEVENT",
+                f"UID:{uid}",
+                f"DTSTAMP:{dtstamp}",
+                f"DTSTART:{dtstart}" if dtstart else "",
+                f"DTEND:{dtend}" if dtend else "",
+                f"SUMMARY:{event.get('title', {}).get('en') or event.get('title', {}).get('he')}",
+                f"DESCRIPTION:{description or ''}",
+                f"LOCATION:{location or ''}",
+                f"URL:{event.get('canonicalUrl')}",
+                "END:VEVENT",
+            ]
+        )
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(filter(None, lines)) + "\r\n"
+
+
+def notify_indexers(urls: list[str]):
+    unique = sorted({absolute_url(u) for u in urls if u})
+    if not unique:
+        return
+    payload = {
+        "urls": unique,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+    record_setting_hit("indexing:lastPing", {"urls": unique, "timestamp": payload["timestamp"]})
+    if INDEXNOW_KEY:
+        indexnow_payload = {
+            "host": urlparse(CANONICAL_BASE_URL).netloc,
+            "key": INDEXNOW_KEY,
+            "keyLocation": INDEXNOW_KEY_LOCATION or absolute_url("/indexnow.txt"),
+            "urlList": unique,
+        }
+        try:
+            requests.post(INDEXNOW_ENDPOINT, json=indexnow_payload, timeout=5)
+        except Exception as exc:  # pragma: no cover - network best effort
+            app.logger.warning(f"IndexNow ping failed: {exc}")
+    sitemap_url = build_canonical("sitemap_index")
+    for ping_url in (
+        f"https://www.google.com/ping?sitemap={quote_plus(sitemap_url)}",
+        f"https://www.bing.com/ping?sitemap={quote_plus(sitemap_url)}",
+    ):
+        try:
+            requests.get(ping_url, timeout=5)
+        except Exception as exc:  # pragma: no cover
+            app.logger.warning(f"Search engine ping failed: {exc}")
+
+
+def trigger_revalidation(paths: list[str]):
+    if not REVALIDATE_ENDPOINT or not paths:
+        return
+    payload = {"paths": paths}
+    if REVALIDATE_SECRET:
+        payload["secret"] = REVALIDATE_SECRET
+    try:
+        requests.post(REVALIDATE_ENDPOINT, json=payload, timeout=5)
+        record_setting_hit("indexing:lastRevalidate", {"paths": paths})
+    except Exception as exc:  # pragma: no cover
+        app.logger.warning(f"Revalidation webhook failed: {exc}")
 
 # --- Security ---
 JWT_SECRET = os.environ.get("JWT_SECRET_KEY", "")
@@ -479,6 +1052,73 @@ def scrape_party_details(url: str):
 
 # --- Routes ---
 
+# Static generation data APIs
+
+
+def event_related_paths(event: dict) -> list[str]:
+    paths = {f"/event/{event.get('slug') or ''}"}
+    city_slug = event.get("city", {}).get("slug")
+    if city_slug:
+        paths.add(f"/city/{city_slug}")
+    venue_slug = event.get("venue", {}).get("slug")
+    if venue_slug:
+        paths.add(f"/venue/{venue_slug}")
+    for genre in event.get("genres", []):
+        if genre.get("slug"):
+            paths.add(f"/genre/{genre['slug']}")
+    if event.get("startsAt"):
+        day = event["startsAt"].split("T", 1)[0]
+        paths.add(f"/date/{day}")
+    return sorted(paths)
+
+
+@app.route("/api/events", methods=["GET"])
+@limiter.limit("100 per minute")
+def list_events_api():
+    events = serialize_events(include_past=True)
+    payload = {
+        "generatedAt": isoformat_or_none(datetime.utcnow().replace(tzinfo=timezone.utc)),
+        "items": events,
+    }
+    return json_response(payload, cache_seconds=EVENT_CACHE_SECONDS)
+
+
+@app.route("/api/cities", methods=["GET"])
+@limiter.limit("100 per minute")
+def list_cities_api():
+    events = serialize_events(include_past=False)
+    items = [item for item in aggregate_dimension(events, "city") if item.get("eventCount")]
+    payload = {
+        "generatedAt": isoformat_or_none(datetime.utcnow().replace(tzinfo=timezone.utc)),
+        "items": items,
+    }
+    return json_response(payload, cache_seconds=LIST_CACHE_SECONDS)
+
+
+@app.route("/api/venues", methods=["GET"])
+@limiter.limit("100 per minute")
+def list_venues_api():
+    events = serialize_events(include_past=False)
+    items = [item for item in aggregate_dimension(events, "venue") if item.get("eventCount")]
+    payload = {
+        "generatedAt": isoformat_or_none(datetime.utcnow().replace(tzinfo=timezone.utc)),
+        "items": items,
+    }
+    return json_response(payload, cache_seconds=LIST_CACHE_SECONDS)
+
+
+@app.route("/api/genres", methods=["GET"])
+@limiter.limit("100 per minute")
+def list_genres_api():
+    events = serialize_events(include_past=False)
+    items = [item for item in aggregate_genres(events) if item.get("eventCount")]
+    payload = {
+        "generatedAt": isoformat_or_none(datetime.utcnow().replace(tzinfo=timezone.utc)),
+        "items": items,
+    }
+    return json_response(payload, cache_seconds=LIST_CACHE_SECONDS)
+
+
 # Parties
 @app.route("/api/admin/add-party", methods=["POST"])
 @limiter.limit("100 per minute")
@@ -495,6 +1135,7 @@ def add_party():
         return jsonify({"message": "URL is not allowed."}), 400
     try:
         party_data = scrape_party_details(url)
+        party_data.setdefault("slug", slugify_value(party_data.get("name")))
         canonical = party_data["canonicalUrl"]
         res = parties_collection.update_one(
             {"$or": [{"canonicalUrl": canonical}, {"goOutUrl": canonical}]},
@@ -508,6 +1149,9 @@ def add_party():
             )
             return jsonify({"message": "This party has already been added.", "id": str(doc["_id"])}), 409
         party_data["_id"] = str(res.upserted_id)
+        event_view = normalize_event(party_data)
+        notify_indexers([event_view.get("canonicalUrl")])
+        trigger_revalidation(event_related_paths(event_view))
         return jsonify({"message": "Party added successfully!", "party": party_data}), 201
     except errors.DuplicateKeyError as e:
         app.logger.warning(f"[DB] DuplicateKeyError: {getattr(e, 'details', None)}")
@@ -522,9 +1166,13 @@ def add_party():
 def delete_party(party_id):
     try:
         obj_id = ObjectId(party_id)
+        existing = parties_collection.find_one({"_id": obj_id}) or {}
         result = parties_collection.delete_one({"_id": obj_id})
         if result.deleted_count == 0:
             return jsonify({"message": "Party not found."}), 404
+        event_view = normalize_event(existing)
+        notify_indexers([event_view.get("canonicalUrl")])
+        trigger_revalidation(event_related_paths(event_view))
         return jsonify({"message": "Party deleted successfully!"}), 200
     except Exception as e:
         return jsonify({"message": "Error deleting party", "error": str(e)}), 500
@@ -543,6 +1191,10 @@ def update_party(party_id):
         result = parties_collection.update_one({"_id": obj_id}, {"$set": data})
         if result.matched_count == 0:
             return jsonify({"message": "Party not found."}), 404
+        updated_doc = parties_collection.find_one({"_id": obj_id}) or {}
+        event_view = normalize_event(updated_doc)
+        notify_indexers([event_view.get("canonicalUrl")])
+        trigger_revalidation(event_related_paths(event_view))
         return jsonify({"message": "Party updated successfully!"}), 200
     except ValidationError as ve:
         app.logger.warning(f"[VALIDATION] {ve}")
@@ -777,6 +1429,191 @@ def rename_carousel():
         return jsonify({"message": "Carousel renamed"}), 200
     except Exception as e:
         return jsonify({"message": "Error renaming carousel", "error": str(e)}), 500
+
+
+# --- Discovery surfaces ---
+
+
+def sitemap_xml(entries: list[dict], root_tag: str = "urlset") -> str:
+    item_tag = "sitemap" if root_tag == "sitemapindex" else "url"
+    body = [f"<{root_tag} xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">"]
+    for entry in entries:
+        loc = entry.get("loc")
+        lastmod = entry.get("lastmod")
+        if not loc:
+            continue
+        body.append(f"<{item_tag}><loc>{loc}</loc>{'<lastmod>'+lastmod+'</lastmod>' if lastmod else ''}</{item_tag}>")
+    body.append(f"</{root_tag}>")
+    return "".join(body)
+
+
+@app.route("/sitemap.xml")
+def sitemap_index():
+    upcoming = serialize_events(include_past=False)
+    shards = shard_events(upcoming)
+    entries = []
+    for idx, shard in enumerate(shards):
+        lastmod = None
+        for event in shard:
+            if event.get("lastmod") and (not lastmod or event["lastmod"] > lastmod):
+                lastmod = event["lastmod"]
+        name = f"events-{idx}.xml"
+        entries.append({
+            "loc": build_canonical("sitemap_child", name=name),
+            "lastmod": lastmod,
+        })
+    for name, getter in (
+        ("cities.xml", lambda: aggregate_dimension(upcoming, "city")),
+        ("venues.xml", lambda: aggregate_dimension(upcoming, "venue")),
+        ("genres.xml", lambda: aggregate_genres(upcoming)),
+        ("dates.xml", lambda: unique_dates(upcoming)),
+    ):
+        items = getter()
+        lastmod = None
+        for item in items:
+            if item.get("lastmod") and (not lastmod or item["lastmod"] > lastmod):
+                lastmod = item["lastmod"]
+        entries.append({
+            "loc": build_canonical("sitemap_child", name=name),
+            "lastmod": lastmod,
+        })
+    record_setting_hit("analytics:sitemap:index")
+    xml = sitemap_xml(entries, root_tag="sitemapindex")
+    return text_response(xml, "application/xml", cache_seconds=SITEMAP_CACHE_SECONDS, robots=None)
+
+
+def sitemap_child_response(items: list[dict]):
+    entries = []
+    for item in items:
+        loc = item.get("canonicalUrl") or item.get("loc")
+        if not loc:
+            continue
+        entries.append({"loc": loc, "lastmod": item.get("lastmod")})
+    xml = sitemap_xml(entries)
+    return text_response(xml, "application/xml", cache_seconds=SITEMAP_CACHE_SECONDS, robots=None)
+
+
+@app.route("/sitemaps/events-<int:shard>.xml")
+def sitemap_events_shard(shard: int):
+    upcoming = serialize_events(include_past=False)
+    shards = shard_events(upcoming)
+    if shard < 0 or shard >= len(shards):
+        return text_response("", "application/xml", cache_seconds=SITEMAP_CACHE_SECONDS, robots=None, status=404)
+    events = shards[shard]
+    items = [{"canonicalUrl": event.get("canonicalUrl"), "lastmod": event.get("lastmod") } for event in events]
+    record_setting_hit("analytics:sitemap:events", {"shard": shard})
+    return sitemap_child_response(items)
+
+
+@app.route("/sitemaps/cities.xml")
+def sitemap_cities():
+    upcoming = serialize_events(include_past=False)
+    items = aggregate_dimension(upcoming, "city")
+    record_setting_hit("analytics:sitemap:cities")
+    return sitemap_child_response(items)
+
+
+@app.route("/sitemaps/venues.xml")
+def sitemap_venues():
+    upcoming = serialize_events(include_past=False)
+    items = aggregate_dimension(upcoming, "venue")
+    record_setting_hit("analytics:sitemap:venues")
+    return sitemap_child_response(items)
+
+
+@app.route("/sitemaps/genres.xml")
+def sitemap_genres():
+    upcoming = serialize_events(include_past=False)
+    items = aggregate_genres(upcoming)
+    record_setting_hit("analytics:sitemap:genres")
+    return sitemap_child_response(items)
+
+
+@app.route("/sitemaps/dates.xml")
+def sitemap_dates():
+    upcoming = serialize_events(include_past=False)
+    items = unique_dates(upcoming)
+    record_setting_hit("analytics:sitemap:dates")
+    return sitemap_child_response(items)
+
+
+def filtered_events_for_scope(scope_slug: str | None) -> tuple[list[dict], str, str]:
+    events = serialize_events(include_past=False)
+    scope_title = "Parties247 Events"
+    scope_url = build_canonical("events_feed", fmt="rss").rsplit(".", 1)[0]
+    if scope_slug:
+        cities = {item["slug"]: item for item in aggregate_dimension(events, "city")}
+        genres = {item["slug"]: item for item in aggregate_genres(events)}
+        matched = []
+        if scope_slug in cities:
+            matched = [event for event in events if event.get("city", {}).get("slug") == scope_slug]
+            scope_title = f"Events in {cities[scope_slug]['name']['en'] or cities[scope_slug]['name']['he']}"
+            scope_url = build_canonical("scoped_feed", slug=scope_slug, fmt="rss").rsplit(".", 1)[0]
+        elif scope_slug in genres:
+            matched = [event for event in events if any(g.get("slug") == scope_slug for g in event.get("genres", []))]
+            scope_title = f"{genres[scope_slug]['name']['en'] or genres[scope_slug]['name']['he']} Events"
+            scope_url = build_canonical("scoped_feed", slug=scope_slug, fmt="rss").rsplit(".", 1)[0]
+        events = matched
+    return events, scope_title, scope_url
+
+
+def feed_response(scope_slug: str | None, fmt: str):
+    fmt = fmt.lower()
+    events, title, url = filtered_events_for_scope(scope_slug)
+    if scope_slug and not events:
+        return text_response("", "text/plain", cache_seconds=FEED_CACHE_SECONDS, robots="noindex", status=404)
+    body = build_feed(events, title, url, fmt)
+    content_type = {
+        "rss": "application/rss+xml",
+        "atom": "application/atom+xml",
+        "json": "application/feed+json",
+    }.get(fmt, "application/octet-stream")
+    record_setting_hit("analytics:feed", {"scope": scope_slug or "events", "format": fmt})
+    return text_response(body, content_type, cache_seconds=FEED_CACHE_SECONDS, robots="noindex")
+
+
+@app.route("/feeds/events.<fmt>")
+def feeds_events(fmt: str):
+    return feed_response(None, fmt)
+
+
+@app.route("/feeds/<slug>.<fmt>")
+def feeds_scope(slug: str, fmt: str):
+    return feed_response(slug, fmt)
+
+
+@app.route("/ics/event/<slug>.ics")
+def ics_event(slug: str):
+    events = [event for event in serialize_events(include_past=True) if event.get("slug") == slug]
+    if not events:
+        return text_response("", "text/calendar", cache_seconds=ICS_CACHE_SECONDS, robots="noindex", status=404)
+    body = build_ics(events, title=events[0].get("title", {}).get("en") or events[0].get("title", {}).get("he") or "Event")
+    record_setting_hit("analytics:ics:event", {"slug": slug})
+    return text_response(body, "text/calendar", cache_seconds=ICS_CACHE_SECONDS, robots="noindex")
+
+
+@app.route("/ics/city/<slug>.ics")
+def ics_city(slug: str):
+    events = [event for event in serialize_events(include_past=False) if event.get("city", {}).get("slug") == slug]
+    if not events:
+        return text_response("", "text/calendar", cache_seconds=ICS_CACHE_SECONDS, robots="noindex", status=404)
+    title = f"Events in {events[0].get('city', {}).get('name', {}).get('en') or events[0].get('city', {}).get('name', {}).get('he') or slug}"
+    body = build_ics(events, title=title)
+    record_setting_hit("analytics:ics:city", {"slug": slug})
+    return text_response(body, "text/calendar", cache_seconds=ICS_CACHE_SECONDS, robots="noindex")
+
+
+@app.route("/robots.txt")
+def robots_txt():
+    lines = [
+        "User-agent: *",
+        "Disallow: /api/",
+        "Disallow: /feeds/",
+        "Disallow: /search",
+        "Disallow: /admin",
+        f"Sitemap: {build_canonical('sitemap_index')}",
+    ]
+    return text_response("\n".join(lines) + "\n", "text/plain", cache_seconds=LIST_CACHE_SECONDS, robots=None)
 
 # --- Referral APIs ---
 REFERRAL_KEY = "referral"

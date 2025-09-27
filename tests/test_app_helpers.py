@@ -17,6 +17,12 @@ def test_normalized_or_none_for_dedupe():
     assert app.normalized_or_none_for_dedupe('not a url') is None
 
 
+def test_parse_datetime_normalizes_naive_iso():
+    dt = app.parse_datetime('2024-05-01T12:00:00')
+    assert dt.tzinfo is not None
+    assert dt.isoformat().endswith('+00:00')
+
+
 def test_ensure_index_behaviour():
     coll = app.Collection()
     coll._indexes = {'same': {'key': [('a', 1)], 'unique': True, 'partialFilterExpression': None}}
@@ -53,6 +59,50 @@ def test_get_region_music_event_age_tags():
 
     tags = app.get_tags('free alcohol open air', 'תל אביב')
     assert set(tags) == {'אלכוהול חופשי', 'בחוץ', 'תל אביב'}
+
+
+def test_get_parties_appends_default_ref(monkeypatch):
+    docs = [
+        {
+            '_id': '1',
+            'goOutUrl': 'https://example.com/event?foo=1',
+            'originalUrl': 'https://example.com/event',
+            'date': '2099-01-01T00:00:00',
+        },
+        {
+            '_id': '2',
+            'goOutUrl': 'https://example.com/other?ref=keep',
+            'date': '2099-01-02T00:00:00',
+        },
+    ]
+
+    class DummyCursor:
+        def __init__(self, items):
+            self._items = items
+
+        def sort(self, key, direction):
+            return sorted(self._items, key=lambda d: d.get(key))
+
+        def __iter__(self):
+            return iter(self._items)
+
+    class DummyCollection:
+        def find(self):
+            return DummyCursor(list(docs))
+
+    class DummySettings:
+        def find_one(self, filter):
+            return {'value': 'default-ref'}
+
+    monkeypatch.setattr(app, 'parties_collection', DummyCollection())
+    monkeypatch.setattr(app, 'settings_collection', DummySettings())
+
+    payload, status = app.get_parties()
+    assert status == 200
+    urls = {item['_id']: item.get('goOutUrl') for item in payload}
+    assert urls['1'].endswith('ref=default-ref')
+    assert urls['2'].count('ref=keep') == 1
+    assert 'default-ref' not in urls['2']
 
 
 def test_protect_decorator():
@@ -95,3 +145,22 @@ def test_admin_login(monkeypatch):
     flask_mod.request.get_json = lambda silent=True: {'password': 'bad'}
     res, status = app.admin_login()
     assert status == 401
+    assert res['message'] == 'Invalid credentials.'
+
+
+def test_api_docs_and_openapi_spec():
+    flask_mod = sys.modules['flask']
+    flask_mod.request.host_url = 'http://localhost/'
+    flask_mod.request.url_root = 'http://localhost/'
+
+    data, status = app.openapi_json()
+    assert status == 200
+    assert data['info']['title'] == 'Parties247 API'
+    assert '/api/parties' in data['paths']
+    assert data['servers'][0]['url'] == 'http://localhost'
+
+    html, status, headers = app.docs_page()
+    assert status == 200
+    assert headers['Content-Type'].startswith('text/html')
+    assert 'Parties247 API' in html
+    assert '/openapi.json' in html

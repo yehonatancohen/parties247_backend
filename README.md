@@ -77,6 +77,11 @@ Admin endpoints are protected using short‑lived JSON Web Tokens (JWTs).
    ```
 5. To verify that a token is still valid, POST to `/api/admin/verify-token`.
 
+## API Documentation
+
+- Browse the human-friendly overview at [`/docs`](http://localhost:3001/docs) when the server is running.
+- Consume the machine-readable OpenAPI description at [`/openapi.json`](http://localhost:3001/openapi.json). Import this file into tools like Postman, Hoppscotch, or VS Code's REST client for interactive exploration.
+
 ## Testing
 Run the test suite with:
 ```bash

@@ -3,6 +3,7 @@ import json
 import logging
 import hmac
 import re
+import copy
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from functools import wraps
@@ -56,6 +57,8 @@ EVENT_SITEMAP_CHUNK = 500
 # --- URL canonicalization ---
 TRACKING_PREFIXES = ("utm_",)
 TRACKING_KEYS = {"fbclid", "gclid", "mc_cid", "mc_eid"}
+
+REFERRAL_KEY = "referral"
 
 CANONICAL_PATTERNS = {
     "event": "/event/{slug}",
@@ -117,7 +120,10 @@ def parse_datetime(value) -> datetime | None:
         try:
             if text.endswith("Z"):
                 return datetime.fromisoformat(text[:-1]).replace(tzinfo=timezone.utc)
-            return datetime.fromisoformat(text)
+            dt = datetime.fromisoformat(text)
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
         except ValueError:
             pass
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
@@ -217,6 +223,48 @@ def normalize_url(raw: str) -> str:
 def normalized_or_none_for_dedupe(raw: str) -> str | None:
     n = normalize_url(raw)
     return n if urlparse(n).netloc else None
+
+
+def append_referral_param(url: str | None, referral: str | None) -> str | None:
+    """Append the referral query parameter to the URL when missing."""
+    if not url or not referral:
+        return url
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return url
+    if not parsed.netloc:
+        return url
+    query_items = parse_qsl(parsed.query, keep_blank_values=True)
+    if any(k.lower() == "ref" for k, _ in query_items):
+        return urlunparse(parsed)
+    query_items.append(("ref", referral))
+    new_query = urlencode(query_items, doseq=True)
+    return urlunparse(parsed._replace(query=new_query))
+
+
+def default_referral_code() -> str | None:
+    """Fetch the default referral code from the settings collection."""
+    if not settings_collection:
+        return None
+    try:
+        doc = settings_collection.find_one({"key": REFERRAL_KEY}) or {}
+    except Exception as exc:
+        app.logger.warning(f"Failed to fetch referral code: {exc}")
+        return None
+    value = (doc.get("value") or "").strip()
+    return value or None
+
+
+def apply_default_referral(party: dict, referral: str | None) -> None:
+    """Mutate the party dict to ensure URLs carry the referral code."""
+    if not party or not referral:
+        return
+    for key in ("goOutUrl", "originalUrl"):
+        if key in party:
+            party[key] = append_referral_param(party.get(key), referral)
+    if not party.get("referralCode"):
+        party["referralCode"] = referral
 
 ALLOWED_SCHEMES = {"http", "https"}
 ALLOWED_PORTS = {80, 443}
@@ -788,6 +836,471 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 
+OPENAPI_TEMPLATE = {
+    "openapi": "3.1.0",
+    "info": {
+        "title": "Parties247 API",
+        "version": "1.0.0",
+        "description": "REST API for reading party data and managing the Parties247 catalog.",
+        "contact": {
+            "name": "Parties247",
+            "url": "https://parties247-website.vercel.app",
+        },
+    },
+    "paths": {
+        "/api/health": {
+            "get": {
+                "summary": "Health check",
+                "description": "Returns a simple status payload indicating the API is responsive.",
+                "responses": {
+                    "200": {
+                        "description": "Service is healthy.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "status": {"type": "string", "example": "ok"}
+                                    },
+                                }
+                            }
+                        },
+                    }
+                },
+            }
+        },
+        "/api/docs": {
+            "get": {
+                "summary": "Minimal endpoint list",
+                "description": "Machine-readable summary of key endpoints, maintained for backward compatibility.",
+                "responses": {
+                    "200": {
+                        "description": "Endpoint overview.",
+                        "content": {"application/json": {"schema": {"type": "object"}}},
+                    }
+                },
+            }
+        },
+        "/api/parties": {
+            "get": {
+                "summary": "List parties",
+                "description": "Fetch the public parties currently tracked by Parties247.",
+                "responses": {
+                    "200": {
+                        "description": "Array of party objects.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "array",
+                                    "items": {"$ref": "#/components/schemas/Party"},
+                                }
+                            }
+                        },
+                    },
+                    "500": {
+                        "description": "Unexpected error fetching parties.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string"},
+                                        "error": {"type": "string"},
+                                    },
+                                }
+                            }
+                        },
+                    },
+                },
+            }
+        },
+        "/api/events": {
+            "get": {
+                "summary": "Events feed",
+                "description": "Return a denormalized events list used by downstream integrations.",
+                "responses": {
+                    "200": {
+                        "description": "Events response payload.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "generatedAt": {"type": "string", "format": "date-time"},
+                                        "items": {
+                                            "type": "array",
+                                            "items": {"$ref": "#/components/schemas/Event"},
+                                        },
+                                    },
+                                }
+                            }
+                        },
+                    }
+                },
+            }
+        },
+        "/api/cities": {
+            "get": {
+                "summary": "List cities",
+                "description": "Aggregate the number of parties per city.",
+                "responses": {
+                    "200": {
+                        "description": "List of cities with event counts.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "generatedAt": {"type": "string", "format": "date-time"},
+                                        "items": {
+                                            "type": "array",
+                                            "items": {"$ref": "#/components/schemas/Dimension"},
+                                        },
+                                    },
+                                }
+                            }
+                        },
+                    }
+                },
+            }
+        },
+        "/api/venues": {
+            "get": {
+                "summary": "List venues",
+                "description": "Aggregate the number of parties per venue.",
+                "responses": {
+                    "200": {
+                        "description": "List of venues with event counts.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "generatedAt": {"type": "string", "format": "date-time"},
+                                        "items": {
+                                            "type": "array",
+                                            "items": {"$ref": "#/components/schemas/Dimension"},
+                                        },
+                                    },
+                                }
+                            }
+                        },
+                    }
+                },
+            }
+        },
+        "/api/genres": {
+            "get": {
+                "summary": "List genres",
+                "description": "Aggregate the number of parties per genre.",
+                "responses": {
+                    "200": {
+                        "description": "List of genres with event counts.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "generatedAt": {"type": "string", "format": "date-time"},
+                                        "items": {
+                                            "type": "array",
+                                            "items": {"$ref": "#/components/schemas/Dimension"},
+                                        },
+                                    },
+                                }
+                            }
+                        },
+                    }
+                },
+            }
+        },
+        "/api/tags": {
+            "get": {
+                "summary": "List tags",
+                "description": "Return the curated tags available for parties.",
+                "responses": {
+                    "200": {
+                        "description": "List of tags.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "array",
+                                    "items": {"$ref": "#/components/schemas/Tag"},
+                                }
+                            }
+                        },
+                    }
+                },
+            }
+        },
+        "/api/referral": {
+            "get": {
+                "summary": "Get referral configuration",
+                "description": "Expose the configured default referral code used in external links.",
+                "responses": {
+                    "200": {
+                        "description": "Referral configuration payload.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "referral": {"type": "string", "nullable": True}
+                                    },
+                                }
+                            }
+                        },
+                    }
+                },
+            }
+        },
+        "/api/admin/login": {
+            "post": {
+                "summary": "Obtain admin token",
+                "description": "Authenticate with the admin password to receive a JWT for protected endpoints.",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {"password": {"type": "string"}},
+                                "required": ["password"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "JWT issued.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"token": {"type": "string"}},
+                                }
+                            }
+                        },
+                    },
+                    "401": {
+                        "description": "Invalid credentials.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"message": {"type": "string"}},
+                                }
+                            }
+                        },
+                    },
+                },
+            }
+        },
+        "/api/admin/add-party": {
+            "post": {
+                "summary": "Add a party",
+                "description": "Scrape and persist a new party. Requires admin token.",
+                "security": [{"bearerAuth": []}],
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {"url": {"type": "string", "format": "uri"}},
+                                "required": ["url"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "201": {
+                        "description": "Party created.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string"},
+                                        "party": {"$ref": "#/components/schemas/Party"},
+                                    },
+                                }
+                            }
+                        },
+                    },
+                    "400": {"description": "Invalid payload."},
+                    "409": {"description": "Party already exists."},
+                    "500": {"description": "Server error."},
+                },
+            }
+        },
+        "/api/admin/delete-party/{partyId}": {
+            "delete": {
+                "summary": "Delete a party",
+                "description": "Remove an existing party by its identifier. Requires admin token.",
+                "security": [{"bearerAuth": []}],
+                "parameters": [
+                    {
+                        "name": "partyId",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"},
+                        "description": "MongoDB ObjectId of the party to delete.",
+                    }
+                ],
+                "responses": {
+                    "200": {"description": "Party deleted."},
+                    "404": {"description": "Party not found."},
+                    "500": {"description": "Error deleting party."},
+                },
+            }
+        },
+        "/api/admin/update-party/{partyId}": {
+            "put": {
+                "summary": "Update a party",
+                "description": "Update select fields on an existing party. Requires admin token.",
+                "security": [{"bearerAuth": []}],
+                "parameters": [
+                    {
+                        "name": "partyId",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"},
+                    }
+                ],
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "description": "Any subset of party fields to update.",
+                                "additionalProperties": True,
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "Party updated."},
+                    "400": {"description": "Invalid payload."},
+                    "404": {"description": "Party not found."},
+                    "500": {"description": "Server error."},
+                },
+            }
+        },
+    },
+    "components": {
+        "securitySchemes": {
+            "bearerAuth": {
+                "type": "http",
+                "scheme": "bearer",
+                "bearerFormat": "JWT",
+            }
+        },
+        "schemas": {
+            "Party": {
+                "type": "object",
+                "properties": {
+                    "_id": {"type": "string"},
+                    "name": {"type": "string"},
+                    "date": {"type": "string"},
+                    "goOutUrl": {"type": "string", "format": "uri"},
+                    "originalUrl": {"type": "string", "format": "uri"},
+                    "startsAt": {"type": "string", "format": "date-time"},
+                    "endsAt": {"type": "string", "format": "date-time"},
+                    "city": {"type": "string"},
+                    "venue": {"type": "string"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                },
+                "additionalProperties": True,
+            },
+            "Event": {
+                "type": "object",
+                "description": "Normalized event payload consumed by listings.",
+                "properties": {
+                    "id": {"type": "string"},
+                    "name": {"type": "string"},
+                    "startsAt": {"type": "string", "format": "date-time"},
+                    "endsAt": {"type": "string", "format": "date-time"},
+                    "canonicalUrl": {"type": "string", "format": "uri"},
+                },
+                "additionalProperties": True,
+            },
+            "Dimension": {
+                "type": "object",
+                "properties": {
+                    "slug": {"type": "string"},
+                    "name": {"type": "string"},
+                    "eventCount": {"type": "integer", "minimum": 0},
+                },
+                "additionalProperties": True,
+            },
+            "Tag": {
+                "type": "object",
+                "properties": {
+                    "slug": {"type": "string"},
+                    "name": {"type": "string"},
+                    "order": {"type": "integer"},
+                },
+                "required": ["slug", "name"],
+            },
+        },
+    },
+}
+
+
+def build_openapi_document():
+    """Generate the OpenAPI document, hydrating runtime server information."""
+    document = copy.deepcopy(OPENAPI_TEMPLATE)
+    server_url = (request.host_url or "").rstrip("/")
+    if not server_url:
+        server_url = "http://localhost"
+    document["servers"] = [{"url": server_url}]
+    return document
+
+
+@app.route("/openapi.json", methods=["GET"])
+def openapi_json():
+    """Expose the OpenAPI definition for API consumers."""
+    return jsonify(build_openapi_document()), 200
+
+
+@app.route("/docs", methods=["GET"])
+def docs_page():
+    """Serve a lightweight HTML page linking to the OpenAPI definition."""
+    spec_url = (request.url_root or "").rstrip("/") + "/openapi.json"
+    html = f"""<!doctype html>
+<html lang=\"en\">
+  <head>
+    <meta charset=\"utf-8\">
+    <title>Parties247 API Documentation</title>
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+    <style>
+      body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 2rem; line-height: 1.6; }}
+      h1 {{ font-size: 2rem; margin-bottom: 1rem; }}
+      pre {{ background: #f4f4f4; padding: 1rem; overflow-x: auto; }}
+      code {{ font-family: Consolas, Monaco, 'Courier New', monospace; }}
+      a {{ color: #2563eb; }}
+    </style>
+  </head>
+  <body>
+    <h1>Parties247 API</h1>
+    <p>Explore the machine-readable OpenAPI description or download it for use in client tooling.</p>
+    <p><a href=\"{spec_url}\">View OpenAPI JSON</a></p>
+    <h2>Quick start</h2>
+    <p>Fetch all public parties:</p>
+    <pre><code>curl {spec_url.replace('openapi.json', 'api/parties')}</code></pre>
+    <p>Authenticate to manage parties:</p>
+    <pre><code>curl -X POST {spec_url.replace('openapi.json', 'api/admin/login')} \
+  -H 'Content-Type: application/json' \
+  -d '{{"password": "your-admin-password"}}'</code></pre>
+    <p>After obtaining a JWT, include it in the <code>Authorization: Bearer &lt;token&gt;</code> header for admin requests.</p>
+    <p>For full details, import the <a href=\"{spec_url}\">OpenAPI document</a> into your preferred API explorer.</p>
+  </body>
+</html>"""
+    return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
 @app.route("/api/docs", methods=["GET"])
 def docs():
     """Return a minimal machine-readable description of public endpoints."""
@@ -795,6 +1308,8 @@ def docs():
         jsonify(
             {
                 "endpoints": [
+                    {"path": "/docs", "methods": ["GET"], "description": "HTML overview of the API."},
+                    {"path": "/openapi.json", "methods": ["GET"], "description": "OpenAPI description of the API."},
                     {"path": "/api/health", "methods": ["GET"], "description": "Service liveness probe."},
                     {"path": "/api/docs", "methods": ["GET"], "description": "This documentation payload."},
                     {"path": "/api/parties", "methods": ["GET"], "description": "List public parties."},
@@ -1135,6 +1650,8 @@ def add_party():
         return jsonify({"message": "URL is not allowed."}), 400
     try:
         party_data = scrape_party_details(url)
+        referral = default_referral_code()
+        apply_default_referral(party_data, referral)
         party_data.setdefault("slug", slugify_value(party_data.get("name")))
         canonical = party_data["canonicalUrl"]
         res = parties_collection.update_one(
@@ -1208,8 +1725,10 @@ def update_party(party_id):
 def get_parties():
     try:
         items = []
+        referral = default_referral_code()
         for party in parties_collection.find().sort("date", 1):
             party["_id"] = str(party["_id"])
+            apply_default_referral(party, referral)
             items.append(party)
         return jsonify(items), 200
     except Exception as e:
@@ -1615,14 +2134,11 @@ def robots_txt():
     ]
     return text_response("\n".join(lines) + "\n", "text/plain", cache_seconds=LIST_CACHE_SECONDS, robots=None)
 
-# --- Referral APIs ---
-REFERRAL_KEY = "referral"
-
 @app.route("/api/referral", methods=["GET"])
 def get_referral():
     try:
-        doc = settings_collection.find_one({"key": REFERRAL_KEY})
-        return jsonify({"referral": (doc or {}).get("value", "")}), 200
+        code = default_referral_code() or ""
+        return jsonify({"referral": code}), 200
     except Exception as e:
         return jsonify({"message": "Error fetching referral", "error": str(e)}), 500
 

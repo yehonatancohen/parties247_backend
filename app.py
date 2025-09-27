@@ -486,7 +486,7 @@ def normalize_event(doc: dict) -> dict:
     }
 
     genres = []
-    raw_genres = doc.get("genres") or doc.get("tags") or []
+    raw_genres = doc.get("genres") or []
     if isinstance(raw_genres, str):
         raw_genres = [raw_genres]
     for item in raw_genres:

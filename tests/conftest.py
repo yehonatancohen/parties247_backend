@@ -38,7 +38,15 @@ class _Flask:
 Flask_request = types.SimpleNamespace(headers={}, get_json=lambda silent=True: {})
 def jsonify(obj):
     return obj
-sys.modules['flask'] = types.SimpleNamespace(Flask=_Flask, request=Flask_request, jsonify=jsonify)
+def url_for(endpoint, _external=False, **values):
+    if endpoint == "openapi_json":
+        path = "/openapi.json"
+    else:
+        path = f"/{endpoint}"
+    if _external:
+        return f"http://testserver{path}"
+    return path
+sys.modules['flask'] = types.SimpleNamespace(Flask=_Flask, request=Flask_request, jsonify=jsonify, url_for=url_for)
 
 # stub flask_cors
 sys.modules['flask_cors'] = types.SimpleNamespace(CORS=lambda app: None)

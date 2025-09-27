@@ -7,7 +7,7 @@ import copy
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from functools import wraps
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode, quote_plus
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode, quote_plus, urljoin
 try:
     from pymongo import UpdateOne
 except Exception:  # pragma: no cover - used only when pymongo isn't available in tests
@@ -1287,6 +1287,60 @@ OPENAPI_TEMPLATE = {
                 }
             }
         },
+        "/api/admin/sections": {
+            "post": {
+                "summary": "Import parties into a carousel",
+                "description": "Scrape a curated page for party links, ensure each party exists, and create a carousel using them. Requires admin token.",
+                "security": [{"bearerAuth": []}],
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["url"],
+                                "properties": {
+                                    "url": {"type": "string", "format": "uri"},
+                                    "carouselName": {"type": "string"},
+                                    "title": {"type": "string"}
+                                }
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "201": {
+                        "description": "Carousel created from section.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string"},
+                                        "carousel": {"$ref": "#/components/schemas/Carousel"},
+                                        "partyCount": {"type": "integer"},
+                                        "warnings": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "url": {"type": "string"},
+                                                    "error": {"type": "string"}
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "400": {"description": "Invalid payload."},
+                    "404": {"description": "No parties found at the provided URL."},
+                    "502": {"description": "Error fetching the source URL."},
+                    "500": {"description": "Server error while importing the section."}
+                }
+            }
+        },
         "/api/admin/add-party": {
             "post": {
                 "summary": "Add a party",
@@ -1607,6 +1661,15 @@ class CarouselPartiesUpdateSchema(BaseModel):
 
 class CarouselReorderSchema(BaseModel):
     orderedIds: list[str]
+    class Config:
+        extra = "forbid"
+
+
+class CarouselImportRequest(BaseModel):
+    url: str
+    carouselName: str | None = None
+    title: str | None = None
+
     class Config:
         extra = "forbid"
 
@@ -1940,6 +2003,116 @@ def serialize_carousel(doc: dict) -> dict:
     return data
 
 
+def extract_event_urls_from_page(source_url: str, html: str) -> list[str]:
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return []
+    discovered: list[str] = []
+    seen: set[str] = set()
+    for anchor in soup.find_all("a"):
+        href = getattr(anchor, "get", lambda *args, **kwargs: None)("href")
+        if not href:
+            continue
+        absolute = urljoin(source_url, href)
+        normalized = normalize_url(absolute)
+        if "/event/" not in urlparse(normalized).path:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        discovered.append(normalized)
+    if discovered:
+        return discovered
+    script_tag = soup.find("script", {"id": "__NEXT_DATA__"})
+    if not script_tag or not getattr(script_tag, "string", None):
+        return []
+    try:
+        data = json.loads(script_tag.string)
+    except Exception:
+        return []
+
+    ordered: list[str] = []
+    seen = set()
+
+    def _walk(node):
+        if isinstance(node, dict):
+            for value in node.values():
+                _walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+        elif isinstance(node, str) and "/event/" in node:
+            absolute_url = urljoin(source_url, node)
+            normalized_url = normalize_url(absolute_url)
+            if "/event/" not in urlparse(normalized_url).path:
+                return
+            if normalized_url in seen:
+                return
+            seen.add(normalized_url)
+            ordered.append(normalized_url)
+
+    _walk(data)
+    return ordered
+
+
+def ensure_party_for_url(event_url: str, referral: str | None) -> tuple[dict | None, bool]:
+    if parties_collection is None:
+        return None, False
+    canonical = normalize_url(event_url)
+    query = {"$or": [{"canonicalUrl": canonical}, {"goOutUrl": canonical}]}
+    existing = None
+    try:
+        existing = parties_collection.find_one(query)
+    except Exception as exc:
+        app.logger.error(f"Failed to query party for {event_url}: {exc}")
+    if existing:
+        if referral:
+            mutated = dict(existing)
+            apply_default_referral(mutated, referral)
+            updates = {}
+            for key in ("goOutUrl", "originalUrl", "referralCode"):
+                if mutated.get(key) != existing.get(key):
+                    updates[key] = mutated.get(key)
+            if updates:
+                try:
+                    parties_collection.update_one({"_id": existing.get("_id")}, {"$set": updates})
+                    existing.update(updates)
+                except Exception as exc:
+                    app.logger.warning(
+                        f"Failed to update referral for party {existing.get('_id')}: {exc}"
+                    )
+        return existing, False
+
+    party_data = scrape_party_details(event_url)
+    party_data.setdefault("canonicalUrl", canonical)
+    if not party_data.get("originalUrl"):
+        party_data["originalUrl"] = event_url
+    if not party_data.get("goOutUrl"):
+        party_data["goOutUrl"] = canonical
+    apply_default_referral(party_data, referral)
+    party_data.setdefault("slug", slugify_value(party_data.get("name")))
+    try:
+        result = parties_collection.update_one(query, {"$setOnInsert": party_data}, upsert=True)
+    except Exception as exc:
+        app.logger.error(f"Failed to upsert party from {event_url}: {exc}")
+        raise
+    upserted_id = getattr(result, "upserted_id", None)
+    if upserted_id is None:
+        try:
+            existing = parties_collection.find_one(query)
+        except Exception as exc:
+            app.logger.error(f"Failed to load existing party for {event_url}: {exc}")
+            existing = None
+        return existing, False
+
+    party_data["_id"] = upserted_id
+    event_view = normalize_event(party_data)
+    notify_indexers([event_view.get("canonicalUrl")])
+    trigger_revalidation(event_related_paths(event_view))
+    return party_data, True
+
+
 @app.route("/api/admin/carousels", methods=["POST"])
 @limiter.limit("10 per minute")
 @protect
@@ -2122,7 +2295,6 @@ def reorder_carousels():
         return jsonify({"message": "Reordered"}), 200
     except Exception as e:
         return jsonify({"message": "Error reordering carousels", "error": str(e)}), 500
-
 # --- Tags APIs ---
 @app.route("/api/tags", methods=["GET"])
 @limiter.limit("100 per minute")
@@ -2242,6 +2414,93 @@ def rename_carousel():
         return jsonify({"message": "Carousel renamed"}), 200
     except Exception as e:
         return jsonify({"message": "Error renaming carousel", "error": str(e)}), 500
+
+
+@app.route("/api/admin/sections", methods=["POST"])
+@limiter.limit("5 per minute")
+@protect
+def add_section():
+    if carousels_collection is None or parties_collection is None:
+        return jsonify({"message": "Storage unavailable."}), 503
+    payload = request.get_json(silent=True) or {}
+    try:
+        req = CarouselImportRequest(**payload)
+    except ValidationError as ve:
+        app.logger.warning(f"[VALIDATION] {ve}")
+        return jsonify({"message": "Invalid payload", "errors": ve.errors()}), 400
+
+    title = (req.carouselName or req.title or "").strip()
+    if not title:
+        return jsonify({"message": "carouselName or title is required"}), 400
+    source_url = (req.url or "").strip()
+    if not source_url or not is_url_allowed(source_url):
+        return jsonify({"message": "URL is not allowed."}), 400
+
+    try:
+        response = requests.get(source_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        return jsonify({"message": "Unable to fetch source URL.", "error": str(exc)}), 502
+
+    event_urls = extract_event_urls_from_page(source_url, response.text)
+    if not event_urls:
+        return jsonify({"message": "No parties were found at the provided URL."}), 404
+
+    referral = default_referral_code()
+    collected: list[dict] = []
+    warnings: list[dict] = []
+    for event_url in event_urls:
+        try:
+            party_doc, _created = ensure_party_for_url(event_url, referral)
+        except Exception as exc:
+            warnings.append({"url": event_url, "error": str(exc)})
+            continue
+        if not party_doc or not party_doc.get("_id"):
+            warnings.append({"url": event_url, "error": "Missing party identifier"})
+            continue
+        collected.append(party_doc)
+
+    ordered_party_ids = []
+    seen_ids: set[str] = set()
+    for doc in collected:
+        raw_id = doc.get("_id")
+        if raw_id is None:
+            continue
+        str_id = str(raw_id)
+        if str_id in seen_ids:
+            continue
+        seen_ids.add(str_id)
+        ordered_party_ids.append(raw_id)
+
+    if not ordered_party_ids:
+        return jsonify({"message": "No parties could be imported from the provided URL."}), 404
+
+    try:
+        last = carousels_collection.find().sort("order", -1).limit(1)
+        last_order = next(last, {}).get("order", -1)
+    except Exception:
+        last_order = -1
+
+    doc = {
+        "title": title,
+        "partyIds": ordered_party_ids,
+        "order": int(last_order) + 1,
+    }
+
+    try:
+        result = carousels_collection.insert_one(doc)
+        doc["_id"] = result.inserted_id
+    except Exception as exc:
+        return jsonify({"message": "Error creating carousel", "error": str(exc)}), 500
+
+    payload = {
+        "message": "Carousel created from section.",
+        "carousel": serialize_carousel(doc),
+        "partyCount": len(ordered_party_ids),
+    }
+    if warnings:
+        payload["warnings"] = warnings
+    return jsonify(payload), 201
 
 
 # --- Discovery surfaces ---

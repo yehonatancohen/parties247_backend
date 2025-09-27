@@ -89,6 +89,7 @@ class _DB:
     def __init__(self):
         self.parties = _Collection()
         self.carousels = _Collection()
+        self.sections = _Collection()
     def __getitem__(self, item):
         return self
 class _MongoClient:
@@ -100,17 +101,57 @@ sys.modules['pymongo'] = types.SimpleNamespace(MongoClient=_MongoClient, errors=
 sys.modules['pymongo.collection'] = types.SimpleNamespace(Collection=_Collection)
 
 # stub bson.objectid
-sys.modules['bson'] = types.SimpleNamespace(objectid=types.SimpleNamespace(ObjectId=lambda x: x))
+class _ObjectId(str):
+    def __new__(cls, value):
+        return str.__new__(cls, value)
+
+
+sys.modules['bson'] = types.SimpleNamespace(objectid=types.SimpleNamespace(ObjectId=_ObjectId))
 sys.modules['bson.objectid'] = sys.modules['bson'].objectid
 
 # stub requests
 sys.modules['requests'] = types.SimpleNamespace(
     get=lambda url, headers=None, timeout=None: types.SimpleNamespace(status_code=200, text='', raise_for_status=lambda: None),
     post=lambda url, json=None, timeout=None: types.SimpleNamespace(status_code=200, text='', raise_for_status=lambda: None),
+    exceptions=types.SimpleNamespace(RequestException=Exception),
 )
 
 # stub bs4
-sys.modules['bs4'] = types.SimpleNamespace(BeautifulSoup=lambda text, parser: types.SimpleNamespace(find=lambda *a, **k: types.SimpleNamespace(string='{}', get=lambda x: None)))
+import re
+
+
+class _FakeTag:
+    def __init__(self, attrs=None, string=None):
+        self._attrs = attrs or {}
+        self.string = string
+
+    def get(self, key, default=None):
+        return self._attrs.get(key, default)
+
+
+class _FakeSoup:
+    def __init__(self, text):
+        self._text = text or ""
+
+    def find_all(self, name):
+        if name != "a":
+            return []
+        pattern = re.compile(r'<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
+        tags = []
+        for href, inner in pattern.findall(self._text):
+            tags.append(_FakeTag({"href": href}, inner))
+        return tags
+
+    def find(self, name, attrs=None):
+        attrs = attrs or {}
+        if name == "script" and attrs.get("id") == "__NEXT_DATA__":
+            match = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', self._text, re.IGNORECASE | re.DOTALL)
+            if match:
+                return _FakeTag(string=match.group(1))
+        return None
+
+
+sys.modules['bs4'] = types.SimpleNamespace(BeautifulSoup=lambda text, parser: _FakeSoup(text))
 
 # stub pydantic
 class _ValidationError(Exception):

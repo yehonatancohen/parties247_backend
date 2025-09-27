@@ -245,7 +245,7 @@ def append_referral_param(url: str | None, referral: str | None) -> str | None:
 
 def default_referral_code() -> str | None:
     """Fetch the default referral code from the settings collection."""
-    if not settings_collection:
+    if settings_collection is None:
         return None
     try:
         doc = settings_collection.find_one({"key": REFERRAL_KEY}) or {}
@@ -394,7 +394,7 @@ except Exception as e:
 
 
 def record_setting_hit(key: str, extra: dict | None = None):
-    if not settings_collection:
+    if settings_collection is None:
         return
     payload = {"key": key, "lastHit": datetime.utcnow()}
     if extra:
@@ -406,7 +406,7 @@ def record_setting_hit(key: str, extra: dict | None = None):
 
 
 def all_events() -> list[dict]:
-    if not parties_collection:
+    if parties_collection is None:
         return []
     try:
         docs = list(parties_collection.find())

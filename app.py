@@ -21,7 +21,7 @@ import ipaddress
 import bcrypt
 import jwt
 from dotenv import load_dotenv
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, url_for
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -869,18 +869,6 @@ OPENAPI_TEMPLATE = {
                 },
             }
         },
-        "/api/docs": {
-            "get": {
-                "summary": "Minimal endpoint list",
-                "description": "Machine-readable summary of key endpoints, maintained for backward compatibility.",
-                "responses": {
-                    "200": {
-                        "description": "Endpoint overview.",
-                        "content": {"application/json": {"schema": {"type": "object"}}},
-                    }
-                },
-            }
-        },
         "/api/parties": {
             "get": {
                 "summary": "List parties",
@@ -1096,6 +1084,209 @@ OPENAPI_TEMPLATE = {
                 },
             }
         },
+        "/api/admin/carousels": {
+            "get": {
+                "summary": "List carousels",
+                "description": "Return the ordered list of carousels with their assigned parties. Requires admin token.",
+                "security": [{"bearerAuth": []}],
+                "responses": {
+                    "200": {
+                        "description": "Array of carousels.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "array",
+                                    "items": {"$ref": "#/components/schemas/Carousel"}
+                                }
+                            }
+                        }
+                    },
+                    "500": {"description": "Error fetching carousels."}
+                }
+            },
+            "post": {
+                "summary": "Create a carousel",
+                "description": "Create a new carousel at the end of the display order. Requires admin token.",
+                "security": [{"bearerAuth": []}],
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["title"],
+                                "properties": {
+                                    "title": {"type": "string"},
+                                    "partyIds": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": "Party identifiers to include in the carousel."
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "201": {
+                        "description": "Carousel created.",
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/Carousel"}
+                            }
+                        }
+                    },
+                    "400": {"description": "Invalid payload."},
+                    "500": {"description": "Error creating carousel."}
+                }
+            }
+        },
+        "/api/admin/carousels/{carouselId}": {
+            "put": {
+                "summary": "Update carousel info",
+                "description": "Update carousel metadata such as title or display order. Requires admin token.",
+                "security": [{"bearerAuth": []}],
+                "parameters": [
+                    {
+                        "name": "carouselId",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"}
+                    }
+                ],
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "title": {"type": "string"},
+                                    "order": {"type": "integer"}
+                                }
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "200": {
+                        "description": "Carousel updated.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string"},
+                                        "carousel": {"$ref": "#/components/schemas/Carousel"}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "400": {"description": "Invalid payload."},
+                    "404": {"description": "Carousel not found."},
+                    "500": {"description": "Error updating carousel."}
+                }
+            },
+            "delete": {
+                "summary": "Delete a carousel",
+                "description": "Remove a carousel by identifier. Requires admin token.",
+                "security": [{"bearerAuth": []}],
+                "parameters": [
+                    {
+                        "name": "carouselId",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"}
+                    }
+                ],
+                "responses": {
+                    "200": {"description": "Carousel deleted."},
+                    "404": {"description": "Carousel not found."},
+                    "500": {"description": "Error deleting carousel."}
+                }
+            }
+        },
+        "/api/admin/carousels/{carouselId}/parties": {
+            "get": {
+                "summary": "List carousel parties",
+                "description": "Return the parties currently assigned to the carousel in order. Requires admin token.",
+                "security": [{"bearerAuth": []}],
+                "parameters": [
+                    {
+                        "name": "carouselId",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"}
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Array of party documents.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "array",
+                                    "items": {"$ref": "#/components/schemas/Party"}
+                                }
+                            }
+                        }
+                    },
+                    "400": {"description": "Invalid carousel id."},
+                    "404": {"description": "Carousel not found."},
+                    "500": {"description": "Error fetching carousel parties."}
+                }
+            },
+            "put": {
+                "summary": "Update carousel parties",
+                "description": "Replace the ordered party list for a carousel. Requires admin token.",
+                "security": [{"bearerAuth": []}],
+                "parameters": [
+                    {
+                        "name": "carouselId",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"}
+                    }
+                ],
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["partyIds"],
+                                "properties": {
+                                    "partyIds": {
+                                        "type": "array",
+                                        "items": {"type": "string"}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "200": {
+                        "description": "Carousel parties updated.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string"},
+                                        "carousel": {"$ref": "#/components/schemas/Carousel"}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "400": {"description": "Invalid payload or missing parties."},
+                    "404": {"description": "Carousel not found."},
+                    "500": {"description": "Error updating carousel parties."}
+                }
+            }
+        },
         "/api/admin/add-party": {
             "post": {
                 "summary": "Add a party",
@@ -1244,6 +1435,19 @@ OPENAPI_TEMPLATE = {
                 },
                 "required": ["slug", "name"],
             },
+            "Carousel": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "order": {"type": "integer"},
+                    "partyIds": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    }
+                },
+                "additionalProperties": True,
+            },
         },
     },
 }
@@ -1267,64 +1471,41 @@ def openapi_json():
 
 @app.route("/docs", methods=["GET"])
 def docs_page():
-    """Serve a lightweight HTML page linking to the OpenAPI definition."""
-    spec_url = (request.url_root or "").rstrip("/") + "/openapi.json"
+    """Render Swagger UI backed by the generated OpenAPI definition."""
+    spec_url = url_for("openapi_json", _external=True)
     html = f"""<!doctype html>
 <html lang=\"en\">
   <head>
     <meta charset=\"utf-8\">
     <title>Parties247 API Documentation</title>
     <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+    <link rel=\"stylesheet\" href=\"https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.10.5/swagger-ui.min.css\" crossorigin=\"anonymous\" />
     <style>
-      body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 2rem; line-height: 1.6; }}
-      h1 {{ font-size: 2rem; margin-bottom: 1rem; }}
-      pre {{ background: #f4f4f4; padding: 1rem; overflow-x: auto; }}
-      code {{ font-family: Consolas, Monaco, 'Courier New', monospace; }}
-      a {{ color: #2563eb; }}
+      body {{ margin: 0; background-color: #f5f5f5; }}
+      #swagger-ui {{ box-shadow: none; }}
     </style>
   </head>
   <body>
-    <h1>Parties247 API</h1>
-    <p>Explore the machine-readable OpenAPI description or download it for use in client tooling.</p>
-    <p><a href=\"{spec_url}\">View OpenAPI JSON</a></p>
-    <h2>Quick start</h2>
-    <p>Fetch all public parties:</p>
-    <pre><code>curl {spec_url.replace('openapi.json', 'api/parties')}</code></pre>
-    <p>Authenticate to manage parties:</p>
-    <pre><code>curl -X POST {spec_url.replace('openapi.json', 'api/admin/login')} \
-  -H 'Content-Type: application/json' \
-  -d '{{"password": "your-admin-password"}}'</code></pre>
-    <p>After obtaining a JWT, include it in the <code>Authorization: Bearer &lt;token&gt;</code> header for admin requests.</p>
-    <p>For full details, import the <a href=\"{spec_url}\">OpenAPI document</a> into your preferred API explorer.</p>
+    <div id=\"swagger-ui\"></div>
+    <noscript>
+      <p>JavaScript is required to view the interactive documentation. Download the <a href=\"{spec_url}\">OpenAPI JSON</a>.</p>
+    </noscript>
+    <script src=\"https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.10.5/swagger-ui-bundle.min.js\" crossorigin=\"anonymous\"></script>
+    <script src=\"https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.10.5/swagger-ui-standalone-preset.min.js\" crossorigin=\"anonymous\"></script>
+    <script>
+      window.onload = () => {{
+        SwaggerUIBundle({{
+          url: "{spec_url}",
+          dom_id: '#swagger-ui',
+          presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
+          layout: 'BaseLayout'
+        }});
+      }};
+    </script>
   </body>
 </html>"""
     return html, 200, {"Content-Type": "text/html; charset=utf-8"}
 
-
-@app.route("/api/docs", methods=["GET"])
-def docs():
-    """Return a minimal machine-readable description of public endpoints."""
-    return (
-        jsonify(
-            {
-                "endpoints": [
-                    {"path": "/docs", "methods": ["GET"], "description": "HTML overview of the API."},
-                    {"path": "/openapi.json", "methods": ["GET"], "description": "OpenAPI description of the API."},
-                    {"path": "/api/health", "methods": ["GET"], "description": "Service liveness probe."},
-                    {"path": "/api/docs", "methods": ["GET"], "description": "This documentation payload."},
-                    {"path": "/api/parties", "methods": ["GET"], "description": "List public parties."},
-                    {"path": "/api/tags", "methods": ["GET"], "description": "List available tags."},
-                    {"path": "/api/referral", "methods": ["GET"], "description": "Get referral configuration."},
-                    {
-                        "path": "/api/admin/*",
-                        "methods": ["POST", "PUT", "DELETE"],
-                        "description": "Administrative APIs protected by JWT bearer tokens.",
-                    },
-                ]
-            }
-        ),
-        200,
-    )
 
 @app.route("/api/admin/login", methods=["POST"])
 def admin_login():
@@ -1414,8 +1595,13 @@ class CarouselCreateSchema(BaseModel):
 
 class CarouselUpdateSchema(BaseModel):
     title: str | None = None
-    partyIds: list[str] | None = None
     order: int | None = None
+    class Config:
+        extra = "forbid"
+
+
+class CarouselPartiesUpdateSchema(BaseModel):
+    partyIds: list[str]
     class Config:
         extra = "forbid"
 
@@ -1735,6 +1921,25 @@ def get_parties():
         return jsonify({"message": "Error fetching parties", "error": str(e)}), 500
 
 # --- Carousels ---
+
+
+def serialize_carousel(doc: dict) -> dict:
+    data = dict(doc or {})
+    raw_id = data.pop("_id", None)
+    if raw_id is not None:
+        data["id"] = str(raw_id)
+    elif "id" in data and data["id"] is not None:
+        data["id"] = str(data["id"])
+    party_ids = []
+    for pid in data.get("partyIds", []):
+        if isinstance(pid, ObjectId):
+            party_ids.append(str(pid))
+        elif isinstance(pid, str):
+            party_ids.append(pid)
+    data["partyIds"] = party_ids
+    return data
+
+
 @app.route("/api/admin/carousels", methods=["POST"])
 @limiter.limit("10 per minute")
 @protect
@@ -1752,10 +1957,21 @@ def add_carousel():
         last_order = next(last, {}).get("order", -1)
         doc["order"] = last_order + 1
         result = carousels_collection.insert_one(doc)
-        doc["_id"] = str(result.inserted_id)
-        return jsonify(doc), 201
+        doc["_id"] = result.inserted_id
+        return jsonify(serialize_carousel(doc)), 201
     except Exception as e:
         return jsonify({"message": "Error adding carousel", "error": str(e)}), 500
+
+@app.route("/api/admin/carousels", methods=["GET"])
+@limiter.limit("30 per minute")
+@protect
+def list_admin_carousels():
+    try:
+        items = [serialize_carousel(doc) for doc in carousels_collection.find().sort("order", 1)]
+        return jsonify(items), 200
+    except Exception as e:
+        return jsonify({"message": "Error fetching carousels", "error": str(e)}), 500
+
 
 @app.route("/api/admin/carousels/<carousel_id>", methods=["PUT"])
 @protect
@@ -1774,9 +1990,91 @@ def update_carousel(carousel_id):
         result = carousels_collection.update_one({"_id": obj_id}, {"$set": update_data})
         if result.matched_count == 0:
             return jsonify({"message": "Carousel not found"}), 404
-        return jsonify({"message": "Carousel updated successfully!"}), 200
+        updated_doc = carousels_collection.find_one({"_id": obj_id}) or {}
+        return (
+            jsonify({"message": "Carousel updated successfully!", "carousel": serialize_carousel(updated_doc)}),
+            200,
+        )
     except Exception as e:
         return jsonify({"message": "Error updating carousel", "error": str(e)}), 500
+
+
+@app.route("/api/admin/carousels/<carousel_id>/parties", methods=["GET"])
+@limiter.limit("60 per minute")
+@protect
+def get_carousel_parties(carousel_id):
+    try:
+        obj_id = ObjectId(carousel_id)
+    except Exception:
+        return jsonify({"message": "Invalid carousel id."}), 400
+    try:
+        carousel = carousels_collection.find_one({"_id": obj_id})
+        if not carousel:
+            return jsonify({"message": "Carousel not found"}), 404
+        party_ids = carousel.get("partyIds") or []
+        resolved_ids: list[tuple[str, ObjectId]] = []
+        for pid in party_ids:
+            try:
+                resolved_ids.append((str(pid), ObjectId(pid)))
+            except Exception:
+                return jsonify({"message": "Carousel contains invalid party identifiers."}), 400
+        if not resolved_ids:
+            return jsonify([]), 200
+        lookup_ids = [oid for _, oid in resolved_ids]
+        parties = list(parties_collection.find({"_id": {"$in": lookup_ids}}))
+        parties_by_id = {str(doc.get("_id")): doc for doc in parties}
+        items = []
+        for original_id, oid in resolved_ids:
+            doc = parties_by_id.get(str(oid))
+            if not doc:
+                continue
+            payload = dict(doc)
+            payload["_id"] = str(payload.get("_id"))
+            items.append(payload)
+        return jsonify(items), 200
+    except Exception as e:
+        return jsonify({"message": "Error fetching carousel parties", "error": str(e)}), 500
+
+
+@app.route("/api/admin/carousels/<carousel_id>/parties", methods=["PUT"])
+@protect
+def update_carousel_parties(carousel_id):
+    payload = request.get_json(silent=True) or {}
+    try:
+        update = CarouselPartiesUpdateSchema(**payload)
+    except ValidationError as ve:
+        app.logger.warning(f"[VALIDATION] {ve}")
+        return jsonify({"message": "Invalid carousel data", "errors": ve.errors()}), 400
+    normalized_ids: list[str] = []
+    lookup_ids: list[ObjectId] = []
+    for pid in update.partyIds:
+        try:
+            oid = ObjectId(pid)
+        except Exception:
+            return jsonify({"message": "partyIds must contain valid identifiers."}), 400
+        normalized_ids.append(str(oid))
+        lookup_ids.append(oid)
+    try:
+        obj_id = ObjectId(carousel_id)
+    except Exception:
+        return jsonify({"message": "Invalid carousel id."}), 400
+    try:
+        if lookup_ids:
+            existing_ids = {str(doc.get("_id")) for doc in parties_collection.find({"_id": {"$in": lookup_ids}}, {"_id": 1})}
+            missing = [pid for pid in normalized_ids if pid not in existing_ids]
+            if missing:
+                return jsonify({"message": "Some parties do not exist.", "missing": missing}), 400
+        result = carousels_collection.update_one({"_id": obj_id}, {"$set": {"partyIds": normalized_ids}})
+        if result.matched_count == 0:
+            return jsonify({"message": "Carousel not found"}), 404
+        updated_doc = carousels_collection.find_one({"_id": obj_id}) or {}
+        return (
+            jsonify({"message": "Carousel parties updated successfully!", "carousel": serialize_carousel(updated_doc)}),
+            200,
+        )
+    except Exception as e:
+        return jsonify({"message": "Error updating carousel parties", "error": str(e)}), 500
+
 
 @app.route("/api/admin/carousels/<carousel_id>", methods=["DELETE"])
 @protect
@@ -1794,11 +2092,7 @@ def delete_carousel(carousel_id):
 @limiter.limit("100 per minute")
 def get_carousels():
     try:
-        items = []
-        for carousel in carousels_collection.find().sort("order", 1):
-            carousel["id"] = str(carousel["_id"])
-            carousel.pop("_id")
-            items.append(carousel)
+        items = [serialize_carousel(carousel) for carousel in carousels_collection.find().sort("order", 1)]
         return jsonify(items), 200
     except Exception as e:
         return jsonify({"message": "Error fetching carousels", "error": str(e)}), 500

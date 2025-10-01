@@ -162,6 +162,7 @@ def test_api_docs_and_openapi_spec():
     assert status == 200
     assert data['info']['title'] == 'Parties247 API'
     assert '/api/parties' in data['paths']
+    assert '/api/events/{slug}' in data['paths']
     assert data['servers'][0]['url'] == 'http://localhost'
 
     html, status, headers = app.docs_page()

@@ -333,6 +333,7 @@ try:
     db = client["party247"]
     parties_collection: Collection = db.parties
     carousels_collection: Collection = db.carousels
+    sections_collection: Collection = db.sections
     tags_collection: Collection = db.tags
     settings_collection: Collection = db.settings
 
@@ -389,6 +390,7 @@ except Exception as e:
     app.logger.error(f"Error connecting to MongoDB Atlas: {e}")
     parties_collection = None
     carousels_collection = None
+    sections_collection = None
     tags_collection = None
     settings_collection = None
 
@@ -580,6 +582,20 @@ def serialize_events(include_past: bool = True) -> list[dict]:
         serialized = [event for event in serialized if event["status"] != "past"]
     serialized.sort(key=lambda event: (event.get("startsAt") or "", event.get("slug")))
     return serialized
+
+
+def find_event_by_slug(slug: str) -> tuple[dict | None, dict | None]:
+    """Return the normalized event and original document for the given slug."""
+    if not slug:
+        return None, None
+    slug_key = slug.casefold()
+    docs = all_events()
+    for doc in docs:
+        normalized = normalize_event(doc)
+        candidate = (normalized.get("slug") or "").casefold()
+        if candidate == slug_key:
+            return normalized, doc
+    return None, None
 
 
 def unique_dates(events: list[dict]) -> list[dict]:
@@ -924,6 +940,50 @@ OPENAPI_TEMPLATE = {
                             }
                         },
                     }
+                },
+            }
+        },
+        "/api/events/{slug}": {
+            "get": {
+                "summary": "Event detail",
+                "description": "Fetch a single event by slug, including purchase links when available.",
+                "parameters": [
+                    {
+                        "name": "slug",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"},
+                        "description": "Event slug, e.g. `thursday-moon-02-10`."
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Event payload containing metadata and purchase URLs.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "generatedAt": {"type": "string", "format": "date-time"},
+                                        "event": {"$ref": "#/components/schemas/Event"},
+                                    },
+                                }
+                            }
+                        },
+                    },
+                    "404": {
+                        "description": "Event could not be found.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string"}
+                                    },
+                                }
+                            }
+                        },
+                    },
                 },
             }
         },
@@ -1468,6 +1528,9 @@ OPENAPI_TEMPLATE = {
                     "startsAt": {"type": "string", "format": "date-time"},
                     "endsAt": {"type": "string", "format": "date-time"},
                     "canonicalUrl": {"type": "string", "format": "uri"},
+                    "purchaseUrl": {"type": "string", "format": "uri"},
+                    "originalUrl": {"type": "string", "format": "uri"},
+                    "referralCode": {"type": "string"},
                 },
                 "additionalProperties": True,
             },
@@ -1843,6 +1906,40 @@ def list_events_api():
     payload = {
         "generatedAt": isoformat_or_none(datetime.utcnow().replace(tzinfo=timezone.utc)),
         "items": events,
+    }
+    return json_response(payload, cache_seconds=EVENT_CACHE_SECONDS)
+
+
+@app.route("/api/events/<slug>", methods=["GET"])
+@limiter.limit("100 per minute")
+def event_detail_api(slug: str):
+    event, original = find_event_by_slug(slug)
+    if not event:
+        return jsonify({"message": "Event not found."}), 404
+
+    referral = default_referral_code()
+    original_copy = dict(original or {})
+    apply_default_referral(original_copy, referral)
+
+    purchase_url = (
+        original_copy.get("goOutUrl")
+        or original_copy.get("originalUrl")
+        or original_copy.get("canonicalUrl")
+    )
+
+    event_payload = dict(event)
+    if purchase_url:
+        event_payload["purchaseUrl"] = purchase_url
+    original_url = original_copy.get("originalUrl")
+    if original_url:
+        event_payload["originalUrl"] = original_url
+    referral_code = original_copy.get("referralCode")
+    if referral_code:
+        event_payload["referralCode"] = referral_code
+
+    payload = {
+        "generatedAt": isoformat_or_none(datetime.utcnow().replace(tzinfo=timezone.utc)),
+        "event": event_payload,
     }
     return json_response(payload, cache_seconds=EVENT_CACHE_SECONDS)
 

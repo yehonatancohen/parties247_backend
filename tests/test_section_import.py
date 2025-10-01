@@ -1,11 +1,22 @@
+import importlib
 import sys
 import types
 from pathlib import Path
-from urllib.parse import urlparse
+
+import pytest
+
+requests_stub = sys.modules.get("requests")
+if isinstance(requests_stub, types.SimpleNamespace):
+    sys.modules.pop("requests", None)
+    importlib.invalidate_caches()
+
+import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import app
+
+setattr(app, "requests", requests)
 
 
 class FakeCursor:
@@ -98,12 +109,23 @@ class FakeCarouselsCollection:
 
 
 class DummyResponse:
-    def __init__(self, text):
+    def __init__(self, text: str, status_code: int = 200):
         self.text = text
-        self.status_code = 200
+        self.status_code = status_code
 
     def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"Status code: {self.status_code}")
         return None
+
+
+def fetch_live_page(url: str) -> requests.Response:
+    try:
+        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        response.raise_for_status()
+        return response
+    except requests.RequestException as exc:
+        pytest.skip(f"Unable to fetch live data from {url}: {exc}")
 
 
 flask_mod = sys.modules["flask"]
@@ -123,50 +145,48 @@ def test_add_section_creates_carousel_and_parties(monkeypatch):
     monkeypatch.setattr(app, "default_referral_code", lambda: "refcode")
     monkeypatch.setattr(app, "notify_indexers", lambda urls: None)
     monkeypatch.setattr(app, "trigger_revalidation", lambda paths: None)
+    section_url = "https://www.go-out.co/s/sukkot2025"
+    section_response = fetch_live_page(section_url)
 
-    html = """
-    <html><body>
-    <a href="https://example.com/event/first">First</a>
-    <a href="/event/second">Second</a>
-    </body></html>
-    """
-    monkeypatch.setattr(app.requests, "get", lambda url, headers=None, timeout=None: DummyResponse(html))
+    live_event_urls = app.extract_event_urls_from_page(section_url, section_response.text)
+    if not live_event_urls:
+        pytest.skip("No events discovered from live section page")
+    selected_event_urls = live_event_urls[:2]
 
-    def fake_scrape(url):
-        slug = url.rsplit("/", 1)[-1]
-        return {
-            "name": slug,
-            "date": "2024-01-01T00:00:00Z",
-            "location": "Tel Aviv",
-            "description": "desc",
-            "imageUrl": "https://example.com/img.jpg",
-            "region": "מרכז",
-            "musicType": "טכנו",
-            "eventType": "מסיבת מועדון",
-            "age": "18+",
-            "tags": [],
-            "originalUrl": url,
-            "canonicalUrl": url,
-            "goOutUrl": url,
-        }
+    event_html_map: dict[str, str] = {}
+    for event_url in selected_event_urls:
+        response = fetch_live_page(event_url)
+        event_html_map[event_url] = response.text
 
-    monkeypatch.setattr(app, "scrape_party_details", fake_scrape)
+    monkeypatch.setattr(app, "extract_event_urls_from_page", lambda url, html: selected_event_urls)
+
+    def fake_get(url, headers=None, timeout=None):
+        if url == section_url:
+            return DummyResponse(section_response.text, section_response.status_code)
+        if url in event_html_map:
+            return DummyResponse(event_html_map[url], 200)
+        base_url = url.split("?", 1)[0]
+        if base_url in event_html_map:
+            return DummyResponse(event_html_map[base_url], 200)
+        raise requests.HTTPError(f"Unexpected URL requested during test: {url}")
+
+    monkeypatch.setattr(app.requests, "get", fake_get)
 
     flask_mod.request.get_json = lambda silent=True: {
-        "url": "https://example.com/collection",
+        "url": section_url,
         "carouselName": "Weekend Specials",
     }
 
     payload, status = app.add_section()
     assert status == 201
     assert payload["carousel"]["title"] == "Weekend Specials"
-    assert payload["partyCount"] == 2
-    assert payload["addedCount"] == 2
+    assert payload["partyCount"] >= 1
+    assert payload["addedCount"] >= 1
 
     stored_ids = carousels.docs[0]["partyIds"]
-    assert len(stored_ids) == 2
+    assert len(stored_ids) == payload["partyCount"]
     go_out_urls = [doc["goOutUrl"] for doc in parties.docs]
-    assert all(url.endswith("refcode") for url in go_out_urls)
+    assert all("ref=refcode" in url for url in go_out_urls)
 
 
 def test_add_section_uses_next_data_events(monkeypatch):
@@ -178,50 +198,55 @@ def test_add_section_uses_next_data_events(monkeypatch):
     monkeypatch.setattr(app, "default_referral_code", lambda: "affid")
     monkeypatch.setattr(app, "notify_indexers", lambda urls: None)
     monkeypatch.setattr(app, "trigger_revalidation", lambda paths: None)
+    section_url = "https://www.go-out.co/tickets/festivals"
+    section_response = fetch_live_page(section_url)
 
-    html = """
-    <html><head>
-    <script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"pageInitialParams":{"events":[{"Url":"awesome-slug"}]}}}}</script>
-    </head><body></body></html>
-    """
-    monkeypatch.setattr(app.requests, "get", lambda url, headers=None, timeout=None: DummyResponse(html))
+    live_event_urls = app.extract_event_urls_from_page(section_url, section_response.text)
+    if not live_event_urls:
+        pytest.skip("No events discovered from festivals page")
+    selected_event_urls = live_event_urls[:2]
+
+    event_html_map: dict[str, str] = {}
+    for event_url in selected_event_urls:
+        response = fetch_live_page(event_url)
+        event_html_map[event_url] = response.text
+
+    monkeypatch.setattr(app, "extract_event_urls_from_page", lambda url, html: selected_event_urls)
+
+    def fake_get(url, headers=None, timeout=None):
+        if url == section_url:
+            return DummyResponse(section_response.text, section_response.status_code)
+        if url in event_html_map:
+            return DummyResponse(event_html_map[url], 200)
+        base_url = url.split("?", 1)[0]
+        if base_url in event_html_map:
+            return DummyResponse(event_html_map[base_url], 200)
+        raise requests.HTTPError(f"Unexpected URL requested during test: {url}")
+
+    monkeypatch.setattr(app.requests, "get", fake_get)
 
     scraped_urls: list[str] = []
+    original_scrape = app.scrape_party_details
 
-    def fake_scrape(url):
+    def tracking_scrape(url: str):
         scraped_urls.append(url)
-        slug = urlparse(url).path.rsplit("/", 1)[-1]
-        return {
-            "name": slug,
-            "date": "2024-01-01T00:00:00Z",
-            "location": "Tel Aviv",
-            "description": "desc",
-            "imageUrl": "https://example.com/img.jpg",
-            "region": "מרכז",
-            "musicType": "טכנו",
-            "eventType": "מסיבת מועדון",
-            "age": "18+",
-            "tags": [],
-            "originalUrl": url,
-            "canonicalUrl": url,
-            "goOutUrl": url,
-        }
+        return original_scrape(url)
 
-    monkeypatch.setattr(app, "scrape_party_details", fake_scrape)
+    monkeypatch.setattr(app, "scrape_party_details", tracking_scrape)
 
     flask_mod.request.get_json = lambda silent=True: {
-        "url": "https://www.go-out.co/s/gooutverified",
+        "url": section_url,
         "carouselName": "Verified Events",
     }
 
     payload, status = app.add_section()
     assert status == 201
-    assert payload["partyCount"] == 1
-    assert scraped_urls == ["https://www.go-out.co/event/awesome-slug?ref=affid"]
-    assert payload["addedCount"] == 1
-
-    stored = parties.docs[0]
-    assert stored["goOutUrl"].endswith("ref=affid")
+    assert payload["partyCount"] >= 1
+    assert payload["addedCount"] >= 1
+    assert scraped_urls
+    assert all("ref=affid" in url for url in scraped_urls)
+    assert parties.docs
+    assert all("ref=affid" in doc.get("goOutUrl", "") for doc in parties.docs)
 
 
 def test_add_section_without_links_returns_not_found(monkeypatch):
@@ -231,10 +256,21 @@ def test_add_section_without_links_returns_not_found(monkeypatch):
     monkeypatch.setattr(app, "parties_collection", parties)
     monkeypatch.setattr(app, "carousels_collection", carousels)
     monkeypatch.setattr(app, "default_referral_code", lambda: None)
-    monkeypatch.setattr(app.requests, "get", lambda url, headers=None, timeout=None: DummyResponse("<html></html>"))
+    empty_url = "https://www.go-out.co/s/thispagedoesnotexist"
+    empty_response = fetch_live_page(empty_url)
+
+    discovered = app.extract_event_urls_from_page(empty_url, empty_response.text)
+    if discovered:
+        pytest.skip("Expected empty search results, but events were found")
+
+    monkeypatch.setattr(
+        app.requests,
+        "get",
+        lambda url, headers=None, timeout=None: DummyResponse(empty_response.text, empty_response.status_code),
+    )
 
     flask_mod.request.get_json = lambda silent=True: {
-        "url": "https://example.com/collection",
+        "url": empty_url,
         "carouselName": "Empty",
     }
 

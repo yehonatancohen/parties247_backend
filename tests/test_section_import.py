@@ -1,5 +1,9 @@
 import sys
 import types
+from pathlib import Path
+from urllib.parse import urlparse
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import app
 
@@ -145,6 +149,60 @@ def test_add_section_creates_carousel_and_parties(monkeypatch):
     assert len(stored_ids) == 2
     go_out_urls = [doc["goOutUrl"] for doc in parties.docs]
     assert all(url.endswith("refcode") for url in go_out_urls)
+
+
+def test_add_section_uses_next_data_events(monkeypatch):
+    authenticated_headers()
+    parties = FakePartiesCollection()
+    carousels = FakeCarouselsCollection()
+    monkeypatch.setattr(app, "parties_collection", parties)
+    monkeypatch.setattr(app, "carousels_collection", carousels)
+    monkeypatch.setattr(app, "default_referral_code", lambda: "affid")
+    monkeypatch.setattr(app, "notify_indexers", lambda urls: None)
+    monkeypatch.setattr(app, "trigger_revalidation", lambda paths: None)
+
+    html = """
+    <html><head>
+    <script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"pageInitialParams":{"events":[{"Url":"awesome-slug"}]}}}}</script>
+    </head><body></body></html>
+    """
+    monkeypatch.setattr(app.requests, "get", lambda url, headers=None, timeout=None: DummyResponse(html))
+
+    scraped_urls: list[str] = []
+
+    def fake_scrape(url):
+        scraped_urls.append(url)
+        slug = urlparse(url).path.rsplit("/", 1)[-1]
+        return {
+            "name": slug,
+            "date": "2024-01-01T00:00:00Z",
+            "location": "Tel Aviv",
+            "description": "desc",
+            "imageUrl": "https://example.com/img.jpg",
+            "region": "מרכז",
+            "musicType": "טכנו",
+            "eventType": "מסיבת מועדון",
+            "age": "18+",
+            "tags": [],
+            "originalUrl": url,
+            "canonicalUrl": url,
+            "goOutUrl": url,
+        }
+
+    monkeypatch.setattr(app, "scrape_party_details", fake_scrape)
+
+    flask_mod.request.get_json = lambda silent=True: {
+        "url": "https://www.go-out.co/s/gooutverified",
+        "carouselName": "Verified Events",
+    }
+
+    payload, status = app.add_section()
+    assert status == 201
+    assert payload["partyCount"] == 1
+    assert scraped_urls == ["https://www.go-out.co/event/awesome-slug?ref=affid"]
+
+    stored = parties.docs[0]
+    assert stored["goOutUrl"].endswith("ref=affid")
 
 
 def test_add_section_without_links_returns_not_found(monkeypatch):

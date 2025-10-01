@@ -68,11 +68,13 @@ def test_get_parties_appends_default_ref(monkeypatch):
             'goOutUrl': 'https://example.com/event?foo=1',
             'originalUrl': 'https://example.com/event',
             'date': '2099-01-01T00:00:00',
+            'name': 'My Great Party',
         },
         {
             '_id': '2',
             'goOutUrl': 'https://example.com/other?ref=keep',
             'date': '2099-01-02T00:00:00',
+            'slug': 'existing-slug',
         },
     ]
 
@@ -103,6 +105,9 @@ def test_get_parties_appends_default_ref(monkeypatch):
     assert urls['1'].endswith('ref=default-ref')
     assert urls['2'].count('ref=keep') == 1
     assert 'default-ref' not in urls['2']
+    slugs = {item['_id']: item.get('slug') for item in payload}
+    assert slugs['1'] == 'my-great-party'
+    assert slugs['2'] == 'existing-slug'
 
 
 def test_protect_decorator():

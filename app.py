@@ -7,7 +7,7 @@ import copy
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from functools import wraps
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode, quote_plus, urljoin
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode, quote_plus, urljoin, ParseResult
 try:
     from pymongo import UpdateOne
 except Exception:  # pragma: no cover - used only when pymongo isn't available in tests
@@ -2117,22 +2117,62 @@ def extract_event_urls_from_page(source_url: str, html: str) -> list[str]:
         soup = BeautifulSoup(html, "html.parser")
     except Exception:
         return []
+
+    referral = default_referral_code()
     discovered: list[str] = []
     seen: set[str] = set()
+
+    def _dedupe_key(parsed: ParseResult) -> str:
+        filtered_qs = [
+            (k, v)
+            for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+            if k.lower() != "ref"
+        ]
+        query = urlencode(filtered_qs, doseq=True)
+        return urlunparse(parsed._replace(query=query, fragment=""))
+
+    def _store(raw_url: str) -> None:
+        try:
+            normalized = normalize_url(raw_url)
+        except Exception:
+            return
+        parsed = urlparse(normalized)
+        if "/event/" not in parsed.path:
+            return
+        key = _dedupe_key(parsed)
+        if key in seen:
+            return
+        seen.add(key)
+        final_url = append_referral_param(normalized, referral)
+        discovered.append(final_url or normalized)
+
+    GO_OUT_EVENT_BASE = "https://www.go-out.co/event/"
+
+    def _build_candidate(value: str | None) -> str | None:
+        candidate = (value or "").strip()
+        if not candidate:
+            return None
+        parsed = urlparse(candidate)
+        if parsed.scheme and parsed.netloc:
+            return candidate
+        if candidate.startswith("/"):
+            return urljoin(source_url, candidate)
+        slug = candidate.lstrip("/")
+        if not slug:
+            return None
+        if slug.startswith("event/"):
+            slug = slug[len("event/") :]
+        return f"{GO_OUT_EVENT_BASE}{slug}"
+
     for anchor in soup.find_all("a"):
         href = getattr(anchor, "get", lambda *args, **kwargs: None)("href")
         if not href:
             continue
         absolute = urljoin(source_url, href)
-        normalized = normalize_url(absolute)
-        if "/event/" not in urlparse(normalized).path:
-            continue
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        discovered.append(normalized)
+        _store(absolute)
     if discovered:
         return discovered
+
     script_tag = soup.find("script", {"id": "__NEXT_DATA__"})
     if not script_tag or not getattr(script_tag, "string", None):
         return []
@@ -2141,8 +2181,24 @@ def extract_event_urls_from_page(source_url: str, html: str) -> list[str]:
     except Exception:
         return []
 
+    def _collect_from_event_dict(item: dict) -> None:
+        for key in ("Url", "url", "slug"):
+            if key in item:
+                candidate = _build_candidate(item.get(key))
+                if candidate:
+                    _store(candidate)
+
+    root = data if isinstance(data, dict) else {}
+    page_props = root.get("props", {}).get("pageProps", {}) if isinstance(root, dict) else {}
+    initial_params = page_props.get("pageInitialParams", {}) if isinstance(page_props, dict) else {}
+    for key in ("events", "firstEvents"):
+        collection = initial_params.get(key)
+        if isinstance(collection, list):
+            for item in collection:
+                if isinstance(item, dict):
+                    _collect_from_event_dict(item)
+
     ordered: list[str] = []
-    seen = set()
 
     def _walk(node):
         if isinstance(node, dict):
@@ -2151,17 +2207,13 @@ def extract_event_urls_from_page(source_url: str, html: str) -> list[str]:
         elif isinstance(node, list):
             for item in node:
                 _walk(item)
-        elif isinstance(node, str) and "/event/" in node:
-            absolute_url = urljoin(source_url, node)
-            normalized_url = normalize_url(absolute_url)
-            if "/event/" not in urlparse(normalized_url).path:
-                return
-            if normalized_url in seen:
-                return
-            seen.add(normalized_url)
-            ordered.append(normalized_url)
+        elif isinstance(node, str):
+            candidate = _build_candidate(node) if "/event/" not in node else urljoin(source_url, node)
+            if candidate:
+                _store(candidate)
 
     _walk(data)
+    ordered.extend(discovered)
     return ordered
 
 

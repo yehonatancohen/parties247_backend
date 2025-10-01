@@ -1977,6 +1977,18 @@ def get_parties():
         referral = default_referral_code()
         for party in parties_collection.find().sort("date", 1):
             party["_id"] = str(party["_id"])
+            slug = party.get("slug")
+            if not slug:
+                for candidate in (
+                    party.get("name"),
+                    party.get("title"),
+                    party.get("canonicalUrl"),
+                    party.get("_id"),
+                ):
+                    slug = slugify_value(candidate)
+                    if slug:
+                        break
+            party["slug"] = slug or ""
             apply_default_referral(party, referral)
             items.append(party)
         return jsonify(items), 200

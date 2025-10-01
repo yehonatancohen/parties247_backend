@@ -1682,6 +1682,8 @@ class ReferralUpdateSchema(BaseModel):
 # --- Parties schemas ---
 class AddPartyRequest(BaseModel):
     url: str
+    carouselName: str | None = None
+
     class Config:
         extra = "forbid"
 
@@ -1732,6 +1734,31 @@ class CarouselImportRequest(BaseModel):
     url: str
     carouselName: str | None = None
     title: str | None = None
+
+    class Config:
+        extra = "forbid"
+
+
+class SectionCreateSchema(BaseModel):
+    title: str
+    content: str
+    slug: str | None = None
+
+    class Config:
+        extra = "forbid"
+
+
+class SectionUpdateSchema(BaseModel):
+    title: str | None = None
+    content: str | None = None
+    slug: str | None = None
+
+    class Config:
+        extra = "forbid"
+
+
+class SectionReorderSchema(BaseModel):
+    orderedIds: list[str]
 
     class Config:
         extra = "forbid"
@@ -2005,17 +2032,43 @@ def add_party():
             {"$setOnInsert": party_data},
             upsert=True,
         )
+        carousel_info = None
+        added_to_carousel = False
         if res.matched_count == 1 and res.upserted_id is None:
             doc = parties_collection.find_one(
                 {"$or": [{"canonicalUrl": canonical}, {"goOutUrl": canonical}]},
                 {"_id": 1}
             )
+            if doc and req.carouselName:
+                carousel_doc, added = ensure_carousel_contains_party(req.carouselName, doc.get("_id"))
+                if carousel_doc:
+                    carousel_info = serialize_carousel(carousel_doc)
+                added_to_carousel = added
+                response_payload = {
+                    "message": "Party already existed.",
+                    "id": str(doc.get("_id")),
+                    "addedToCarousel": added_to_carousel,
+                }
+                if carousel_info:
+                    response_payload["carousel"] = carousel_info
+                return jsonify(response_payload), 200
             return jsonify({"message": "This party has already been added.", "id": str(doc["_id"])}), 409
         party_data["_id"] = str(res.upserted_id)
         event_view = normalize_event(party_data)
         notify_indexers([event_view.get("canonicalUrl")])
         trigger_revalidation(event_related_paths(event_view))
-        return jsonify({"message": "Party added successfully!", "party": party_data}), 201
+        if req.carouselName:
+            carousel_doc, added_to_carousel = ensure_carousel_contains_party(req.carouselName, party_data.get("_id"))
+            if carousel_doc:
+                carousel_info = serialize_carousel(carousel_doc)
+        response_payload = {
+            "message": "Party added successfully!",
+            "party": party_data,
+        }
+        if carousel_info:
+            response_payload["carousel"] = carousel_info
+            response_payload["addedToCarousel"] = added_to_carousel
+        return jsonify(response_payload), 201
     except errors.DuplicateKeyError as e:
         app.logger.warning(f"[DB] DuplicateKeyError: {getattr(e, 'details', None)}")
         return jsonify({"message": "This party has already been added."}), 409
@@ -2272,6 +2325,65 @@ def ensure_party_for_url(event_url: str, referral: str | None) -> tuple[dict | N
     notify_indexers([event_view.get("canonicalUrl")])
     trigger_revalidation(event_related_paths(event_view))
     return party_data, True
+
+
+def ensure_carousel_contains_party(title: str, party_id) -> tuple[dict | None, bool]:
+    if carousels_collection is None:
+        return None, False
+    carousel_title = (title or "").strip()
+    if not carousel_title:
+        return None, False
+
+    def _normalize_party_id(value):
+        if isinstance(value, ObjectId):
+            return value, str(value)
+        try:
+            oid = ObjectId(value)
+            return oid, str(oid)
+        except Exception:
+            text = str(value)
+            return text, text
+
+    storage_id, normalized_id = _normalize_party_id(party_id)
+
+    try:
+        existing = carousels_collection.find_one({"title": carousel_title})
+    except Exception as exc:
+        app.logger.error(f"Failed to query carousel '{carousel_title}': {exc}")
+        return None, False
+
+    if existing:
+        existing_ids = {str(pid) for pid in existing.get("partyIds", [])}
+        if normalized_id in existing_ids:
+            return existing, False
+        try:
+            carousels_collection.update_one({"_id": existing.get("_id")}, {"$push": {"partyIds": storage_id}})
+            refreshed = carousels_collection.find_one({"_id": existing.get("_id")}) or existing
+            return refreshed, True
+        except Exception as exc:
+            app.logger.error(
+                f"Failed to append party {normalized_id} to carousel '{carousel_title}': {exc}"
+            )
+            return existing, False
+
+    try:
+        last = carousels_collection.find().sort("order", -1).limit(1)
+        last_order = next(last, {}).get("order", -1)
+    except Exception:
+        last_order = -1
+
+    doc = {
+        "title": carousel_title,
+        "partyIds": [storage_id],
+        "order": int(last_order) + 1,
+    }
+    try:
+        result = carousels_collection.insert_one(doc)
+        doc["_id"] = getattr(result, "inserted_id", doc.get("_id"))
+        return doc, True
+    except Exception as exc:
+        app.logger.error(f"Failed to create carousel '{carousel_title}': {exc}")
+        return None, False
 
 
 @app.route("/api/admin/carousels", methods=["POST"])
@@ -2577,13 +2689,149 @@ def rename_carousel():
         return jsonify({"message": "Error renaming carousel", "error": str(e)}), 500
 
 
+def normalize_section_doc(doc: dict | None) -> dict:
+    data = dict(doc or {})
+    if "_id" in data and data["_id"] is not None:
+        data["_id"] = str(data["_id"])
+    return data
+
+
+def _coerce_section_id(value):
+    try:
+        return ObjectId(value)
+    except Exception:
+        return value
+
+
+@app.route("/api/admin/sections/<section_id>", methods=["PUT"])
+@protect
+def update_section(section_id):
+    if sections_collection is None:
+        return jsonify({"message": "Storage unavailable."}), 503
+    payload = request.get_json(silent=True) or {}
+    try:
+        req = SectionUpdateSchema(**payload)
+    except ValidationError as ve:
+        app.logger.warning(f"[VALIDATION] {ve}")
+        return jsonify({"message": "Invalid payload", "errors": ve.errors()}), 400
+    updates = {}
+    if req.title is not None:
+        updates["title"] = (req.title or "").strip()
+    if req.content is not None:
+        updates["content"] = req.content
+    if req.slug is not None:
+        slug = slugify_value(req.slug)
+        if not slug:
+            return jsonify({"message": "Unable to derive slug from provided data."}), 400
+        updates["slug"] = slug
+    if not updates:
+        return jsonify({"message": "No valid fields provided."}), 400
+    updates["updatedAt"] = isoformat_or_none(datetime.utcnow().replace(tzinfo=timezone.utc))
+    identifier = _coerce_section_id(section_id)
+    try:
+        result = sections_collection.update_one({"_id": identifier}, {"$set": updates})
+    except Exception as exc:
+        return jsonify({"message": "Error updating section", "error": str(exc)}), 500
+    if getattr(result, "matched_count", 0) == 0:
+        return jsonify({"message": "Section not found"}), 404
+    try:
+        updated_doc = sections_collection.find_one({"_id": identifier})
+    except Exception as exc:
+        return jsonify({"message": "Error loading section", "error": str(exc)}), 500
+    return (
+        jsonify({"message": "Section updated successfully!", "section": normalize_section_doc(updated_doc)}),
+        200,
+    )
+
+
+@app.route("/api/admin/sections/reorder", methods=["POST"])
+@protect
+def reorder_sections():
+    if sections_collection is None:
+        return jsonify({"message": "Storage unavailable."}), 503
+    payload = request.get_json(silent=True) or {}
+    try:
+        req = SectionReorderSchema(**payload)
+    except ValidationError as ve:
+        app.logger.warning(f"[VALIDATION] {ve}")
+        return jsonify({"message": "Invalid payload", "errors": ve.errors()}), 400
+    if not req.orderedIds:
+        return jsonify({"message": "No items to reorder"}), 400
+    missing: list[str] = []
+    for idx, raw_id in enumerate(req.orderedIds):
+        identifier = _coerce_section_id(raw_id)
+        try:
+            result = sections_collection.update_one({"_id": identifier}, {"$set": {"order": idx}})
+        except Exception as exc:
+            return jsonify({"message": "Error reordering sections", "error": str(exc)}), 500
+        if getattr(result, "matched_count", 0) == 0:
+            missing.append(str(raw_id))
+    if missing:
+        return jsonify({"message": "Some sections were not found.", "missing": missing}), 404
+    return jsonify({"message": "Sections reordered"}), 200
+
+
+@app.route("/api/sections", methods=["GET"])
+def list_sections():
+    if sections_collection is None:
+        return jsonify([]), 200
+    try:
+        cursor = sections_collection.find().sort("order", 1)
+    except AttributeError:
+        cursor = sections_collection.find()
+    except Exception as exc:
+        return jsonify({"message": "Error fetching sections", "error": str(exc)}), 500
+    items = [normalize_section_doc(doc) for doc in cursor]
+    return jsonify(items), 200
+
+
 @app.route("/api/admin/sections", methods=["POST"])
 @limiter.limit("5 per minute")
 @protect
 def add_section():
+    payload = request.get_json(silent=True) or {}
+    if not payload.get("url"):
+        if sections_collection is None:
+            return jsonify({"message": "Storage unavailable."}), 503
+        try:
+            section_req = SectionCreateSchema(**payload)
+        except ValidationError as ve:
+            app.logger.warning(f"[VALIDATION] {ve}")
+            return jsonify({"message": "Invalid payload", "errors": ve.errors()}), 400
+        title = (section_req.title or "").strip()
+        content = section_req.content
+        if not title:
+            return jsonify({"message": "title is required"}), 400
+        slug_source = section_req.slug or title
+        slug = slugify_value(slug_source)
+        if not slug:
+            return jsonify({"message": "Unable to derive slug from provided data."}), 400
+        try:
+            last = sections_collection.find().sort("order", -1).limit(1)
+            last_order = next(last, {}).get("order", -1)
+        except Exception:
+            last_order = -1
+        now = isoformat_or_none(datetime.utcnow().replace(tzinfo=timezone.utc))
+        doc = {
+            "title": title,
+            "content": content,
+            "slug": slug,
+            "order": int(last_order) + 1,
+            "createdAt": now,
+            "updatedAt": now,
+        }
+        try:
+            result = sections_collection.insert_one(doc)
+            doc["_id"] = getattr(result, "inserted_id", doc.get("_id"))
+        except Exception as exc:
+            return jsonify({"message": "Error creating section", "error": str(exc)}), 500
+        payload = dict(doc)
+        if payload.get("_id") is not None:
+            payload["_id"] = str(payload["_id"])
+        return jsonify(payload), 201
+
     if carousels_collection is None or parties_collection is None:
         return jsonify({"message": "Storage unavailable."}), 503
-    payload = request.get_json(silent=True) or {}
     try:
         req = CarouselImportRequest(**payload)
     except ValidationError as ve:
@@ -2621,43 +2869,24 @@ def add_section():
             continue
         collected.append(party_doc)
 
-    ordered_party_ids = []
-    seen_ids: set[str] = set()
+    carousel_doc = None
+    added_count = 0
     for doc in collected:
         raw_id = doc.get("_id")
         if raw_id is None:
             continue
-        str_id = str(raw_id)
-        if str_id in seen_ids:
-            continue
-        seen_ids.add(str_id)
-        ordered_party_ids.append(raw_id)
+        carousel_doc, added = ensure_carousel_contains_party(title, raw_id)
+        if added:
+            added_count += 1
 
-    if not ordered_party_ids:
+    if carousel_doc is None:
         return jsonify({"message": "No parties could be imported from the provided URL."}), 404
-
-    try:
-        last = carousels_collection.find().sort("order", -1).limit(1)
-        last_order = next(last, {}).get("order", -1)
-    except Exception:
-        last_order = -1
-
-    doc = {
-        "title": title,
-        "partyIds": ordered_party_ids,
-        "order": int(last_order) + 1,
-    }
-
-    try:
-        result = carousels_collection.insert_one(doc)
-        doc["_id"] = result.inserted_id
-    except Exception as exc:
-        return jsonify({"message": "Error creating carousel", "error": str(exc)}), 500
 
     payload = {
         "message": "Carousel created from section.",
-        "carousel": serialize_carousel(doc),
-        "partyCount": len(ordered_party_ids),
+        "carousel": serialize_carousel(carousel_doc),
+        "partyCount": len(carousel_doc.get("partyIds", [])),
+        "addedCount": added_count,
     }
     if warnings:
         payload["warnings"] = warnings

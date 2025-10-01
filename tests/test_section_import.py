@@ -79,6 +79,23 @@ class FakeCarouselsCollection:
         self.docs.append(stored)
         return types.SimpleNamespace(inserted_id=stored["_id"])
 
+    def find_one(self, query):
+        for doc in self.docs:
+            if _matches(doc, query):
+                return doc.copy()
+        return None
+
+    def update_one(self, query, update):
+        for doc in self.docs:
+            if _matches(doc, query):
+                if "$push" in update and "partyIds" in update["$push"]:
+                    doc.setdefault("partyIds", [])
+                    doc["partyIds"].append(update["$push"]["partyIds"])
+                if "$set" in update:
+                    doc.update(update["$set"])
+                return types.SimpleNamespace(matched_count=1)
+        return types.SimpleNamespace(matched_count=0)
+
 
 class DummyResponse:
     def __init__(self, text):
@@ -144,6 +161,7 @@ def test_add_section_creates_carousel_and_parties(monkeypatch):
     assert status == 201
     assert payload["carousel"]["title"] == "Weekend Specials"
     assert payload["partyCount"] == 2
+    assert payload["addedCount"] == 2
 
     stored_ids = carousels.docs[0]["partyIds"]
     assert len(stored_ids) == 2
@@ -200,6 +218,7 @@ def test_add_section_uses_next_data_events(monkeypatch):
     assert status == 201
     assert payload["partyCount"] == 1
     assert scraped_urls == ["https://www.go-out.co/event/awesome-slug?ref=affid"]
+    assert payload["addedCount"] == 1
 
     stored = parties.docs[0]
     assert stored["goOutUrl"].endswith("ref=affid")

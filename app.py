@@ -60,6 +60,11 @@ TRACKING_KEYS = {"fbclid", "gclid", "mc_cid", "mc_eid"}
 
 REFERRAL_KEY = "referral"
 
+GO_OUT_BASE_URL = "https://www.go-out.co"
+GO_OUT_EVENT_BASE = f"{GO_OUT_BASE_URL}/event/"
+GO_OUT_TICKETS_API_PATH = "/endOne/getEventsByTypeNew"
+GO_OUT_TICKETS_PREFIX = "/tickets/"
+
 CANONICAL_PATTERNS = {
     "event": "/event/{slug}",
     "city": "/city/{slug}",
@@ -2165,6 +2170,174 @@ def serialize_carousel(doc: dict) -> dict:
     return data
 
 
+def _is_go_out_tickets_url(url: str) -> bool:
+    try:
+        parsed = urlparse((url or "").strip())
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = parsed.netloc.lower()
+    if not host.endswith("go-out.co"):
+        return False
+    path = parsed.path or ""
+    return path.startswith(GO_OUT_TICKETS_PREFIX)
+
+
+def _lookup_case_insensitive(source: dict, *candidates: str):
+    if not isinstance(source, dict):
+        return None
+    lower_map = {str(key).lower(): key for key in source.keys()}
+    for name in candidates:
+        if name in source:
+            return source[name]
+        key = lower_map.get(str(name).lower())
+        if key is not None:
+            return source[key]
+    return None
+
+
+def _sanitize_ticket_payload(raw: dict) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    types = _lookup_case_insensitive(raw, "Types")
+    if not isinstance(types, list):
+        return None
+    normalized_types = []
+    for item in types:
+        text = str(item).strip()
+        if text:
+            normalized_types.append(text)
+    if not normalized_types:
+        return None
+
+    skip_raw = _lookup_case_insensitive(raw, "skip")
+    limit_raw = _lookup_case_insensitive(raw, "limit")
+    has_range = skip_raw is not None or limit_raw is not None
+    if not has_range:
+        return None
+
+    try:
+        skip_val = int(skip_raw)
+    except Exception:
+        skip_val = 0
+    try:
+        limit_val = int(limit_raw)
+    except Exception:
+        limit_val = 20
+    if skip_val < 0:
+        skip_val = 0
+    if limit_val <= 0:
+        limit_val = 20
+
+    location = _lookup_case_insensitive(raw, "location")
+    location_text = str(location).strip() if isinstance(location, str) else None
+    if not location_text:
+        location_text = "IL"
+
+    recived_raw = _lookup_case_insensitive(raw, "recivedDate", "receivedDate", "recievedDate")
+    recived_text = None
+    if isinstance(recived_raw, str) and recived_raw.strip():
+        recived_text = recived_raw.strip()
+    else:
+        parsed = parse_datetime(recived_raw)
+        if parsed:
+            recived_text = parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    if not recived_text:
+        recived_text = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+
+    payload = {
+        "skip": skip_val,
+        "limit": limit_val,
+        "location": location_text,
+        "Types": normalized_types,
+        "recivedDate": recived_text,
+    }
+    return payload
+
+
+def _extract_ticket_category_payload(next_data: dict) -> dict | None:
+    candidates: list[dict] = []
+
+    def _walk(node):
+        if isinstance(node, dict):
+            payload = _sanitize_ticket_payload(node)
+            if payload:
+                candidates.append(payload)
+            for value in node.values():
+                _walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(next_data or {})
+    if not candidates:
+        return None
+    return candidates[0]
+
+
+def _extract_event_slug_from_ticket_item(item: dict) -> str | None:
+    if not isinstance(item, dict):
+        return None
+    for key in ("Url", "url", "slug", "Slug", "_id", "id"):
+        if key in item:
+            value = item.get(key)
+            if isinstance(value, (int, float)):
+                value = str(int(value))
+            elif value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                if "/" in text:
+                    parsed = urlparse(text)
+                    if parsed.path and "/event/" in parsed.path:
+                        slug = parsed.path.rsplit("/", 1)[-1]
+                        return slug
+                return text
+    return None
+
+
+def fetch_ticket_category_event_urls(source_url: str, next_data: dict) -> list[str]:
+    if not _is_go_out_tickets_url(source_url):
+        return []
+    payload = _extract_ticket_category_payload(next_data)
+    if not payload:
+        return []
+    endpoint = urljoin(GO_OUT_BASE_URL, GO_OUT_TICKETS_API_PATH)
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Origin": GO_OUT_BASE_URL,
+        "Referer": source_url,
+        "User-Agent": "Mozilla/5.0",
+    }
+    try:
+        response = requests.post(endpoint, json=payload, headers=headers, timeout=15)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        app.logger.warning(f"Failed to fetch Go-Out tickets events for {source_url}: {exc}")
+        return []
+    try:
+        body = response.json()
+    except ValueError:
+        return []
+    events = body.get("events") if isinstance(body, dict) else None
+    if not isinstance(events, list):
+        return []
+    urls: list[str] = []
+    for event in events:
+        slug = _extract_event_slug_from_ticket_item(event)
+        if not slug:
+            continue
+        slug = slug.lstrip("/")
+        if slug.startswith("event/"):
+            slug = slug[len("event/") :]
+        if not slug:
+            continue
+        urls.append(f"{GO_OUT_EVENT_BASE}{slug}")
+    return urls
+
+
 def extract_event_urls_from_page(source_url: str, html: str) -> list[str]:
     try:
         soup = BeautifulSoup(html, "html.parser")
@@ -2199,8 +2372,6 @@ def extract_event_urls_from_page(source_url: str, html: str) -> list[str]:
         final_url = append_referral_param(normalized, referral)
         discovered.append(final_url or normalized)
 
-    GO_OUT_EVENT_BASE = "https://www.go-out.co/event/"
-
     def _build_candidate(value: str | None) -> str | None:
         candidate = (value or "").strip()
         if not candidate:
@@ -2233,6 +2404,9 @@ def extract_event_urls_from_page(source_url: str, html: str) -> list[str]:
         data = json.loads(script_tag.string)
     except Exception:
         return []
+
+    for api_url in fetch_ticket_category_event_urls(source_url, data):
+        _store(api_url)
 
     def _collect_from_event_dict(item: dict) -> None:
         for key in ("Url", "url", "slug"):

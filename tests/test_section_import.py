@@ -143,6 +143,17 @@ def authenticated_headers():
     flask_mod.request.headers = {"Authorization": "Bearer token"}
 
 
+def test_discover_event_urls_from_live_nightlife_page():
+    section_url = "https://www.go-out.co/tickets/nightlife"
+    try:
+        urls = app.discover_event_urls_from_source(section_url)
+    except requests.RequestException as exc:
+        pytest.skip(f"Unable to fetch live data from {section_url}: {exc}")
+
+    party_urls = [url for url in urls if "/event/" in url]
+    assert party_urls, "Expected at least one party URL discovered from nightlife category"
+
+
 def test_extract_event_urls_from_ticket_category_uses_api(monkeypatch):
     sample_html = """
     <html><head></head><body>
@@ -203,7 +214,7 @@ def test_add_section_imports_ticket_category_via_api(monkeypatch):
     </body></html>
     """
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, **kwargs):
         if url == section_url:
             return DummyResponse(sample_html, 200)
         raise AssertionError(f"Unexpected GET {url}")
@@ -298,7 +309,7 @@ def test_add_section_creates_carousel_and_parties(monkeypatch):
 
     monkeypatch.setattr(app, "extract_event_urls_from_page", lambda url, html: selected_event_urls)
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, **kwargs):
         if url == section_url:
             return DummyResponse(section_response.text, section_response.status_code)
         if url in event_html_map:
@@ -351,7 +362,7 @@ def test_add_section_uses_next_data_events(monkeypatch):
 
     monkeypatch.setattr(app, "extract_event_urls_from_page", lambda url, html: selected_event_urls)
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, **kwargs):
         if url == section_url:
             return DummyResponse(section_response.text, section_response.status_code)
         if url in event_html_map:

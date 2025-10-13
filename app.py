@@ -4,6 +4,7 @@ import logging
 import hmac
 import re
 import copy
+from typing import Iterable
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from functools import wraps
@@ -2959,6 +2960,49 @@ def list_sections():
     return jsonify(items), 200
 
 
+def discover_event_urls_from_source(source_url: str) -> list[str]:
+    """Fetch a source page and extract party URLs from it."""
+    disable_proxies = {"http": None, "https": None}
+    response = requests.get(
+        source_url,
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=15,
+        proxies=disable_proxies,
+    )
+    response.raise_for_status()
+    return extract_event_urls_from_page(source_url, response.text)
+
+
+def add_parties_to_carousel_from_urls(
+    title: str, event_urls: Iterable[str], referral: str | None
+) -> tuple[dict | None, int, list[dict]]:
+    collected: list[dict] = []
+    warnings: list[dict] = []
+
+    for event_url in event_urls:
+        try:
+            party_doc, _created = ensure_party_for_url(event_url, referral)
+        except Exception as exc:
+            warnings.append({"url": event_url, "error": str(exc)})
+            continue
+        if not party_doc or not party_doc.get("_id"):
+            warnings.append({"url": event_url, "error": "Missing party identifier"})
+            continue
+        collected.append(party_doc)
+
+    carousel_doc = None
+    added_count = 0
+    for doc in collected:
+        raw_id = doc.get("_id")
+        if raw_id is None:
+            continue
+        carousel_doc, added = ensure_carousel_contains_party(title, raw_id)
+        if added:
+            added_count += 1
+
+    return carousel_doc, added_count, warnings
+
+
 @app.route("/api/admin/sections", methods=["POST"])
 @limiter.limit("5 per minute")
 @protect
@@ -3020,38 +3064,17 @@ def add_section():
         return jsonify({"message": "URL is not allowed."}), 400
 
     try:
-        response = requests.get(source_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-        response.raise_for_status()
+        event_urls = discover_event_urls_from_source(source_url)
     except requests.exceptions.RequestException as exc:
         return jsonify({"message": "Unable to fetch source URL.", "error": str(exc)}), 502
 
-    event_urls = extract_event_urls_from_page(source_url, response.text)
     if not event_urls:
         return jsonify({"message": "No parties were found at the provided URL."}), 404
 
     referral = default_referral_code()
-    collected: list[dict] = []
-    warnings: list[dict] = []
-    for event_url in event_urls:
-        try:
-            party_doc, _created = ensure_party_for_url(event_url, referral)
-        except Exception as exc:
-            warnings.append({"url": event_url, "error": str(exc)})
-            continue
-        if not party_doc or not party_doc.get("_id"):
-            warnings.append({"url": event_url, "error": "Missing party identifier"})
-            continue
-        collected.append(party_doc)
-
-    carousel_doc = None
-    added_count = 0
-    for doc in collected:
-        raw_id = doc.get("_id")
-        if raw_id is None:
-            continue
-        carousel_doc, added = ensure_carousel_contains_party(title, raw_id)
-        if added:
-            added_count += 1
+    carousel_doc, added_count, warnings = add_parties_to_carousel_from_urls(
+        title, event_urls, referral
+    )
 
     if carousel_doc is None:
         return jsonify({"message": "No parties could be imported from the provided URL."}), 404

@@ -1,4 +1,5 @@
 import importlib
+import json
 import sys
 import types
 from pathlib import Path
@@ -109,14 +110,20 @@ class FakeCarouselsCollection:
 
 
 class DummyResponse:
-    def __init__(self, text: str, status_code: int = 200):
+    def __init__(self, text: str = "", status_code: int = 200, json_data=None):
         self.text = text
         self.status_code = status_code
+        self._json_data = json_data
 
     def raise_for_status(self):
         if self.status_code >= 400:
             raise requests.HTTPError(f"Status code: {self.status_code}")
         return None
+
+    def json(self):
+        if self._json_data is not None:
+            return self._json_data
+        return json.loads(self.text)
 
 
 def fetch_live_page(url: str) -> requests.Response:
@@ -135,6 +142,137 @@ def authenticated_headers():
     app.JWT_SECRET = "secret"
     flask_mod.request.headers = {"Authorization": "Bearer token"}
 
+
+def test_extract_event_urls_from_ticket_category_uses_api(monkeypatch):
+    sample_html = """
+    <html><head></head><body>
+    <script id="__NEXT_DATA__" type="application/json">
+    {"props":{"pageProps":{"pageInitialParams":{"ticketsRequest":{"skip":0,"limit":8,"Types":["אירועים","מועדוני לילה"],"location":"IL","recivedDate":"2025-10-13T13:08:47.589Z"}}}}}
+    </script>
+    </body></html>
+    """
+
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        captured["headers"] = headers
+        return DummyResponse(json_data={
+            "status": True,
+            "events": [{"Url": "1759874720952"}, {"Url": "1760017344268"}],
+        })
+
+    monkeypatch.setattr(app.requests, "post", fake_post)
+    monkeypatch.setattr(app, "default_referral_code", lambda: "refcode")
+
+    urls = app.extract_event_urls_from_page("https://www.go-out.co/tickets/nightlife", sample_html)
+
+    assert captured["url"] == "https://www.go-out.co/endOne/getEventsByTypeNew"
+    assert captured["json"] == {
+        "skip": 0,
+        "limit": 8,
+        "location": "IL",
+        "Types": ["אירועים", "מועדוני לילה"],
+        "recivedDate": "2025-10-13T13:08:47.589Z",
+    }
+    assert set(captured["headers"].keys()) == {"Content-Type", "Accept", "Origin", "Referer", "User-Agent"}
+    assert captured["headers"]["Referer"] == "https://www.go-out.co/tickets/nightlife"
+
+    expected_urls = {
+        "https://www.go-out.co/event/1759874720952?ref=refcode",
+        "https://www.go-out.co/event/1760017344268?ref=refcode",
+    }
+    numeric_urls = {
+        url
+        for url in urls
+        if url.rsplit("/event/", 1)[-1].split("?")[0].isdigit()
+    }
+    assert numeric_urls == expected_urls
+
+
+def test_add_section_imports_ticket_category_via_api(monkeypatch):
+    authenticated_headers()
+    section_url = "https://www.go-out.co/tickets/nightlife"
+
+    sample_html = """
+    <html><head></head><body>
+    <script id="__NEXT_DATA__" type="application/json">
+    {"props":{"pageProps":{"pageInitialParams":{"ticketsRequest":{"skip":0,"limit":4,"Types":["אירועים","מועדוני לילה"],"location":"IL","recivedDate":"2025-10-13T13:08:47.589Z"}}}}}
+    </script>
+    </body></html>
+    """
+
+    def fake_get(url, headers=None, timeout=None):
+        if url == section_url:
+            return DummyResponse(sample_html, 200)
+        raise AssertionError(f"Unexpected GET {url}")
+
+    posted = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        posted["url"] = url
+        posted["json"] = json
+        posted["headers"] = headers
+        return DummyResponse(json_data={
+            "status": True,
+            "events": [
+                {"Url": "1759874720952"},
+                {"Url": "1760017344268"},
+            ],
+        })
+
+    monkeypatch.setattr(app.requests, "get", fake_get)
+    monkeypatch.setattr(app.requests, "post", fake_post)
+    monkeypatch.setattr(app, "default_referral_code", lambda: "refcode")
+    monkeypatch.setattr(app, "notify_indexers", lambda urls: None)
+    monkeypatch.setattr(app, "trigger_revalidation", lambda paths: None)
+
+    captured_urls: list[str] = []
+    valid_slugs = {"1759874720952", "1760017344268"}
+
+    def fake_ensure_party_for_url(event_url, referral):
+        slug = event_url.rsplit("/event/", 1)[-1].split("?")[0]
+        if slug not in valid_slugs:
+            return None, False
+        captured_urls.append(event_url)
+        return {"_id": f"party-{len(captured_urls)}", "goOutUrl": event_url}, True
+
+    carousel_state = {"partyIds": [], "title": ""}
+
+    def fake_ensure_carousel_contains_party(title, party_id):
+        carousel_state["title"] = title
+        added = False
+        if party_id not in carousel_state["partyIds"]:
+            carousel_state["partyIds"].append(party_id)
+            added = True
+        doc = {"_id": "carousel-1", "title": carousel_state["title"], "partyIds": list(carousel_state["partyIds"]) }
+        return doc, added
+
+    monkeypatch.setattr(app, "ensure_party_for_url", fake_ensure_party_for_url)
+    monkeypatch.setattr(app, "ensure_carousel_contains_party", fake_ensure_carousel_contains_party)
+    monkeypatch.setattr(app, "serialize_carousel", lambda doc: doc)
+    monkeypatch.setattr(app, "parties_collection", object())
+    monkeypatch.setattr(app, "carousels_collection", object())
+
+    flask_mod.request.get_json = lambda silent=True: {
+        "url": section_url,
+        "carouselName": "Nightlife Highlights",
+    }
+
+    payload, status = app.add_section()
+
+    assert status == 201
+    assert payload["partyCount"] == 2
+    assert payload["addedCount"] == 2
+    assert payload["carousel"]["title"] == "Nightlife Highlights"
+
+    assert posted["url"] == "https://www.go-out.co/endOne/getEventsByTypeNew"
+    assert posted["json"]["Types"] == ["אירועים", "מועדוני לילה"]
+    assert captured_urls == [
+        "https://www.go-out.co/event/1759874720952?ref=refcode",
+        "https://www.go-out.co/event/1760017344268?ref=refcode",
+    ]
 
 def test_add_section_creates_carousel_and_parties(monkeypatch):
     authenticated_headers()

@@ -65,6 +65,9 @@ GO_OUT_BASE_URL = "https://www.go-out.co"
 GO_OUT_EVENT_BASE = f"{GO_OUT_BASE_URL}/event/"
 GO_OUT_TICKETS_API_PATH = "/endOne/getEventsByTypeNew"
 GO_OUT_TICKETS_PREFIX = "/tickets/"
+NIGHTLIFE_CAROUSEL_TITLE = "חיי לילה"
+WEEKEND_CAROUSEL_TITLE = "סופ״ש"
+ISRAEL_TIMEZONE = timezone(timedelta(hours=3), name="Israel Daylight Time")
 
 CANONICAL_PATTERNS = {
     "event": "/event/{slug}",
@@ -231,9 +234,8 @@ def normalized_or_none_for_dedupe(raw: str) -> str | None:
     return n if urlparse(n).netloc else None
 
 
-def append_referral_param(url: str | None, referral: str | None) -> str | None:
-    """Append the referral query parameter to the URL when missing."""
-    if not url or not referral:
+def _append_query_param(url: str | None, key: str, value: str | None) -> str | None:
+    if not url or not value:
         return url
     try:
         parsed = urlparse(url)
@@ -242,11 +244,22 @@ def append_referral_param(url: str | None, referral: str | None) -> str | None:
     if not parsed.netloc:
         return url
     query_items = parse_qsl(parsed.query, keep_blank_values=True)
-    if any(k.lower() == "ref" for k, _ in query_items):
+    key_lower = key.lower()
+    if any(k.lower() == key_lower for k, _ in query_items):
         return urlunparse(parsed)
-    query_items.append(("ref", referral))
+    query_items.append((key, value))
     new_query = urlencode(query_items, doseq=True)
     return urlunparse(parsed._replace(query=new_query))
+
+
+def append_referral_param(url: str | None, referral: str | None) -> str | None:
+    """Append the referral query parameter to the URL when missing."""
+    return _append_query_param(url, "ref", referral)
+
+
+def append_affiliate_param(url: str | None, referral: str | None) -> str | None:
+    """Append the Go-Out affiliate parameter if a referral code exists."""
+    return _append_query_param(url, "aff", referral)
 
 
 def default_referral_code() -> str | None:
@@ -1442,6 +1455,76 @@ OPENAPI_TEMPLATE = {
                     "400": {"description": "Invalid payload."},
                     "409": {"description": "Party already exists."},
                     "500": {"description": "Server error."},
+                },
+            }
+        },
+        "/api/admin/import/nightlife": {
+            "post": {
+                "summary": "Import Go-Out nightlife events",
+                "description": "Fetches the latest nightlife events from Go-Out and syncs the 'חיי לילה' carousel.",
+                "security": [{"bearerAuth": []}],
+                "responses": {
+                    "200": {
+                        "description": "Nightlife carousel updated.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string"},
+                                        "carousel": {"$ref": "#/components/schemas/Carousel"},
+                                        "addedCount": {"type": "integer"},
+                                        "sourceEventCount": {"type": "integer"},
+                                        "warnings": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "additionalProperties": True,
+                                            },
+                                        },
+                                    },
+                                },
+                            }
+                        },
+                    },
+                    "404": {"description": "No nightlife events were returned."},
+                    "500": {"description": "Unable to update nightlife carousel."},
+                    "502": {"description": "Failed to contact Go-Out."},
+                },
+            }
+        },
+        "/api/admin/import/weekend": {
+            "post": {
+                "summary": "Import Go-Out weekend events",
+                "description": "Fetches the weekend feed from Go-Out and syncs the 'סופ״ש' carousel.",
+                "security": [{"bearerAuth": []}],
+                "responses": {
+                    "200": {
+                        "description": "Weekend carousel updated.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string"},
+                                        "carousel": {"$ref": "#/components/schemas/Carousel"},
+                                        "addedCount": {"type": "integer"},
+                                        "sourceEventCount": {"type": "integer"},
+                                        "warnings": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "additionalProperties": True,
+                                            },
+                                        },
+                                    },
+                                },
+                            }
+                        },
+                    },
+                    "404": {"description": "No weekend events were returned."},
+                    "500": {"description": "Unable to update weekend carousel."},
+                    "502": {"description": "Failed to contact Go-Out."},
                 },
             }
         },
@@ -2973,6 +3056,104 @@ def discover_event_urls_from_source(source_url: str) -> list[str]:
     return extract_event_urls_from_page(source_url, response.text)
 
 
+def _collect_go_out_event_urls(events: list, referral: str | None) -> list[str]:
+    urls: list[str] = []
+    for event in events or []:
+        slug = _extract_event_slug_from_ticket_item(event)
+        if not slug:
+            continue
+        slug = slug.lstrip("/")
+        if not slug:
+            continue
+        if "/" in slug:
+            slug = slug.rsplit("/", 1)[-1]
+        event_url = f"{GO_OUT_EVENT_BASE}{slug}"
+        event_url = append_affiliate_param(event_url, referral)
+        urls.append(event_url)
+    return urls
+
+
+def _format_iso_timestamp(now: datetime | None = None) -> str:
+    moment = (now or datetime.utcnow()).replace(tzinfo=timezone.utc)
+    formatted = moment.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    return f"{formatted}Z"
+
+
+def _format_weekend_recived_date(now: datetime | None = None) -> str:
+    moment = now or datetime.now(ISRAEL_TIMEZONE)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=ISRAEL_TIMEZONE)
+    else:
+        moment = moment.astimezone(ISRAEL_TIMEZONE)
+    offset = moment.strftime("%z")
+    tz_name = moment.tzname() or "Israel Daylight Time"
+    base = moment.strftime("%a %b %d %Y %H:%M:%S")
+    return f"{base} GMT{offset} ({tz_name})"
+
+
+def scrape_nightlife_events(referral: str | None) -> list[str]:
+    payload = {
+        "skip": 0,
+        "limit": 50,
+        "location": "IL",
+        "Types": ["תל אביב", "מועדוני לילה"],
+        "recivedDate": _format_iso_timestamp(),
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Origin": GO_OUT_BASE_URL,
+        "Referer": f"{GO_OUT_BASE_URL}/tickets/nightlife",
+        "User-Agent": "Mozilla/5.0",
+    }
+    disable_proxies = {"http": None, "https": None}
+    response = requests.post(
+        urljoin(GO_OUT_BASE_URL, "/endOne/getEventsByTypeNew"),
+        json=payload,
+        headers=headers,
+        timeout=15,
+        proxies=disable_proxies,
+    )
+    response.raise_for_status()
+    try:
+        body = response.json()
+    except ValueError:
+        return []
+    events = body.get("events") if isinstance(body, dict) else []
+    return _collect_go_out_event_urls(events, referral)
+
+
+def scrape_weekend_events(referral: str | None) -> list[str]:
+    params = {
+        "limit": 50,
+        "skip": 0,
+        "recivedDate": _format_weekend_recived_date(),
+        "location": "IL",
+    }
+    headers = {
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9,he;q=0.8",
+        "Cache-Control": "no-cache",
+        "Referer": f"{GO_OUT_BASE_URL}/weekend",
+        "User-Agent": "Mozilla/5.0",
+    }
+    disable_proxies = {"http": None, "https": None}
+    response = requests.get(
+        urljoin(GO_OUT_BASE_URL, "/endOne/getWeekendEvents"),
+        params=params,
+        headers=headers,
+        timeout=15,
+        proxies=disable_proxies,
+    )
+    response.raise_for_status()
+    try:
+        body = response.json()
+    except ValueError:
+        return []
+    events = body.get("events") if isinstance(body, dict) else []
+    return _collect_go_out_event_urls(events, referral)
+
+
 def add_parties_to_carousel_from_urls(
     title: str, event_urls: Iterable[str], referral: str | None
 ) -> tuple[dict | None, int, list[dict]]:
@@ -3001,6 +3182,72 @@ def add_parties_to_carousel_from_urls(
             added_count += 1
 
     return carousel_doc, added_count, warnings
+
+
+def _import_carousel_from_urls(carousel_name: str, urls: list[str], referral: str | None):
+    if not urls:
+        return None, 0, []
+    return add_parties_to_carousel_from_urls(carousel_name, urls, referral)
+
+
+@app.route("/api/admin/import/nightlife", methods=["POST"])
+@limiter.limit("5 per minute")
+@protect
+def import_nightlife_carousel():
+    referral = default_referral_code()
+    try:
+        event_urls = scrape_nightlife_events(referral)
+    except requests.exceptions.RequestException as exc:
+        return jsonify({"message": "Unable to fetch nightlife events.", "error": str(exc)}), 502
+
+    if not event_urls:
+        return jsonify({"message": "No nightlife events were returned."}), 404
+
+    carousel_doc, added_count, warnings = _import_carousel_from_urls(
+        NIGHTLIFE_CAROUSEL_TITLE, event_urls, referral
+    )
+    if carousel_doc is None:
+        return jsonify({"message": "Unable to update nightlife carousel."}), 500
+
+    payload = {
+        "message": "Nightlife carousel updated.",
+        "carousel": serialize_carousel(carousel_doc),
+        "addedCount": added_count,
+        "sourceEventCount": len(event_urls),
+    }
+    if warnings:
+        payload["warnings"] = warnings
+    return jsonify(payload), 200
+
+
+@app.route("/api/admin/import/weekend", methods=["POST"])
+@limiter.limit("5 per minute")
+@protect
+def import_weekend_carousel():
+    referral = default_referral_code()
+    try:
+        event_urls = scrape_weekend_events(referral)
+    except requests.exceptions.RequestException as exc:
+        return jsonify({"message": "Unable to fetch weekend events.", "error": str(exc)}), 502
+
+    if not event_urls:
+        return jsonify({"message": "No weekend events were returned."}), 404
+
+    carousel_doc, added_count, warnings = _import_carousel_from_urls(
+        WEEKEND_CAROUSEL_TITLE, event_urls, referral
+    )
+    if carousel_doc is None:
+        return jsonify({"message": "Unable to update weekend carousel."}), 500
+
+    payload = {
+        "message": "Weekend carousel updated.",
+        "carousel": serialize_carousel(carousel_doc),
+        "addedCount": added_count,
+        "sourceEventCount": len(event_urls),
+    }
+    if warnings:
+        payload["warnings"] = warnings
+    return jsonify(payload), 200
 
 
 @app.route("/api/admin/sections", methods=["POST"])

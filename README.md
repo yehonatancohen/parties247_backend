@@ -8,6 +8,7 @@ Backend service powering the [Parties247](https://parties247.com) website. It ex
 - JWT‑based admin authentication
 - Rate limiting and CORS restrictions
 - Easy configuration through environment variables
+- Automated imports for Go-Out nightlife and weekend events
 
 ## Getting Started
 
@@ -76,6 +77,15 @@ Admin endpoints are protected using short‑lived JSON Web Tokens (JWTs).
    Authorization: Bearer <jwt>
    ```
 5. To verify that a token is still valid, POST to `/api/admin/verify-token`.
+
+## Automated Go-Out Imports
+
+Authenticated admins can seed two curated carousels directly from Go-Out's official feeds:
+
+- `POST /api/admin/import/nightlife` scrapes the nightlife category and updates the "חיי לילה" carousel.
+- `POST /api/admin/import/weekend` scrapes the weekend feed and updates the "סופ״ש" carousel.
+
+Both endpoints fetch the latest events via Go-Out's APIs, append the configured referral code, and ensure the related parties exist before updating their respective carousels.
 
 ## API Documentation
 

@@ -2393,6 +2393,9 @@ def scrape_party_details(url: str):
         if go_out:
             party_details["goOutUrl"] = go_out
 
+        if not party_details["location"]:
+            party_details["location"] = "לא ידוע"
+
         if not all([party_details["name"], party_details["date"], party_details["location"]]):
             raise ValueError("Scraped data is missing critical fields.")
         return party_details

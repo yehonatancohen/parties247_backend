@@ -4,6 +4,8 @@ import logging
 import hmac
 import re
 import copy
+import html
+from collections import Counter
 from typing import Iterable
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
@@ -355,6 +357,7 @@ try:
     sections_collection: Collection = db.sections
     tags_collection: Collection = db.tags
     settings_collection: Collection = db.settings
+    analytics_collection: Collection = db.analytics
 
     try:
         parties_collection.update_many(
@@ -403,6 +406,8 @@ try:
     ensure_index(tags_collection, [("order", 1)], name="tag_order_asc")
 
     ensure_index(settings_collection, [("key", 1)], name="unique_key", unique=True)
+    ensure_index(analytics_collection, [("createdAt", -1)], name="created_desc")
+    ensure_index(analytics_collection, [("category", 1), ("action", 1)], name="category_action")
 
     app.logger.info("Connected to MongoDB and ensured indexes.")
 except Exception as e:
@@ -412,6 +417,7 @@ except Exception as e:
     sections_collection = None
     tags_collection = None
     settings_collection = None
+    analytics_collection = None
 
 
 def record_setting_hit(key: str, extra: dict | None = None):
@@ -424,6 +430,109 @@ def record_setting_hit(key: str, extra: dict | None = None):
         settings_collection.update_one({"key": key}, {"$set": payload}, upsert=True)
     except Exception as exc:  # pragma: no cover - best effort only
         app.logger.warning(f"Failed to persist analytics hit {key}: {exc}")
+
+
+ANALYTICS_METADATA_LIMIT = 12
+ANALYTICS_TEXT_LIMIT = 256
+
+
+def sanitize_analytics_text(value: str | None) -> str | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text[:ANALYTICS_TEXT_LIMIT]
+
+
+def sanitize_analytics_metadata(data: dict | None) -> dict:
+    if not isinstance(data, dict):
+        return {}
+    cleaned = {}
+    for key, value in data.items():
+        if len(cleaned) >= ANALYTICS_METADATA_LIMIT:
+            break
+        if not isinstance(key, str) or not key.strip():
+            continue
+        if value is None:
+            continue
+        if isinstance(value, (int, float, bool)):
+            cleaned[key] = value
+            continue
+        text_value = sanitize_analytics_text(str(value))
+        if text_value is None:
+            continue
+        cleaned[key] = text_value
+    return cleaned
+
+
+def extract_client_ip(flask_request) -> str | None:
+    candidates = [
+        flask_request.headers.get("X-Forwarded-For"),
+        flask_request.headers.get("CF-Connecting-IP"),
+        flask_request.headers.get("X-Real-IP"),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        ip = candidate.split(",")[0].strip()
+        if ip:
+            return ip
+    return getattr(flask_request, "remote_addr", None)
+
+
+def build_analytics_summary(window_days: int = 30) -> dict:
+    if analytics_collection is None:
+        raise RuntimeError("Analytics datastore unavailable")
+    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+    total_events = 0
+    recent_events = 0
+    action_counter: Counter[tuple[str, str]] = Counter()
+    label_counter: Counter[str] = Counter()
+    path_counter: Counter[str] = Counter()
+    try:
+        try:
+            cursor = analytics_collection.find({})
+        except TypeError:  # pragma: no cover - compatibility with tests
+            cursor = analytics_collection.find()
+    except Exception as exc:
+        app.logger.error(f"Failed to read analytics events: {exc}")
+        raise
+
+    for doc in cursor:
+        total_events += 1
+        created_at = parse_datetime(doc.get("createdAt"))
+        if not created_at or created_at < cutoff:
+            continue
+        recent_events += 1
+        category = sanitize_analytics_text(doc.get("category")) or "unknown"
+        action = sanitize_analytics_text(doc.get("action")) or "unknown"
+        action_counter[(category, action)] += 1
+        label = sanitize_analytics_text(doc.get("label"))
+        if label:
+            label_counter[label] += 1
+        path = sanitize_analytics_text(doc.get("path"))
+        if path:
+            path_counter[path] += 1
+
+    summary = {
+        "windowDays": window_days,
+        "totalEvents": total_events,
+        "recentEvents": recent_events,
+        "actions": [
+            {"category": category, "action": action, "count": count}
+            for (category, action), count in action_counter.most_common(20)
+        ],
+        "topLabels": [
+            {"label": label, "count": count}
+            for label, count in label_counter.most_common(20)
+        ],
+        "topPaths": [
+            {"path": path, "count": count}
+            for path, count in path_counter.most_common(20)
+        ],
+    }
+    return summary
 
 
 def all_events() -> list[dict]:
@@ -871,6 +980,148 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 
+@app.route("/api/analytics/events", methods=["POST"])
+@limiter.limit("120 per minute")
+def create_analytics_event():
+    """Record a user interaction event emitted by the frontend."""
+    if analytics_collection is None:
+        return jsonify({"message": "Analytics datastore unavailable."}), 503
+    payload = request.get_json(silent=True) or {}
+    try:
+        event = AnalyticsEventSchema(**payload)
+    except ValidationError as exc:
+        errors = exc.errors() if hasattr(exc, "errors") else []
+        return jsonify({"message": "Invalid analytics event.", "errors": errors}), 400
+
+    raw_category = getattr(event, "category", None)
+    raw_action = getattr(event, "action", None)
+    category = sanitize_analytics_text(raw_category)
+    action = sanitize_analytics_text(raw_action)
+    if not category or not action:
+        return jsonify({"message": "Invalid analytics event.", "errors": [{"loc": ["category", "action"], "msg": "Both category and action are required."}]}), 400
+    label = sanitize_analytics_text(event.label)
+    path = sanitize_analytics_text(event.path)
+    session_id = sanitize_analytics_text(event.sessionId)
+    user_id = sanitize_analytics_text(event.userId)
+    metadata = sanitize_analytics_metadata(event.context)
+
+    record = {
+        "category": category,
+        "action": action,
+        "createdAt": datetime.utcnow(),
+    }
+    if event.value is not None:
+        try:
+            record["value"] = float(event.value)
+        except (TypeError, ValueError):
+            record["value"] = event.value
+    if label:
+        record["label"] = label
+    if path:
+        record["path"] = path
+    if session_id:
+        record["sessionId"] = session_id
+    if user_id:
+        record["userId"] = user_id
+    if metadata:
+        record["context"] = metadata
+
+    user_agent = sanitize_analytics_text(request.headers.get("User-Agent"))
+    referer = sanitize_analytics_text(request.headers.get("Referer"))
+    client_ip = sanitize_analytics_text(extract_client_ip(request))
+    if user_agent:
+        record["userAgent"] = user_agent
+    if referer:
+        record["referer"] = referer
+    if client_ip:
+        record["clientIp"] = client_ip
+
+    try:
+        analytics_collection.insert_one(record)
+    except Exception as exc:  # pragma: no cover - best effort persistence
+        app.logger.error(f"Failed to persist analytics event: {exc}")
+        return jsonify({"message": "Failed to record analytics event."}), 500
+
+    return jsonify({"message": "Recorded"}), 201
+
+
+@app.route("/api/analytics/summary", methods=["GET"])
+@limiter.limit("30 per minute")
+def analytics_summary():
+    """Return aggregated analytics collected within the reporting window."""
+    try:
+        summary = build_analytics_summary()
+    except RuntimeError:
+        return jsonify({"message": "Analytics datastore unavailable."}), 503
+    except Exception as exc:  # pragma: no cover - defensive
+        app.logger.error(f"Failed to build analytics summary: {exc}")
+        return jsonify({"message": "Failed to build analytics summary."}), 500
+    return jsonify(summary), 200
+
+
+@app.route("/analytics", methods=["GET"])
+def analytics_page():
+    """Render a lightweight HTML dashboard summarizing analytics events."""
+    try:
+        summary = build_analytics_summary()
+    except RuntimeError:
+        body = """<!doctype html><html lang='en'><head><meta charset='utf-8'><title>Analytics</title></head><body><h1>Analytics</h1><p>Analytics datastore unavailable.</p></body></html>"""
+        return body, 503, {"Content-Type": "text/html; charset=utf-8"}
+    except Exception as exc:  # pragma: no cover - defensive
+        app.logger.error(f"Failed to render analytics dashboard: {exc}")
+        body = """<!doctype html><html lang='en'><head><meta charset='utf-8'><title>Analytics</title></head><body><h1>Analytics</h1><p>Unable to render analytics dashboard.</p></body></html>"""
+        return body, 500, {"Content-Type": "text/html; charset=utf-8"}
+
+    def render_table(title: str, headers: list[str], rows: list[list[str]]):
+        header_html = "".join(f"<th>{html.escape(col)}</th>" for col in headers)
+        if not rows:
+            row_html = f"<tr><td colspan='{len(headers)}'>No data recorded.</td></tr>"
+        else:
+            row_html = "".join(
+                "<tr>" + "".join(f"<td>{html.escape(str(cell))}</td>" for cell in row) + "</tr>"
+                for row in rows
+            )
+        return f"<section><h2>{html.escape(title)}</h2><table><thead><tr>{header_html}</tr></thead><tbody>{row_html}</tbody></table></section>"
+
+    action_rows = [[item["category"], item["action"], item["count"]] for item in summary.get("actions", [])]
+    label_rows = [[item["label"], item["count"]] for item in summary.get("topLabels", [])]
+    path_rows = [[item["path"], item["count"]] for item in summary.get("topPaths", [])]
+
+    body = f"""<!doctype html>
+<html lang='en'>
+  <head>
+    <meta charset='utf-8'>
+    <title>Analytics dashboard</title>
+    <meta name='viewport' content='width=device-width, initial-scale=1'>
+    <style>
+      body {{ font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; margin: 0; padding: 2rem; background-color: #f8fafc; color: #0f172a; }}
+      h1 {{ margin-top: 0; }}
+      section {{ background: #ffffff; padding: 1.5rem; margin-bottom: 1.5rem; border-radius: 12px; box-shadow: 0 10px 20px rgba(15, 23, 42, 0.08); }}
+      table {{ width: 100%; border-collapse: collapse; margin-top: 0.5rem; }}
+      th, td {{ text-align: left; padding: 0.5rem; border-bottom: 1px solid #e2e8f0; }}
+      th {{ font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.08em; color: #475569; }}
+      td {{ font-size: 0.95rem; }}
+      .stats {{ display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 2rem; }}
+      .stat {{ background: linear-gradient(135deg, #6366f1, #8b5cf6); color: white; padding: 1.25rem 1.5rem; border-radius: 16px; min-width: 200px; box-shadow: 0 20px 25px -15px rgba(99, 102, 241, 0.8); }}
+      .stat h3 {{ margin: 0 0 0.5rem; font-size: 0.9rem; text-transform: uppercase; letter-spacing: 0.12em; opacity: 0.9; }}
+      .stat p {{ margin: 0; font-size: 1.75rem; font-weight: 700; }}
+    </style>
+  </head>
+  <body>
+    <h1>Analytics overview</h1>
+    <div class='stats'>
+      <div class='stat'><h3>Total events tracked</h3><p>{summary.get('totalEvents', 0)}</p></div>
+      <div class='stat'><h3>Events in last {summary.get('windowDays', 30)} days</h3><p>{summary.get('recentEvents', 0)}</p></div>
+    </div>
+    {render_table('Top actions', ['Category', 'Action', 'Count'], action_rows)}
+    {render_table('Top labels', ['Label', 'Count'], label_rows)}
+    {render_table('Top paths', ['Path', 'Count'], path_rows)}
+  </body>
+</html>"""
+
+    return body, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
 OPENAPI_TEMPLATE = {
     "openapi": "3.1.0",
     "info": {
@@ -902,6 +1153,91 @@ OPENAPI_TEMPLATE = {
                         },
                     }
                 },
+            }
+        },
+        "/api/analytics/events": {
+            "post": {
+                "summary": "Record analytics event",
+                "description": "Capture a user interaction from the Parties247 frontend or widgets.",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/AnalyticsEventRequest"}
+                        }
+                    }
+                },
+                "responses": {
+                    "201": {
+                        "description": "Event was recorded successfully.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string", "example": "Recorded"}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid analytics event payload.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string"},
+                                        "errors": {"type": "array", "items": {"type": "object"}}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "503": {
+                        "description": "Analytics datastore unavailable.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string"}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/analytics/summary": {
+            "get": {
+                "summary": "Analytics summary",
+                "description": "Retrieve aggregated analytics counts for the last 30 days.",
+                "responses": {
+                    "200": {
+                        "description": "Aggregated analytics counters.",
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/AnalyticsSummary"}
+                            }
+                        }
+                    },
+                    "503": {
+                        "description": "Analytics datastore unavailable.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string"}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         },
         "/api/parties": {
@@ -1654,6 +1990,67 @@ OPENAPI_TEMPLATE = {
                 },
                 "additionalProperties": True,
             },
+            "AnalyticsEventRequest": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string", "example": "page"},
+                    "action": {"type": "string", "example": "view"},
+                    "label": {"type": "string", "example": "home"},
+                    "value": {"type": "number", "example": 1},
+                    "path": {"type": "string", "example": "/"},
+                    "context": {"type": "object", "additionalProperties": True},
+                    "sessionId": {"type": "string"},
+                    "userId": {"type": "string"},
+                },
+                "required": ["category", "action"],
+                "additionalProperties": False,
+            },
+            "AnalyticsActionBreakdown": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string"},
+                    "action": {"type": "string"},
+                    "count": {"type": "integer", "minimum": 0},
+                },
+                "required": ["category", "action", "count"],
+            },
+            "AnalyticsTopEntry": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string"},
+                    "count": {"type": "integer", "minimum": 0},
+                },
+                "required": ["label", "count"],
+            },
+            "AnalyticsTopPath": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "count": {"type": "integer", "minimum": 0},
+                },
+                "required": ["path", "count"],
+            },
+            "AnalyticsSummary": {
+                "type": "object",
+                "properties": {
+                    "windowDays": {"type": "integer", "minimum": 1},
+                    "totalEvents": {"type": "integer", "minimum": 0},
+                    "recentEvents": {"type": "integer", "minimum": 0},
+                    "actions": {
+                        "type": "array",
+                        "items": {"$ref": "#/components/schemas/AnalyticsActionBreakdown"}
+                    },
+                    "topLabels": {
+                        "type": "array",
+                        "items": {"$ref": "#/components/schemas/AnalyticsTopEntry"}
+                    },
+                    "topPaths": {
+                        "type": "array",
+                        "items": {"$ref": "#/components/schemas/AnalyticsTopPath"}
+                    },
+                },
+                "required": ["windowDays", "totalEvents", "recentEvents", "actions", "topLabels", "topPaths"],
+            },
         },
     },
 }
@@ -1765,6 +2162,20 @@ class TagRenameRequest(BaseModel):
 # --- Referral schemas ---
 class ReferralUpdateSchema(BaseModel):
     code: str
+    class Config:
+        extra = "forbid"
+
+
+class AnalyticsEventSchema(BaseModel):
+    category: str
+    action: str
+    label: str | None = None
+    value: float | None = None
+    path: str | None = None
+    context: dict | None = None
+    sessionId: str | None = None
+    userId: str | None = None
+
     class Config:
         extra = "forbid"
 

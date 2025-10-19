@@ -90,6 +90,9 @@ class _DB:
         self.parties = _Collection()
         self.carousels = _Collection()
         self.sections = _Collection()
+        self.tags = _Collection()
+        self.settings = _Collection()
+        self.analytics = _Collection()
     def __getitem__(self, item):
         return self
 class _MongoClient:

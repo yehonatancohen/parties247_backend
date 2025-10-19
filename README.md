@@ -9,6 +9,7 @@ Backend service powering the [Parties247](https://parties247.com) website. It ex
 - Rate limiting and CORS restrictions
 - Easy configuration through environment variables
 - Automated imports for Go-Out nightlife and weekend events
+- Built-in analytics capture and reporting endpoints
 
 ## Getting Started
 
@@ -91,6 +92,12 @@ Both endpoints fetch the latest events via Go-Out's APIs, append the configured 
 
 - Browse the human-friendly overview at [`/docs`](http://localhost:3001/docs) when the server is running.
 - Consume the machine-readable OpenAPI description at [`/openapi.json`](http://localhost:3001/openapi.json). Import this file into tools like Postman, Hoppscotch, or VS Code's REST client for interactive exploration.
+
+## Analytics Instrumentation
+
+- Emit analytics events from the frontend via `POST /api/analytics/events`. Provide a JSON body containing a `category`, `action`, and optional `label`, `path`, `context`, `sessionId`, and `userId` values.
+- Aggregate captured events with `GET /api/analytics/summary`, which returns the top actions, labels, and paths observed in the last 30 days.
+- Review a lightweight dashboard at [`/analytics`](http://localhost:3001/analytics) for a quick glance at recent activity without external tooling.
 
 ## Testing
 Run the test suite with:

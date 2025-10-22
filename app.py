@@ -50,6 +50,10 @@ INDEXNOW_KEY_LOCATION = os.environ.get("INDEXNOW_KEY_LOCATION")
 REVALIDATE_ENDPOINT = os.environ.get("REVALIDATE_ENDPOINT")
 REVALIDATE_SECRET = os.environ.get("REVALIDATE_SECRET")
 
+DEFAULT_OPENAPI_SERVER = os.environ.get(
+    "OPENAPI_DEFAULT_SERVER", "https://parties247-backend.onrender.com"
+)
+
 EVENT_CACHE_SECONDS = 1800
 LIST_CACHE_SECONDS = 600
 FEED_CACHE_SECONDS = 900
@@ -1072,6 +1076,83 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 
+@app.route("/api/analytics/party-click", methods=["POST"])
+@limiter.limit("120 per minute")
+def create_party_click_event():
+    """Record an analytics hit when a user clicks a party link."""
+    if analytics_collection is None:
+        return jsonify({"message": "Analytics datastore unavailable."}), 503
+
+    payload = request.get_json(silent=True) or {}
+    try:
+        event = PartyClickEventSchema(**payload)
+    except ValidationError as exc:
+        errors = exc.errors() if hasattr(exc, "errors") else []
+        return jsonify({"message": "Invalid party click payload.", "errors": errors}), 400
+
+    context = sanitize_analytics_metadata(getattr(event, "context", None))
+
+    def enrich(key: str, value: str | None) -> None:
+        sanitized = sanitize_analytics_text(value)
+        if sanitized and key not in context:
+            context[key] = sanitized
+
+    enrich("partyId", getattr(event, "partyId", None))
+    enrich("slug", getattr(event, "slug", None))
+    enrich("name", getattr(event, "name", None))
+    enrich("carouselId", getattr(event, "carouselId", None))
+    enrich("carouselTitle", getattr(event, "carouselTitle", None))
+    enrich("source", getattr(event, "source", None))
+
+    label = None
+    for candidate in (
+        getattr(event, "label", None),
+        getattr(event, "partyId", None),
+        getattr(event, "slug", None),
+        getattr(event, "name", None),
+        getattr(event, "carouselId", None),
+        getattr(event, "source", None),
+    ):
+        label = sanitize_analytics_text(candidate)
+        if label:
+            break
+
+    if not label:
+        return (
+            jsonify(
+                {
+                    "message": "Invalid party click payload.",
+                    "errors": [
+                        {
+                            "loc": ["partyId", "slug", "label", "name"],
+                            "msg": "Provide at least one identifier for the clicked party.",
+                        }
+                    ],
+                }
+            ),
+            400,
+        )
+
+    page_hint = sanitize_analytics_text(getattr(event, "page", None))
+    path_hint = page_hint or sanitize_analytics_text(getattr(event, "path", None))
+
+    success = record_analytics_event(
+        "party",
+        "click",
+        label=label,
+        path=path_hint or getattr(request, "path", None),
+        context=context or None,
+        session_id=getattr(event, "sessionId", None),
+        user_id=getattr(event, "userId", None),
+        flask_request=request,
+    )
+
+    if not success:
+        return jsonify({"message": "Failed to record analytics event."}), 500
+
+    return jsonify({"message": "Recorded"}), 201
+
+
 @app.route("/api/analytics/events", methods=["POST"])
 @limiter.limit("120 per minute")
 def create_analytics_event():
@@ -1219,6 +1300,62 @@ OPENAPI_TEMPLATE = {
                         },
                     }
                 },
+            }
+        },
+        "/api/analytics/party-click": {
+            "post": {
+                "summary": "Record party click",
+                "description": "Record an analytics event when a user clicks a party card or link.",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/PartyClickEventRequest"}
+                        }
+                    }
+                },
+                "responses": {
+                    "201": {
+                        "description": "Click was recorded successfully.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string", "example": "Recorded"}
+                                    },
+                                }
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid party click payload.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string"},
+                                        "errors": {"type": "array", "items": {"type": "object"}},
+                                    },
+                                }
+                            }
+                        }
+                    },
+                    "503": {
+                        "description": "Analytics datastore unavailable.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string"},
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }
             }
         },
         "/api/analytics/events": {
@@ -2102,6 +2239,25 @@ OPENAPI_TEMPLATE = {
                 "required": ["category", "action"],
                 "additionalProperties": False,
             },
+            "PartyClickEventRequest": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "partyId": {"type": "string", "example": "p123"},
+                    "slug": {"type": "string", "example": "summer-bash"},
+                    "label": {"type": "string", "example": "Summer Bash"},
+                    "name": {"type": "string", "example": "Summer Bash"},
+                    "carouselId": {"type": "string", "example": "featured"},
+                    "carouselTitle": {"type": "string", "example": "Featured"},
+                    "source": {"type": "string", "example": "homepage"},
+                    "page": {"type": "string", "example": "/"},
+                    "path": {"type": "string", "example": "/parties"},
+                    "context": {"type": "object", "additionalProperties": True},
+                    "sessionId": {"type": "string"},
+                    "userId": {"type": "string"},
+                },
+                "description": "Metadata describing the party click that should be recorded.",
+            },
             "AnalyticsActionBreakdown": {
                 "type": "object",
                 "properties": {
@@ -2156,10 +2312,16 @@ OPENAPI_TEMPLATE = {
 def build_openapi_document():
     """Generate the OpenAPI document, hydrating runtime server information."""
     document = copy.deepcopy(OPENAPI_TEMPLATE)
-    server_url = (request.host_url or "").rstrip("/")
-    if not server_url:
-        server_url = "http://localhost"
-    document["servers"] = [{"url": server_url}]
+    servers: list[dict[str, str]] = []
+    server_url = (getattr(request, "host_url", "") or "").rstrip("/")
+    if server_url:
+        servers.append({"url": server_url})
+    fallback = (DEFAULT_OPENAPI_SERVER or "").rstrip("/")
+    if fallback and all(server.get("url") != fallback for server in servers):
+        servers.append({"url": fallback})
+    if not servers:
+        servers.append({"url": "http://localhost"})
+    document["servers"] = servers
     return document
 
 
@@ -2268,6 +2430,24 @@ class AnalyticsEventSchema(BaseModel):
     action: str
     label: str | None = None
     value: float | None = None
+    path: str | None = None
+    context: dict | None = None
+    sessionId: str | None = None
+    userId: str | None = None
+
+    class Config:
+        extra = "forbid"
+
+
+class PartyClickEventSchema(BaseModel):
+    partyId: str | None = None
+    slug: str | None = None
+    label: str | None = None
+    name: str | None = None
+    carouselId: str | None = None
+    carouselTitle: str | None = None
+    source: str | None = None
+    page: str | None = None
     path: str | None = None
     context: dict | None = None
     sessionId: str | None = None

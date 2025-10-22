@@ -1,0 +1,1520 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Parties247 API",
+    "version": "1.0.0",
+    "description": "REST API for reading party data and managing the Parties247 catalog.",
+    "contact": {
+      "name": "Parties247",
+      "url": "https://parties247-website.vercel.app"
+    }
+  },
+  "paths": {
+    "/api/health": {
+      "get": {
+        "summary": "Health check",
+        "description": "Returns a simple status payload indicating the API is responsive.",
+        "responses": {
+          "200": {
+            "description": "Service is healthy.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/analytics/party-click": {
+      "post": {
+        "summary": "Record party click",
+        "description": "Record an analytics event when a user clicks a party card or link.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PartyClickEventRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Click was recorded successfully.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "Recorded"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid party click payload.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string"
+                    },
+                    "errors": {
+                      "type": "array",
+                      "items": {
+                        "type": "object"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Analytics datastore unavailable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/analytics/events": {
+      "post": {
+        "summary": "Record analytics event",
+        "description": "Capture a user interaction from the Parties247 frontend or widgets.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnalyticsEventRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Event was recorded successfully.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "Recorded"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid analytics event payload.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string"
+                    },
+                    "errors": {
+                      "type": "array",
+                      "items": {
+                        "type": "object"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Analytics datastore unavailable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/analytics/summary": {
+      "get": {
+        "summary": "Analytics summary",
+        "description": "Retrieve aggregated analytics counts for the last 30 days.",
+        "responses": {
+          "200": {
+            "description": "Aggregated analytics counters.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyticsSummary"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Analytics datastore unavailable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/parties": {
+      "get": {
+        "summary": "List parties",
+        "description": "Fetch the public parties currently tracked by Parties247.",
+        "responses": {
+          "200": {
+            "description": "Array of party objects.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Party"
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected error fetching parties.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string"
+                    },
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/events": {
+      "get": {
+        "summary": "Events feed",
+        "description": "Return a denormalized events list used by downstream integrations.",
+        "responses": {
+          "200": {
+            "description": "Events response payload.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "generatedAt": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Event"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/events/{slug}": {
+      "get": {
+        "summary": "Event detail",
+        "description": "Fetch a single event by slug, including purchase links when available.",
+        "parameters": [
+          {
+            "name": "slug",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Event slug, e.g. `thursday-moon-02-10`."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Event payload containing metadata and purchase URLs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "generatedAt": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "event": {
+                      "$ref": "#/components/schemas/Event"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Event could not be found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/cities": {
+      "get": {
+        "summary": "List cities",
+        "description": "Aggregate the number of parties per city.",
+        "responses": {
+          "200": {
+            "description": "List of cities with event counts.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "generatedAt": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Dimension"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/venues": {
+      "get": {
+        "summary": "List venues",
+        "description": "Aggregate the number of parties per venue.",
+        "responses": {
+          "200": {
+            "description": "List of venues with event counts.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "generatedAt": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Dimension"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/genres": {
+      "get": {
+        "summary": "List genres",
+        "description": "Aggregate the number of parties per genre.",
+        "responses": {
+          "200": {
+            "description": "List of genres with event counts.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "generatedAt": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Dimension"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/carousels": {
+      "get": {
+        "summary": "Homepage carousels",
+        "description": "Return the ordered public carousels used to render the homepage and record analytics impressions.",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Optional frontend route associated with the visit for analytics labeling."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of public carousels.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Carousel"
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error fetching carousels."
+          }
+        }
+      }
+    },
+    "/api/tags": {
+      "get": {
+        "summary": "List tags",
+        "description": "Return the curated tags available for parties.",
+        "responses": {
+          "200": {
+            "description": "List of tags.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Tag"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/referral": {
+      "get": {
+        "summary": "Get referral configuration",
+        "description": "Expose the configured default referral code used in external links.",
+        "responses": {
+          "200": {
+            "description": "Referral configuration payload.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "referral": {
+                      "type": "string",
+                      "nullable": true
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/admin/login": {
+      "post": {
+        "summary": "Obtain admin token",
+        "description": "Authenticate with the admin password to receive a JWT for protected endpoints.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "password": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "password"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "JWT issued.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "token": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/admin/carousels": {
+      "get": {
+        "summary": "List carousels",
+        "description": "Return the ordered list of carousels with their assigned parties. Requires admin token.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Array of carousels.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Carousel"
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Error fetching carousels."
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a carousel",
+        "description": "Create a new carousel at the end of the display order. Requires admin token.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "title"
+                ],
+                "properties": {
+                  "title": {
+                    "type": "string"
+                  },
+                  "partyIds": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Party identifiers to include in the carousel."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Carousel created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Carousel"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid payload."
+          },
+          "500": {
+            "description": "Error creating carousel."
+          }
+        }
+      }
+    },
+    "/api/admin/carousels/{carouselId}": {
+      "put": {
+        "summary": "Update carousel info",
+        "description": "Update carousel metadata such as title or display order. Requires admin token.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "carouselId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "title": {
+                    "type": "string"
+                  },
+                  "order": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Carousel updated.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string"
+                    },
+                    "carousel": {
+                      "$ref": "#/components/schemas/Carousel"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid payload."
+          },
+          "404": {
+            "description": "Carousel not found."
+          },
+          "500": {
+            "description": "Error updating carousel."
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete a carousel",
+        "description": "Remove a carousel by identifier. Requires admin token.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "carouselId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Carousel deleted."
+          },
+          "404": {
+            "description": "Carousel not found."
+          },
+          "500": {
+            "description": "Error deleting carousel."
+          }
+        }
+      }
+    },
+    "/api/admin/carousels/{carouselId}/parties": {
+      "get": {
+        "summary": "List carousel parties",
+        "description": "Return the parties currently assigned to the carousel in order. Requires admin token.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "carouselId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Array of party documents.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Party"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid carousel id."
+          },
+          "404": {
+            "description": "Carousel not found."
+          },
+          "500": {
+            "description": "Error fetching carousel parties."
+          }
+        }
+      },
+      "put": {
+        "summary": "Update carousel parties",
+        "description": "Replace the ordered party list for a carousel. Requires admin token.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "carouselId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "partyIds"
+                ],
+                "properties": {
+                  "partyIds": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Carousel parties updated.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string"
+                    },
+                    "carousel": {
+                      "$ref": "#/components/schemas/Carousel"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid payload or missing parties."
+          },
+          "404": {
+            "description": "Carousel not found."
+          },
+          "500": {
+            "description": "Error updating carousel parties."
+          }
+        }
+      }
+    },
+    "/api/admin/sections": {
+      "post": {
+        "summary": "Import parties into a carousel",
+        "description": "Scrape a curated page for party links, ensure each party exists, and create a carousel using them. Requires admin token.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "url"
+                ],
+                "properties": {
+                  "url": {
+                    "type": "string",
+                    "format": "uri"
+                  },
+                  "carouselName": {
+                    "type": "string"
+                  },
+                  "title": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Carousel created from section.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string"
+                    },
+                    "carousel": {
+                      "$ref": "#/components/schemas/Carousel"
+                    },
+                    "partyCount": {
+                      "type": "integer"
+                    },
+                    "warnings": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "url": {
+                            "type": "string"
+                          },
+                          "error": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid payload."
+          },
+          "404": {
+            "description": "No parties found at the provided URL."
+          },
+          "502": {
+            "description": "Error fetching the source URL."
+          },
+          "500": {
+            "description": "Server error while importing the section."
+          }
+        }
+      }
+    },
+    "/api/admin/add-party": {
+      "post": {
+        "summary": "Add a party",
+        "description": "Scrape and persist a new party. Requires admin token.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "url": {
+                    "type": "string",
+                    "format": "uri"
+                  }
+                },
+                "required": [
+                  "url"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Party created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string"
+                    },
+                    "party": {
+                      "$ref": "#/components/schemas/Party"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid payload."
+          },
+          "409": {
+            "description": "Party already exists."
+          },
+          "500": {
+            "description": "Server error."
+          }
+        }
+      }
+    },
+    "/api/admin/import/nightlife": {
+      "post": {
+        "summary": "Import Go-Out nightlife events",
+        "description": "Fetches the latest nightlife events from Go-Out and syncs the 'חיי לילה' carousel.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Nightlife carousel updated.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string"
+                    },
+                    "carousel": {
+                      "$ref": "#/components/schemas/Carousel"
+                    },
+                    "addedCount": {
+                      "type": "integer"
+                    },
+                    "sourceEventCount": {
+                      "type": "integer"
+                    },
+                    "warnings": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No nightlife events were returned."
+          },
+          "500": {
+            "description": "Unable to update nightlife carousel."
+          },
+          "502": {
+            "description": "Failed to contact Go-Out."
+          }
+        }
+      }
+    },
+    "/api/admin/import/weekend": {
+      "post": {
+        "summary": "Import Go-Out weekend events",
+        "description": "Fetches the weekend feed from Go-Out and syncs the 'סופ״ש' carousel.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Weekend carousel updated.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string"
+                    },
+                    "carousel": {
+                      "$ref": "#/components/schemas/Carousel"
+                    },
+                    "addedCount": {
+                      "type": "integer"
+                    },
+                    "sourceEventCount": {
+                      "type": "integer"
+                    },
+                    "warnings": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": true
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No weekend events were returned."
+          },
+          "500": {
+            "description": "Unable to update weekend carousel."
+          },
+          "502": {
+            "description": "Failed to contact Go-Out."
+          }
+        }
+      }
+    },
+    "/api/admin/delete-party/{partyId}": {
+      "delete": {
+        "summary": "Delete a party",
+        "description": "Remove an existing party by its identifier. Requires admin token.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "partyId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "MongoDB ObjectId of the party to delete."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Party deleted."
+          },
+          "404": {
+            "description": "Party not found."
+          },
+          "500": {
+            "description": "Error deleting party."
+          }
+        }
+      }
+    },
+    "/api/admin/update-party/{partyId}": {
+      "put": {
+        "summary": "Update a party",
+        "description": "Update select fields on an existing party. Requires admin token.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "partyId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "Any subset of party fields to update.",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Party updated."
+          },
+          "400": {
+            "description": "Invalid payload."
+          },
+          "404": {
+            "description": "Party not found."
+          },
+          "500": {
+            "description": "Server error."
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    },
+    "schemas": {
+      "Party": {
+        "type": "object",
+        "properties": {
+          "_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "date": {
+            "type": "string"
+          },
+          "goOutUrl": {
+            "type": "string",
+            "format": "uri"
+          },
+          "originalUrl": {
+            "type": "string",
+            "format": "uri"
+          },
+          "startsAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "endsAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "city": {
+            "type": "string"
+          },
+          "venue": {
+            "type": "string"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": true
+      },
+      "Event": {
+        "type": "object",
+        "description": "Normalized event payload consumed by listings.",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "startsAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "endsAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "canonicalUrl": {
+            "type": "string",
+            "format": "uri"
+          },
+          "purchaseUrl": {
+            "type": "string",
+            "format": "uri"
+          },
+          "originalUrl": {
+            "type": "string",
+            "format": "uri"
+          },
+          "referralCode": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "Dimension": {
+        "type": "object",
+        "properties": {
+          "slug": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "eventCount": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": true
+      },
+      "Tag": {
+        "type": "object",
+        "properties": {
+          "slug": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "order": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "slug",
+          "name"
+        ]
+      },
+      "Carousel": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "order": {
+            "type": "integer"
+          },
+          "partyIds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": true
+      },
+      "AnalyticsEventRequest": {
+        "type": "object",
+        "properties": {
+          "category": {
+            "type": "string",
+            "example": "page"
+          },
+          "action": {
+            "type": "string",
+            "example": "view"
+          },
+          "label": {
+            "type": "string",
+            "example": "home"
+          },
+          "value": {
+            "type": "number",
+            "example": 1
+          },
+          "path": {
+            "type": "string",
+            "example": "/"
+          },
+          "context": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "sessionId": {
+            "type": "string"
+          },
+          "userId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "category",
+          "action"
+        ],
+        "additionalProperties": false
+      },
+      "PartyClickEventRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "partyId": {
+            "type": "string",
+            "example": "p123"
+          },
+          "slug": {
+            "type": "string",
+            "example": "summer-bash"
+          },
+          "label": {
+            "type": "string",
+            "example": "Summer Bash"
+          },
+          "name": {
+            "type": "string",
+            "example": "Summer Bash"
+          },
+          "carouselId": {
+            "type": "string",
+            "example": "featured"
+          },
+          "carouselTitle": {
+            "type": "string",
+            "example": "Featured"
+          },
+          "source": {
+            "type": "string",
+            "example": "homepage"
+          },
+          "page": {
+            "type": "string",
+            "example": "/"
+          },
+          "path": {
+            "type": "string",
+            "example": "/parties"
+          },
+          "context": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "sessionId": {
+            "type": "string"
+          },
+          "userId": {
+            "type": "string"
+          }
+        },
+        "description": "Metadata describing the party click that should be recorded."
+      },
+      "AnalyticsActionBreakdown": {
+        "type": "object",
+        "properties": {
+          "category": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string"
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "category",
+          "action",
+          "count"
+        ]
+      },
+      "AnalyticsTopEntry": {
+        "type": "object",
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "label",
+          "count"
+        ]
+      },
+      "AnalyticsTopPath": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "path",
+          "count"
+        ]
+      },
+      "AnalyticsSummary": {
+        "type": "object",
+        "properties": {
+          "windowDays": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "totalEvents": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "recentEvents": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "actions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AnalyticsActionBreakdown"
+            }
+          },
+          "topLabels": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AnalyticsTopEntry"
+            }
+          },
+          "topPaths": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AnalyticsTopPath"
+            }
+          }
+        },
+        "required": [
+          "windowDays",
+          "totalEvents",
+          "recentEvents",
+          "actions",
+          "topLabels",
+          "topPaths"
+        ]
+      }
+    }
+  },
+  "servers": [
+    {
+      "url": "https://parties247-backend.onrender.com"
+    }
+  ]
+}

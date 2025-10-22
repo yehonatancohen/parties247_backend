@@ -72,6 +72,60 @@ def test_create_analytics_event_validation(monkeypatch):
     assert collection.docs == []
 
 
+def test_party_click_endpoint_records_event(monkeypatch):
+    collection = FakeAnalyticsCollection()
+
+    request_obj = SimpleNamespace(
+        headers={"User-Agent": "pytest-agent"},
+        path="/api/analytics/party-click",
+        remote_addr="198.51.100.42",
+    )
+    request_obj.get_json = lambda silent=True: {
+        "partyId": "p1",
+        "carouselId": "c1",
+        "carouselTitle": "Featured",
+        "source": "homepage",
+        "page": "/",
+        "context": {"widget": "hero"},
+    }
+
+    monkeypatch.setattr(app, "analytics_collection", collection)
+    monkeypatch.setattr(app, "request", request_obj)
+
+    response, status = app.create_party_click_event()
+
+    assert status == 201
+    assert response["message"] == "Recorded"
+    assert len(collection.docs) == 1
+    doc = collection.docs[0]
+    assert doc["category"] == "party"
+    assert doc["action"] == "click"
+    assert doc["label"] == "p1"
+    assert doc["path"] == "/"
+    assert doc["context"]["carouselId"] == "c1"
+    assert doc["context"]["widget"] == "hero"
+
+
+def test_party_click_endpoint_requires_identifier(monkeypatch):
+    collection = FakeAnalyticsCollection()
+
+    request_obj = SimpleNamespace(
+        headers={},
+        path="/api/analytics/party-click",
+        remote_addr="198.51.100.43",
+    )
+    request_obj.get_json = lambda silent=True: {"context": {"ignored": "value"}}
+
+    monkeypatch.setattr(app, "analytics_collection", collection)
+    monkeypatch.setattr(app, "request", request_obj)
+
+    response, status = app.create_party_click_event()
+
+    assert status == 400
+    assert response["message"] == "Invalid party click payload."
+    assert collection.docs == []
+
+
 def test_analytics_summary(monkeypatch):
     now = datetime.now(timezone.utc)
     collection = FakeAnalyticsCollection()

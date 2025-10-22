@@ -164,6 +164,7 @@ def test_api_docs_and_openapi_spec():
     assert '/api/parties' in data['paths']
     assert '/api/events/{slug}' in data['paths']
     assert '/api/analytics/events' in data['paths']
+    assert '/api/carousels' in data['paths']
     assert '/api/admin/import/nightlife' in data['paths']
     assert '/api/admin/import/weekend' in data['paths']
     assert data['servers'][0]['url'] == 'http://localhost'

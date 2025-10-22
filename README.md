@@ -98,6 +98,8 @@ Both endpoints fetch the latest events via Go-Out's APIs, append the configured 
 - Emit analytics events from the frontend via `POST /api/analytics/events`. Provide a JSON body containing a `category`, `action`, and optional `label`, `path`, `context`, `sessionId`, and `userId` values.
 - Aggregate captured events with `GET /api/analytics/summary`, which returns the top actions, labels, and paths observed in the last 30 days.
 - Review a lightweight dashboard at [`/analytics`](http://localhost:3001/analytics) for a quick glance at recent activity without external tooling.
+- The backend automatically records website visits, carousel impressions, and party exposures when clients request `/api/carousels` or `/api/events/{slug}`; sessions authenticated with an admin token are ignored.
+- Provide an optional `page` query parameter when calling `GET /api/carousels` to associate the recorded visit with the frontend route being rendered.
 
 ## Testing
 Run the test suite with:

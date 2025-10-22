@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from collections import Counter
 from types import SimpleNamespace
 
 import app
@@ -110,3 +111,101 @@ def test_analytics_summary(monkeypatch):
     assert any(item["category"] == "page" and item["action"] == "view" for item in response["actions"])
     assert response["topLabels"][0]["label"] == "Home"
     assert response["topPaths"][0]["path"] == "/"
+
+
+def test_get_carousels_records_analytics(monkeypatch):
+    collection = FakeAnalyticsCollection()
+
+    class DummyCursor:
+        def __init__(self, items):
+            self._items = list(items)
+
+        def sort(self, key, direction):
+            return list(self._items)
+
+    class DummyCarousels:
+        def find(self):
+            return DummyCursor([
+                {"_id": "1", "title": "Featured", "partyIds": ["p1", "p2"]},
+                {"_id": "2", "title": "Fresh", "partyIds": []},
+            ])
+
+    request_obj = SimpleNamespace(
+        headers={"User-Agent": "pytest-agent"},
+        path="/api/carousels",
+        args={"page": "/"},
+        remote_addr="198.51.100.10",
+    )
+
+    monkeypatch.setattr(app, "analytics_collection", collection)
+    monkeypatch.setattr(app, "carousels_collection", DummyCarousels())
+    monkeypatch.setattr(app, "request", request_obj)
+
+    payload, status = app.get_carousels()
+    assert status == 200
+    assert len(collection.docs) == 5
+    categories = Counter(doc["category"] for doc in collection.docs)
+    assert categories["website"] == 1
+    assert categories["carousel"] == 2
+    assert categories["party"] == 2
+    party_docs = [doc for doc in collection.docs if doc["category"] == "party"]
+    assert all(doc["action"] == "impression" for doc in party_docs)
+    assert any(doc.get("context", {}).get("carouselId") == "1" for doc in party_docs)
+
+
+def test_get_carousels_skips_admin_session(monkeypatch):
+    collection = FakeAnalyticsCollection()
+
+    class DummyCursor:
+        def __init__(self, items):
+            self._items = list(items)
+
+        def sort(self, key, direction):
+            return list(self._items)
+
+    class DummyCarousels:
+        def find(self):
+            return DummyCursor([{"_id": "1", "title": "Featured", "partyIds": ["p1"]}])
+
+    request_obj = SimpleNamespace(
+        headers={"Authorization": "Bearer token"},
+        path="/api/carousels",
+        args={},
+        remote_addr="198.51.100.20",
+    )
+
+    monkeypatch.setattr(app, "analytics_collection", collection)
+    monkeypatch.setattr(app, "carousels_collection", DummyCarousels())
+    monkeypatch.setattr(app, "request", request_obj)
+    monkeypatch.setattr(app, "JWT_SECRET", "secret")
+
+    payload, status = app.get_carousels()
+    assert status == 200
+    assert collection.docs == []
+
+
+def test_event_detail_records_analytics(monkeypatch):
+    collection = FakeAnalyticsCollection()
+    request_obj = SimpleNamespace(
+        headers={"User-Agent": "pytest-agent"},
+        path="/api/events/demo",
+        args={},
+        remote_addr="203.0.113.9",
+    )
+
+    def fake_find_event(slug):
+        return ({"slug": slug, "id": "event-1", "name": "Demo"}, {"originalUrl": "https://example.com/event"})
+
+    monkeypatch.setattr(app, "analytics_collection", collection)
+    monkeypatch.setattr(app, "request", request_obj)
+    monkeypatch.setattr(app, "find_event_by_slug", fake_find_event)
+    monkeypatch.setattr(app, "default_referral_code", lambda: None)
+    monkeypatch.setattr(app, "apply_default_referral", lambda payload, referral: None)
+
+    response, status, headers = app.event_detail_api("demo")
+
+    assert status == 200
+    assert any(doc["category"] == "party" and doc["action"] == "view" for doc in collection.docs)
+    party_doc = next(doc for doc in collection.docs if doc["category"] == "party")
+    assert party_doc["label"] == "demo"
+    assert party_doc.get("context", {}).get("slug") == "demo"

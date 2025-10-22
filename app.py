@@ -481,6 +481,74 @@ def extract_client_ip(flask_request) -> str | None:
     return getattr(flask_request, "remote_addr", None)
 
 
+def record_analytics_event(
+    category,
+    action,
+    *,
+    label=None,
+    value=None,
+    path=None,
+    context=None,
+    session_id=None,
+    user_id=None,
+    flask_request=None,
+    include_request_details=True,
+    skip_if_admin=True,
+) -> bool:
+    """Persist a sanitized analytics event document."""
+    if analytics_collection is None:
+        return False
+    cleaned_category = sanitize_analytics_text(category)
+    cleaned_action = sanitize_analytics_text(action)
+    if not cleaned_category or not cleaned_action:
+        return False
+    req = flask_request or request
+    if skip_if_admin and is_admin_session(req):
+        return False
+    record = {"category": cleaned_category, "action": cleaned_action, "createdAt": datetime.utcnow()}
+    if value is not None:
+        try:
+            record["value"] = float(value)
+        except (TypeError, ValueError):
+            record["value"] = value
+    cleaned_label = sanitize_analytics_text(label)
+    if cleaned_label:
+        record["label"] = cleaned_label
+    cleaned_path = sanitize_analytics_text(path)
+    if cleaned_path:
+        record["path"] = cleaned_path
+    cleaned_session = sanitize_analytics_text(session_id)
+    if cleaned_session:
+        record["sessionId"] = cleaned_session
+    cleaned_user = sanitize_analytics_text(user_id)
+    if cleaned_user:
+        record["userId"] = cleaned_user
+    metadata = sanitize_analytics_metadata(context)
+    if metadata:
+        record["context"] = metadata
+    if include_request_details and req is not None:
+        headers = getattr(req, "headers", {}) or {}
+        getter = getattr(headers, "get", None)
+        if callable(getter):
+            user_agent = sanitize_analytics_text(getter("User-Agent"))
+            referer = sanitize_analytics_text(getter("Referer"))
+        else:
+            user_agent = referer = None
+        client_ip = sanitize_analytics_text(extract_client_ip(req)) if req else None
+        if user_agent:
+            record["userAgent"] = user_agent
+        if referer:
+            record["referer"] = referer
+        if client_ip:
+            record["clientIp"] = client_ip
+    try:
+        analytics_collection.insert_one(record)
+        return True
+    except Exception as exc:  # pragma: no cover - best effort persistence
+        app.logger.error(f"Failed to persist analytics event: {exc}")
+        return False
+
+
 def build_analytics_summary(window_days: int = 30) -> dict:
     if analytics_collection is None:
         raise RuntimeError("Analytics datastore unavailable")
@@ -958,6 +1026,30 @@ def protect(f):
         return jsonify({"message": "Unauthorized."}), 401
     return decorated_function
 
+
+def is_admin_session(flask_request=None) -> bool:
+    """Return True when the incoming request carries a valid admin token."""
+    if not JWT_SECRET:
+        return False
+    req = flask_request or request
+    if req is None:
+        return False
+    headers = getattr(req, "headers", {}) or {}
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return False
+    auth_header = getter("Authorization", "") or ""
+    if not auth_header.startswith("Bearer "):
+        return False
+    token = auth_header.split(" ", 1)[1].strip()
+    if not token:
+        return False
+    try:
+        jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return True
+    except jwt.InvalidTokenError:
+        return False
+
 def apply_security_headers(response):
     """Apply a minimal set of security headers on every response."""
     headers = getattr(response, "headers", None)
@@ -999,47 +1091,21 @@ def create_analytics_event():
     action = sanitize_analytics_text(raw_action)
     if not category or not action:
         return jsonify({"message": "Invalid analytics event.", "errors": [{"loc": ["category", "action"], "msg": "Both category and action are required."}]}), 400
-    label = sanitize_analytics_text(event.label)
-    path = sanitize_analytics_text(event.path)
-    session_id = sanitize_analytics_text(event.sessionId)
-    user_id = sanitize_analytics_text(event.userId)
-    metadata = sanitize_analytics_metadata(event.context)
 
-    record = {
-        "category": category,
-        "action": action,
-        "createdAt": datetime.utcnow(),
-    }
-    if event.value is not None:
-        try:
-            record["value"] = float(event.value)
-        except (TypeError, ValueError):
-            record["value"] = event.value
-    if label:
-        record["label"] = label
-    if path:
-        record["path"] = path
-    if session_id:
-        record["sessionId"] = session_id
-    if user_id:
-        record["userId"] = user_id
-    if metadata:
-        record["context"] = metadata
-
-    user_agent = sanitize_analytics_text(request.headers.get("User-Agent"))
-    referer = sanitize_analytics_text(request.headers.get("Referer"))
-    client_ip = sanitize_analytics_text(extract_client_ip(request))
-    if user_agent:
-        record["userAgent"] = user_agent
-    if referer:
-        record["referer"] = referer
-    if client_ip:
-        record["clientIp"] = client_ip
-
-    try:
-        analytics_collection.insert_one(record)
-    except Exception as exc:  # pragma: no cover - best effort persistence
-        app.logger.error(f"Failed to persist analytics event: {exc}")
+    success = record_analytics_event(
+        category,
+        action,
+        label=getattr(event, "label", None),
+        value=getattr(event, "value", None),
+        path=getattr(event, "path", None),
+        context=getattr(event, "context", None),
+        session_id=getattr(event, "sessionId", None),
+        user_id=getattr(event, "userId", None),
+        flask_request=request,
+        include_request_details=True,
+        skip_if_admin=False,
+    )
+    if not success:
         return jsonify({"message": "Failed to record analytics event."}), 500
 
     return jsonify({"message": "Recorded"}), 201
@@ -1415,6 +1481,37 @@ OPENAPI_TEMPLATE = {
                         },
                     }
                 },
+            }
+        },
+        "/api/carousels": {
+            "get": {
+                "summary": "Homepage carousels",
+                "description": "Return the ordered public carousels used to render the homepage and record analytics impressions.",
+                "parameters": [
+                    {
+                        "name": "page",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "string"},
+                        "description": "Optional frontend route associated with the visit for analytics labeling."
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "List of public carousels.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "array",
+                                    "items": {"$ref": "#/components/schemas/Carousel"}
+                                }
+                            }
+                        }
+                    },
+                    "500": {
+                        "description": "Error fetching carousels."
+                    }
+                }
             }
         },
         "/api/tags": {
@@ -2471,6 +2568,20 @@ def event_detail_api(slug: str):
         "generatedAt": isoformat_or_none(datetime.utcnow().replace(tzinfo=timezone.utc)),
         "event": event_payload,
     }
+    event_label = event_payload.get("slug") or event_payload.get("id") or slug
+    event_context = {"slug": event_payload.get("slug") or slug}
+    if event_payload.get("id"):
+        event_context["eventId"] = event_payload.get("id")
+    if event_payload.get("name"):
+        event_context["name"] = event_payload.get("name")
+    record_analytics_event(
+        "party",
+        "view",
+        label=event_label,
+        path=getattr(request, "path", None),
+        context=event_context,
+        flask_request=request,
+    )
     return json_response(payload, cache_seconds=EVENT_CACHE_SECONDS)
 
 
@@ -3211,6 +3322,53 @@ def delete_carousel(carousel_id):
 def get_carousels():
     try:
         items = [serialize_carousel(carousel) for carousel in carousels_collection.find().sort("order", 1)]
+        req = request
+        args = getattr(req, "args", {}) or {}
+        getter = getattr(args, "get", None) if not isinstance(args, dict) else args.get
+        page_hint = None
+        if callable(getter):
+            page_hint = getter("page") or getter("path")
+        elif isinstance(args, dict):
+            page_hint = args.get("page") or args.get("path")
+        visit_context = {"source": "carousel-feed"}
+        if page_hint:
+            visit_context["page"] = page_hint
+        record_analytics_event(
+            "website",
+            "visit",
+            label=page_hint or getattr(req, "path", None),
+            path=getattr(req, "path", None),
+            context=visit_context,
+            flask_request=req,
+        )
+        for carousel in items:
+            carousel_id = carousel.get("id")
+            carousel_title = carousel.get("title")
+            carousel_context = {"carouselId": carousel_id} if carousel_id else {}
+            if carousel_title:
+                carousel_context["title"] = carousel_title
+            record_analytics_event(
+                "carousel",
+                "view",
+                label=carousel_title or carousel_id,
+                path=getattr(req, "path", None),
+                context=carousel_context or None,
+                flask_request=req,
+            )
+            for party_id in carousel.get("partyIds", []):
+                party_context = {"partyId": party_id}
+                if carousel_id:
+                    party_context["carouselId"] = carousel_id
+                if carousel_title:
+                    party_context["carouselTitle"] = carousel_title
+                record_analytics_event(
+                    "party",
+                    "impression",
+                    label=party_id,
+                    path=getattr(req, "path", None),
+                    context=party_context,
+                    flask_request=req,
+                )
         return jsonify(items), 200
     except Exception as e:
         return jsonify({"message": "Error fetching carousels", "error": str(e)}), 500

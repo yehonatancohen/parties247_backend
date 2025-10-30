@@ -96,7 +96,7 @@ Both endpoints fetch the latest events via Go-Out's APIs, append the configured 
 ## Analytics Instrumentation
 
 - Emit analytics events from the frontend via `POST /api/analytics/events`. Provide a JSON body containing a `category`, `action`, and optional `label`, `path`, `context`, `sessionId`, and `userId` values.
-- Aggregate captured events with `GET /api/analytics/summary`, which returns the top actions, labels, and paths observed in the last 30 days.
+- Aggregate captured events with `GET /api/analytics/summary`, which returns the top actions, most popular party entries, labels, and paths observed in the last 30 days.
 - Review a lightweight dashboard at [`/analytics`](http://localhost:3001/analytics) for a quick glance at recent activity without external tooling.
 
 ## Testing

@@ -88,6 +88,7 @@ def test_analytics_summary(monkeypatch):
                 "action": "enter",
                 "label": "After Hours",
                 "path": "/event/after-hours",
+                "context": {"partyId": "party-123", "partySlug": "after-hours"},
                 "createdAt": now - timedelta(days=5),
             },
             {
@@ -110,3 +111,6 @@ def test_analytics_summary(monkeypatch):
     assert any(item["category"] == "page" and item["action"] == "view" for item in response["actions"])
     assert response["topLabels"][0]["label"] == "Home"
     assert response["topPaths"][0]["path"] == "/"
+    top_party = response["topPartyEntries"][0]
+    assert top_party["label"] == "After Hours"
+    assert top_party["partyId"] == "party-123"

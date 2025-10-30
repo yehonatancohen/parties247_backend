@@ -490,6 +490,14 @@ def build_analytics_summary(window_days: int = 30) -> dict:
     action_counter: Counter[tuple[str, str]] = Counter()
     label_counter: Counter[str] = Counter()
     path_counter: Counter[str] = Counter()
+    party_counter: dict[str, dict] = {}
+
+    def to_text(value) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, (int, float, bool)):
+            value = str(value)
+        return sanitize_analytics_text(value)
     try:
         try:
             cursor = analytics_collection.find({})
@@ -515,6 +523,38 @@ def build_analytics_summary(window_days: int = 30) -> dict:
         if path:
             path_counter[path] += 1
 
+        if category == "party" and action == "enter":
+            raw_context = doc.get("context")
+            context = raw_context if isinstance(raw_context, dict) else {}
+            party_slug = to_text(context.get("partySlug")) or to_text(doc.get("partySlug"))
+            party_id = to_text(context.get("partyId")) or to_text(doc.get("partyId"))
+            party_name = to_text(context.get("partyName")) or label
+            party_path = path or to_text(context.get("partyPath"))
+            key = next(
+                (value for value in (party_slug, party_id, party_path, party_name) if value),
+                None,
+            )
+            if key:
+                existing = party_counter.setdefault(
+                    key,
+                    {
+                        "count": 0,
+                        "label": party_name or key,
+                        "path": party_path,
+                        "partySlug": party_slug,
+                        "partyId": party_id,
+                    },
+                )
+                if not existing.get("label") and (party_name or label):
+                    existing["label"] = party_name or label
+                if not existing.get("path") and party_path:
+                    existing["path"] = party_path
+                if not existing.get("partySlug") and party_slug:
+                    existing["partySlug"] = party_slug
+                if not existing.get("partyId") and party_id:
+                    existing["partyId"] = party_id
+                existing["count"] += 1
+
     summary = {
         "windowDays": window_days,
         "totalEvents": total_events,
@@ -530,6 +570,16 @@ def build_analytics_summary(window_days: int = 30) -> dict:
         "topPaths": [
             {"path": path, "count": count}
             for path, count in path_counter.most_common(20)
+        ],
+        "topPartyEntries": [
+            {
+                "label": item.get("label") or "",
+                "path": item.get("path") or "",
+                "partySlug": item.get("partySlug"),
+                "partyId": item.get("partyId"),
+                "count": item.get("count", 0),
+            }
+            for item in sorted(party_counter.values(), key=lambda value: value["count"], reverse=True)[:20]
         ],
     }
     return summary
@@ -1084,6 +1134,15 @@ def analytics_page():
         return f"<section><h2>{html.escape(title)}</h2><table><thead><tr>{header_html}</tr></thead><tbody>{row_html}</tbody></table></section>"
 
     action_rows = [[item["category"], item["action"], item["count"]] for item in summary.get("actions", [])]
+    party_rows = [
+        [
+            item.get("label") or "",
+            item.get("path") or "",
+            item.get("partySlug") or item.get("partyId") or "",
+            item.get("count", 0),
+        ]
+        for item in summary.get("topPartyEntries", [])
+    ]
     label_rows = [[item["label"], item["count"]] for item in summary.get("topLabels", [])]
     path_rows = [[item["path"], item["count"]] for item in summary.get("topPaths", [])]
 
@@ -1114,6 +1173,7 @@ def analytics_page():
       <div class='stat'><h3>Events in last {summary.get('windowDays', 30)} days</h3><p>{summary.get('recentEvents', 0)}</p></div>
     </div>
     {render_table('Top actions', ['Category', 'Action', 'Count'], action_rows)}
+    {render_table('Party entries', ['Party', 'Path', 'Slug/ID', 'Count'], party_rows)}
     {render_table('Top labels', ['Label', 'Count'], label_rows)}
     {render_table('Top paths', ['Path', 'Count'], path_rows)}
   </body>
@@ -1214,7 +1274,7 @@ OPENAPI_TEMPLATE = {
         "/api/analytics/summary": {
             "get": {
                 "summary": "Analytics summary",
-                "description": "Retrieve aggregated analytics counts for the last 30 days.",
+                "description": "Retrieve aggregated analytics counts for the last 30 days, including the parties visitors enter the most.",
                 "responses": {
                     "200": {
                         "description": "Aggregated analytics counters.",
@@ -2030,6 +2090,17 @@ OPENAPI_TEMPLATE = {
                 },
                 "required": ["path", "count"],
             },
+            "AnalyticsTopPartyEntry": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string"},
+                    "path": {"type": "string"},
+                    "partySlug": {"type": "string"},
+                    "partyId": {"type": "string"},
+                    "count": {"type": "integer", "minimum": 0},
+                },
+                "required": ["count"],
+            },
             "AnalyticsSummary": {
                 "type": "object",
                 "properties": {
@@ -2048,8 +2119,20 @@ OPENAPI_TEMPLATE = {
                         "type": "array",
                         "items": {"$ref": "#/components/schemas/AnalyticsTopPath"}
                     },
+                    "topPartyEntries": {
+                        "type": "array",
+                        "items": {"$ref": "#/components/schemas/AnalyticsTopPartyEntry"}
+                    },
                 },
-                "required": ["windowDays", "totalEvents", "recentEvents", "actions", "topLabels", "topPaths"],
+                "required": [
+                    "windowDays",
+                    "totalEvents",
+                    "recentEvents",
+                    "actions",
+                    "topLabels",
+                    "topPaths",
+                    "topPartyEntries",
+                ],
             },
         },
     },

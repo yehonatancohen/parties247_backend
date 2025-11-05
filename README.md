@@ -81,12 +81,13 @@ Admin endpoints are protected using short‑lived JSON Web Tokens (JWTs).
 
 ## Automated Go-Out Imports
 
-Authenticated admins can seed two curated carousels directly from Go-Out's official feeds:
+Authenticated admins can seed curated carousels directly from Go-Out's official feeds or a hand-picked list of event URLs:
 
 - `POST /api/admin/import/nightlife` scrapes the nightlife category and updates the "חיי לילה" carousel.
 - `POST /api/admin/import/weekend` scrapes the weekend feed and updates the "סופ״ש" carousel.
+- `POST /api/admin/import/carousel-urls` accepts an explicit list of event URLs and syncs the specified carousel.
 
-Both endpoints fetch the latest events via Go-Out's APIs, append the configured referral code, and ensure the related parties exist before updating their respective carousels.
+All three endpoints ensure the related parties exist (creating them when necessary) before updating their respective carousels, and automatically append the configured referral code to outbound links.
 
 ## API Documentation
 

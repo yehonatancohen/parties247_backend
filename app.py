@@ -1924,6 +1924,48 @@ OPENAPI_TEMPLATE = {
                 },
             }
         },
+        "/api/admin/import/carousel-urls": {
+            "post": {
+                "summary": "Import carousel from explicit URLs",
+                "description": "Ensure parties exist for the provided URLs and update the referenced carousel. Requires admin token.",
+                "security": [{"bearerAuth": []}],
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/CarouselUrlImportRequest"}
+                        }
+                    }
+                },
+                "responses": {
+                    "200": {
+                        "description": "Carousel updated from URLs.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string"},
+                                        "carousel": {"$ref": "#/components/schemas/Carousel"},
+                                        "addedCount": {"type": "integer"},
+                                        "processedUrlCount": {"type": "integer"},
+                                        "warnings": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "additionalProperties": True,
+                                            },
+                                        },
+                                    },
+                                },
+                            }
+                        },
+                    },
+                    "400": {"description": "Invalid payload or URLs."},
+                    "404": {"description": "Unable to update carousel from provided URLs."}
+                },
+            }
+        },
         "/api/admin/delete-party/{partyId}": {
             "delete": {
                 "summary": "Delete a party",
@@ -2134,6 +2176,20 @@ OPENAPI_TEMPLATE = {
                     "topPartyEntries",
                 ],
             },
+            "CarouselUrlImportRequest": {
+                "type": "object",
+                "required": ["carouselName", "urls"],
+                "properties": {
+                    "carouselName": {"type": "string"},
+                    "urls": {
+                        "type": "array",
+                        "items": {"type": "string", "format": "uri"},
+                        "minItems": 1,
+                    },
+                    "referral": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
         },
     },
 }
@@ -2317,6 +2373,15 @@ class CarouselImportRequest(BaseModel):
     url: str
     carouselName: str | None = None
     title: str | None = None
+
+    class Config:
+        extra = "forbid"
+
+
+class CarouselUrlListImportSchema(BaseModel):
+    carouselName: str
+    urls: list[str]
+    referral: str | None = None
 
     class Config:
         extra = "forbid"
@@ -3742,6 +3807,55 @@ def import_weekend_carousel():
     if warnings:
         payload["warnings"] = warnings
     return jsonify(payload), 200
+
+
+@app.route("/api/admin/import/carousel-urls", methods=["POST"])
+@limiter.limit("5 per minute")
+@protect
+def import_carousel_from_urls():
+    payload = request.get_json(silent=True) or {}
+    try:
+        req = CarouselUrlListImportSchema(**payload)
+    except ValidationError as ve:
+        app.logger.warning(f"[VALIDATION] {ve}")
+        return jsonify({"message": "Invalid payload", "errors": ve.errors()}), 400
+
+    carousel_name = (req.carouselName or "").strip()
+    if not carousel_name:
+        return jsonify({"message": "carouselName is required"}), 400
+
+    cleaned_urls: list[str] = []
+    for raw in req.urls:
+        url = (raw or "").strip()
+        if not url or not is_url_allowed(url):
+            return jsonify({"message": "All URLs must be valid and publicly reachable."}), 400
+        cleaned_urls.append(url)
+
+    if not cleaned_urls:
+        return jsonify({"message": "At least one URL is required."}), 400
+
+    referral = (req.referral or "").strip() or default_referral_code()
+
+    carousel_doc, added_count, warnings = _import_carousel_from_urls(
+        carousel_name, cleaned_urls, referral
+    )
+
+    if carousel_doc is None:
+        return (
+            jsonify({"message": "Unable to update carousel from provided URLs."}),
+            404,
+        )
+
+    response_payload = {
+        "message": "Carousel updated from URLs.",
+        "carousel": serialize_carousel(carousel_doc),
+        "addedCount": added_count,
+        "processedUrlCount": len(cleaned_urls),
+    }
+    if warnings:
+        response_payload["warnings"] = warnings
+
+    return jsonify(response_payload), 200
 
 
 @app.route("/api/admin/sections", methods=["POST"])

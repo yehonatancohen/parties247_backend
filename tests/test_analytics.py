@@ -4,16 +4,68 @@ from types import SimpleNamespace
 import app
 
 
-class FakeAnalyticsCollection:
+class FakeVisitorCollection:
     def __init__(self):
         self.docs: list[dict] = []
 
-    def insert_one(self, doc):
-        self.docs.append(doc)
-        return SimpleNamespace(inserted_id="id")
+    def update_one(self, filter, update, upsert=False):
+        session_id = filter.get("sessionId")
+        existing = next((doc for doc in self.docs if doc.get("sessionId") == session_id), None)
+        payload = update.get("$set", {}).copy()
+        if existing:
+            existing.update(payload)
+        elif upsert:
+            self.docs.append(payload)
+        return SimpleNamespace(upserted_id=None)
 
     def find(self, *args, **kwargs):
         return list(self.docs)
+
+
+class FakePartyCollection:
+    def __init__(self, docs: list[dict]):
+        self.docs = docs
+
+    def find_one(self, query):
+        for doc in self.docs:
+            match = True
+            for key, value in query.items():
+                if doc.get(key) != value:
+                    match = False
+                    break
+            if match:
+                return doc.copy()
+        return None
+
+    def find(self, *args, **kwargs):
+        return list(self.docs)
+
+
+class FakePartyAnalyticsCollection:
+    def __init__(self):
+        self.docs: list[dict] = []
+
+    def update_one(self, filter, update, upsert=False):
+        party_id = filter.get("partyId")
+        existing = next((doc for doc in self.docs if doc.get("partyId") == party_id), None)
+        if not existing:
+            existing = {"partyId": party_id, "views": 0, "redirects": 0}
+            self.docs.append(existing)
+        inc = update.get("$inc", {})
+        for key, value in inc.items():
+            existing[key] = existing.get(key, 0) + value
+        for key, value in update.get("$set", {}).items():
+            existing[key] = value
+        return SimpleNamespace(upserted_id=None)
+
+    def find(self, *args, **kwargs):
+        return list(self.docs)
+
+    def delete_one(self, filter):
+        party_id = filter.get("partyId")
+        before = len(self.docs)
+        self.docs = [doc for doc in self.docs if doc.get("partyId") != party_id]
+        return SimpleNamespace(deleted_count=before - len(self.docs))
 
 
 def make_request(payload, headers=None):
@@ -24,93 +76,80 @@ def make_request(payload, headers=None):
     return req
 
 
-def test_create_analytics_event_success(monkeypatch):
-    collection = FakeAnalyticsCollection()
+def test_record_unique_visitor(monkeypatch):
+    visitors = FakeVisitorCollection()
     headers = {
         "User-Agent": "pytest-agent",
-        "Referer": "https://example.com/page",
-        "X-Forwarded-For": "203.0.113.5",
+        "Referer": "https://example.com",
+        "X-Forwarded-For": "198.51.100.5",
     }
-    payload = {
-        "category": "page",
-        "action": "view",
-        "label": "Home",
-        "path": "/",
-        "context": {"foo": "bar", "skip": None},
-        "sessionId": "abc123",
-    }
+    payload = {"sessionId": "abc123"}
 
-    monkeypatch.setattr(app, "analytics_collection", collection)
+    monkeypatch.setattr(app, "visitor_analytics_collection", visitors)
     monkeypatch.setattr(app, "request", make_request(payload, headers))
 
-    response, status = app.create_analytics_event()
+    response, status = app.record_unique_visitor()
 
-    assert status == 201
+    assert status == 202
     assert response["message"] == "Recorded"
-    assert len(collection.docs) == 1
-    doc = collection.docs[0]
-    assert doc["category"] == "page"
-    assert doc["action"] == "view"
-    assert doc["label"] == "Home"
-    assert doc["path"] == "/"
-    assert doc["context"] == {"foo": "bar"}
-    assert doc["sessionId"] == "abc123"
-    assert doc["clientIp"] == "203.0.113.5"
-    assert isinstance(doc["createdAt"], datetime)
+    assert len(visitors.docs) == 1
+    stored = visitors.docs[0]
+    assert stored["sessionId"] == "abc123"
+    assert stored["referer"] == "https://example.com"
+    assert stored["clientIp"] == "198.51.100.5"
 
 
-def test_create_analytics_event_validation(monkeypatch):
-    collection = FakeAnalyticsCollection()
-    monkeypatch.setattr(app, "analytics_collection", collection)
-    monkeypatch.setattr(app, "request", make_request({"category": "page"}))
+def test_record_party_metrics(monkeypatch):
+    now = datetime.now(timezone.utc)
+    party_doc = {"_id": "party-1", "name": "After Hours", "slug": "after-hours", "date": (now + timedelta(days=1)).isoformat()}
+    parties = FakePartyCollection([party_doc])
+    metrics = FakePartyAnalyticsCollection()
+    payload = {"partyId": "party-1"}
 
-    response, status = app.create_analytics_event()
+    monkeypatch.setattr(app, "parties_collection", parties)
+    monkeypatch.setattr(app, "party_analytics_collection", metrics)
+    monkeypatch.setattr(app, "request", make_request(payload))
 
-    assert status == 400
-    assert response["message"] == "Invalid analytics event."
-    assert collection.docs == []
+    response, status = app.record_party_view()
+    assert status == 202
+    assert response["message"] == "Recorded"
+
+    response, status = app.record_party_redirect()
+    assert status == 202
+    doc = metrics.docs[0]
+    assert doc["views"] == 1
+    assert doc["redirects"] == 1
+    assert doc["partySlug"] == "after-hours"
 
 
 def test_analytics_summary(monkeypatch):
     now = datetime.now(timezone.utc)
-    collection = FakeAnalyticsCollection()
-    collection.docs.extend(
-        [
-            {
-                "category": "page",
-                "action": "view",
-                "label": "Home",
-                "path": "/",
-                "createdAt": now,
-            },
-            {
-                "category": "party",
-                "action": "enter",
-                "label": "After Hours",
-                "path": "/event/after-hours",
-                "context": {"partyId": "party-123", "partySlug": "after-hours"},
-                "createdAt": now - timedelta(days=5),
-            },
-            {
-                "category": "page",
-                "action": "view",
-                "label": "Home",
-                "path": "/",
-                "createdAt": now - timedelta(days=40),
-            },
-        ]
-    )
+    live_party = {"_id": "party-1", "name": "After Hours", "slug": "after-hours", "date": (now + timedelta(hours=12)).isoformat()}
+    archived_party = {"_id": "party-old", "name": "Old Party", "slug": "old", "date": (now - timedelta(days=2)).isoformat()}
+    parties = FakePartyCollection([live_party, archived_party])
 
-    monkeypatch.setattr(app, "analytics_collection", collection)
+    metrics = FakePartyAnalyticsCollection()
+    metrics.docs = [
+        {"partyId": "party-1", "views": 5, "redirects": 2},
+        {"partyId": "party-old", "views": 10, "redirects": 4},
+    ]
+
+    visitors = FakeVisitorCollection()
+    visitors.docs = [
+        {"sessionId": "new", "createdAt": now},
+        {"sessionId": "old", "createdAt": now - timedelta(days=2)},
+    ]
+
+    monkeypatch.setattr(app, "parties_collection", parties)
+    monkeypatch.setattr(app, "party_analytics_collection", metrics)
+    monkeypatch.setattr(app, "visitor_analytics_collection", visitors)
 
     response, status = app.analytics_summary()
 
     assert status == 200
-    assert response["totalEvents"] == 3
-    assert response["recentEvents"] == 2
-    assert any(item["category"] == "page" and item["action"] == "view" for item in response["actions"])
-    assert response["topLabels"][0]["label"] == "Home"
-    assert response["topPaths"][0]["path"] == "/"
-    top_party = response["topPartyEntries"][0]
-    assert top_party["label"] == "After Hours"
-    assert top_party["partyId"] == "party-123"
+    assert response["uniqueVisitors24h"] == 1
+    assert len(response["parties"]) == 1
+    entry = response["parties"][0]
+    assert entry["partyId"] == "party-1"
+    assert entry["views"] == 5
+    assert entry["redirects"] == 2

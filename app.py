@@ -5,7 +5,6 @@ import hmac
 import re
 import copy
 import html
-from collections import Counter
 from typing import Iterable
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
@@ -357,7 +356,8 @@ try:
     sections_collection: Collection = db.sections
     tags_collection: Collection = db.tags
     settings_collection: Collection = db.settings
-    analytics_collection: Collection = db.analytics
+    party_analytics_collection: Collection = db.partyAnalytics
+    visitor_analytics_collection: Collection = db.analyticsVisitors
 
     try:
         parties_collection.update_many(
@@ -406,8 +406,14 @@ try:
     ensure_index(tags_collection, [("order", 1)], name="tag_order_asc")
 
     ensure_index(settings_collection, [("key", 1)], name="unique_key", unique=True)
-    ensure_index(analytics_collection, [("createdAt", -1)], name="created_desc")
-    ensure_index(analytics_collection, [("category", 1), ("action", 1)], name="category_action")
+    ensure_index(party_analytics_collection, [("partyId", 1)], name="unique_party", unique=True)
+    ensure_index(visitor_analytics_collection, [("sessionId", 1)], name="unique_session", unique=True)
+    ensure_index(
+        visitor_analytics_collection,
+        [("createdAt", 1)],
+        name="visitor_created_ttl",
+        expireAfterSeconds=172800,
+    )
 
     app.logger.info("Connected to MongoDB and ensured indexes.")
 except Exception as e:
@@ -417,7 +423,8 @@ except Exception as e:
     sections_collection = None
     tags_collection = None
     settings_collection = None
-    analytics_collection = None
+    party_analytics_collection = None
+    visitor_analytics_collection = None
 
 
 def record_setting_hit(key: str, extra: dict | None = None):
@@ -432,7 +439,6 @@ def record_setting_hit(key: str, extra: dict | None = None):
         app.logger.warning(f"Failed to persist analytics hit {key}: {exc}")
 
 
-ANALYTICS_METADATA_LIMIT = 12
 ANALYTICS_TEXT_LIMIT = 256
 
 
@@ -443,27 +449,6 @@ def sanitize_analytics_text(value: str | None) -> str | None:
     if not text:
         return None
     return text[:ANALYTICS_TEXT_LIMIT]
-
-
-def sanitize_analytics_metadata(data: dict | None) -> dict:
-    if not isinstance(data, dict):
-        return {}
-    cleaned = {}
-    for key, value in data.items():
-        if len(cleaned) >= ANALYTICS_METADATA_LIMIT:
-            break
-        if not isinstance(key, str) or not key.strip():
-            continue
-        if value is None:
-            continue
-        if isinstance(value, (int, float, bool)):
-            cleaned[key] = value
-            continue
-        text_value = sanitize_analytics_text(str(value))
-        if text_value is None:
-            continue
-        cleaned[key] = text_value
-    return cleaned
 
 
 def extract_client_ip(flask_request) -> str | None:
@@ -481,106 +466,169 @@ def extract_client_ip(flask_request) -> str | None:
     return getattr(flask_request, "remote_addr", None)
 
 
-def build_analytics_summary(window_days: int = 30) -> dict:
-    if analytics_collection is None:
-        raise RuntimeError("Analytics datastore unavailable")
-    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
-    total_events = 0
-    recent_events = 0
-    action_counter: Counter[tuple[str, str]] = Counter()
-    label_counter: Counter[str] = Counter()
-    path_counter: Counter[str] = Counter()
-    party_counter: dict[str, dict] = {}
+def is_party_live(party: dict, now: datetime | None = None) -> bool:
+    """Return True when the party occurs within the live window."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=1)
+    for key in ("date", "startsAt", "endsAt"):
+        value = party.get(key)
+        dt = parse_datetime(value)
+        if dt:
+            return dt >= cutoff
+    return True
 
-    def to_text(value) -> str | None:
-        if value is None:
-            return None
-        if isinstance(value, (int, float, bool)):
-            value = str(value)
-        return sanitize_analytics_text(value)
+
+def fetch_all_documents(coll: Collection | None) -> list[dict]:
+    if coll is None:
+        return []
+    try:
+        cursor = coll.find({})
+    except TypeError:  # pragma: no cover - compatibility with simple stubs
+        cursor = coll.find()
+    except Exception as exc:  # pragma: no cover - defensive; surfaced to caller
+        app.logger.error(f"Failed to read documents from collection: {exc}")
+        raise
+    if cursor is None:
+        return []
+    if isinstance(cursor, list):
+        return list(cursor)
+    try:
+        return list(cursor)
+    except TypeError:  # pragma: no cover - fallback for cursors missing __iter__
+        return []
+
+
+def find_party_for_analytics(party_id: str | None, party_slug: str | None) -> dict | None:
+    if parties_collection is None:
+        return None
+    queries = []
+    if party_id:
+        try:
+            queries.append({"_id": ObjectId(party_id)})
+        except Exception:
+            pass
+        queries.append({"_id": party_id})
+    if party_slug:
+        queries.append({"slug": party_slug})
+    seen: set[tuple] = set()
+    for query in queries:
+        key = tuple(sorted(query.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            doc = parties_collection.find_one(query)
+        except TypeError:  # pragma: no cover - compatibility with tests
+            doc = None
+        except Exception as exc:
+            app.logger.warning(f"Failed to lookup party for analytics: {exc}")
+            doc = None
+        if doc:
+            return doc
+    if not queries:
+        return None
+    for doc in fetch_all_documents(parties_collection):
+        if not isinstance(doc, dict):
+            continue
+        identifier = doc.get("_id")
+        if party_id and identifier is not None and str(identifier) == party_id:
+            return doc
+        if party_slug and sanitize_analytics_text(doc.get("slug")) == sanitize_analytics_text(party_slug):
+            return doc
+    return None
+
+
+def build_analytics_summary(window_hours: int = 24) -> dict:
+    if (
+        party_analytics_collection is None
+        or visitor_analytics_collection is None
+        or parties_collection is None
+    ):
+        raise RuntimeError("Analytics datastore unavailable")
+
+    now = datetime.now(timezone.utc)
+    visitor_cutoff = now - timedelta(hours=window_hours)
+
     try:
         try:
-            cursor = analytics_collection.find({})
+            visitor_docs = list(visitor_analytics_collection.find({"createdAt": {"$gte": visitor_cutoff}}))
         except TypeError:  # pragma: no cover - compatibility with tests
-            cursor = analytics_collection.find()
+            visitor_docs = list(visitor_analytics_collection.find())
     except Exception as exc:
-        app.logger.error(f"Failed to read analytics events: {exc}")
+        app.logger.error(f"Failed to read visitor analytics: {exc}")
         raise
 
-    for doc in cursor:
-        total_events += 1
+    unique_visitors = 0
+    for doc in visitor_docs:
         created_at = parse_datetime(doc.get("createdAt"))
-        if not created_at or created_at < cutoff:
-            continue
-        recent_events += 1
-        category = sanitize_analytics_text(doc.get("category")) or "unknown"
-        action = sanitize_analytics_text(doc.get("action")) or "unknown"
-        action_counter[(category, action)] += 1
-        label = sanitize_analytics_text(doc.get("label"))
-        if label:
-            label_counter[label] += 1
-        path = sanitize_analytics_text(doc.get("path"))
-        if path:
-            path_counter[path] += 1
+        if created_at and created_at >= visitor_cutoff:
+            unique_visitors += 1
 
-        if category == "party" and action == "enter":
-            raw_context = doc.get("context")
-            context = raw_context if isinstance(raw_context, dict) else {}
-            party_slug = to_text(context.get("partySlug")) or to_text(doc.get("partySlug"))
-            party_id = to_text(context.get("partyId")) or to_text(doc.get("partyId"))
-            party_name = to_text(context.get("partyName")) or label
-            party_path = path or to_text(context.get("partyPath"))
-            key = next(
-                (value for value in (party_slug, party_id, party_path, party_name) if value),
-                None,
-            )
-            if key:
-                existing = party_counter.setdefault(
-                    key,
-                    {
-                        "count": 0,
-                        "label": party_name or key,
-                        "path": party_path,
-                        "partySlug": party_slug,
-                        "partyId": party_id,
-                    },
-                )
-                if not existing.get("label") and (party_name or label):
-                    existing["label"] = party_name or label
-                if not existing.get("path") and party_path:
-                    existing["path"] = party_path
-                if not existing.get("partySlug") and party_slug:
-                    existing["partySlug"] = party_slug
-                if not existing.get("partyId") and party_id:
-                    existing["partyId"] = party_id
-                existing["count"] += 1
+    try:
+        analytics_docs = fetch_all_documents(party_analytics_collection)
+    except Exception:
+        raise
+
+    metrics_by_party: dict[str, dict] = {}
+    for doc in analytics_docs:
+        identifier = doc.get("partyId")
+        if identifier is None:
+            continue
+        metrics_by_party[str(identifier)] = doc
+
+    live_parties: list[dict] = []
+    live_ids: set[str] = set()
+    for party in fetch_all_documents(parties_collection):
+        if not isinstance(party, dict):
+            continue
+        party_identifier = party.get("_id")
+        if party_identifier is None:
+            continue
+        party_id = str(party_identifier)
+        if not is_party_live(party, now=now):
+            if party_id in metrics_by_party:
+                try:
+                    party_analytics_collection.delete_one({"partyId": party_id})
+                except Exception:  # pragma: no cover - best effort cleanup
+                    pass
+            continue
+        live_ids.add(party_id)
+        metrics = metrics_by_party.get(party_id, {})
+        live_parties.append(
+            {
+                "partyId": party_id,
+                "slug": sanitize_analytics_text(party.get("slug")),
+                "name": sanitize_analytics_text(party.get("name")),
+                "date": isoformat_or_none(party.get("date") or party.get("startsAt")),
+                "views": int(metrics.get("views", 0) or 0),
+                "redirects": int(metrics.get("redirects", 0) or 0),
+            }
+        )
+
+    for doc in analytics_docs:
+        identifier = doc.get("partyId")
+        if identifier is None:
+            continue
+        party_id = str(identifier)
+        if party_id in live_ids:
+            continue
+        try:
+            party_analytics_collection.delete_one({"partyId": party_id})
+        except Exception:  # pragma: no cover - best effort cleanup
+            pass
+
+    live_parties.sort(
+        key=lambda item: (
+            item.get("date") or "",
+            item.get("name") or "",
+            item.get("partyId"),
+        )
+    )
 
     summary = {
-        "windowDays": window_days,
-        "totalEvents": total_events,
-        "recentEvents": recent_events,
-        "actions": [
-            {"category": category, "action": action, "count": count}
-            for (category, action), count in action_counter.most_common(20)
-        ],
-        "topLabels": [
-            {"label": label, "count": count}
-            for label, count in label_counter.most_common(20)
-        ],
-        "topPaths": [
-            {"path": path, "count": count}
-            for path, count in path_counter.most_common(20)
-        ],
-        "topPartyEntries": [
-            {
-                "label": item.get("label") or "",
-                "path": item.get("path") or "",
-                "partySlug": item.get("partySlug"),
-                "partyId": item.get("partyId"),
-                "count": item.get("count", 0),
-            }
-            for item in sorted(party_counter.values(), key=lambda value: value["count"], reverse=True)[:20]
-        ],
+        "generatedAt": now.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "uniqueVisitors24h": int(unique_visitors),
+        "parties": live_parties,
     }
     return summary
 
@@ -1030,51 +1078,28 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 
-@app.route("/api/analytics/events", methods=["POST"])
+@app.route("/api/analytics/visitor", methods=["POST"])
 @limiter.limit("120 per minute")
-def create_analytics_event():
-    """Record a user interaction event emitted by the frontend."""
-    if analytics_collection is None:
+def record_unique_visitor():
+    """Record a unique visitor session for the last 24 hours."""
+    if visitor_analytics_collection is None:
         return jsonify({"message": "Analytics datastore unavailable."}), 503
     payload = request.get_json(silent=True) or {}
     try:
-        event = AnalyticsEventSchema(**payload)
+        body = AnalyticsVisitorRequest(**payload)
     except ValidationError as exc:
         errors = exc.errors() if hasattr(exc, "errors") else []
         return jsonify({"message": "Invalid analytics event.", "errors": errors}), 400
 
-    raw_category = getattr(event, "category", None)
-    raw_action = getattr(event, "action", None)
-    category = sanitize_analytics_text(raw_category)
-    action = sanitize_analytics_text(raw_action)
-    if not category or not action:
-        return jsonify({"message": "Invalid analytics event.", "errors": [{"loc": ["category", "action"], "msg": "Both category and action are required."}]}), 400
-    label = sanitize_analytics_text(event.label)
-    path = sanitize_analytics_text(event.path)
-    session_id = sanitize_analytics_text(event.sessionId)
-    user_id = sanitize_analytics_text(event.userId)
-    metadata = sanitize_analytics_metadata(event.context)
+    session_id = sanitize_analytics_text(body.sessionId)
+    if not session_id:
+        return jsonify({"message": "Invalid analytics event.", "errors": [{"loc": ["sessionId"], "msg": "sessionId is required."}]}), 400
 
+    now = datetime.now(timezone.utc)
     record = {
-        "category": category,
-        "action": action,
-        "createdAt": datetime.utcnow(),
+        "sessionId": session_id,
+        "createdAt": now,
     }
-    if event.value is not None:
-        try:
-            record["value"] = float(event.value)
-        except (TypeError, ValueError):
-            record["value"] = event.value
-    if label:
-        record["label"] = label
-    if path:
-        record["path"] = path
-    if session_id:
-        record["sessionId"] = session_id
-    if user_id:
-        record["userId"] = user_id
-    if metadata:
-        record["context"] = metadata
 
     user_agent = sanitize_analytics_text(request.headers.get("User-Agent"))
     referer = sanitize_analytics_text(request.headers.get("Referer"))
@@ -1087,12 +1112,93 @@ def create_analytics_event():
         record["clientIp"] = client_ip
 
     try:
-        analytics_collection.insert_one(record)
+        visitor_analytics_collection.update_one(
+            {"sessionId": session_id},
+            {"$set": record},
+            upsert=True,
+        )
     except Exception as exc:  # pragma: no cover - best effort persistence
-        app.logger.error(f"Failed to persist analytics event: {exc}")
+        app.logger.error(f"Failed to persist visitor analytics: {exc}")
         return jsonify({"message": "Failed to record analytics event."}), 500
 
-    return jsonify({"message": "Recorded"}), 201
+    return jsonify({"message": "Recorded"}), 202
+
+
+def record_party_interaction(metric: str):
+    if party_analytics_collection is None or parties_collection is None:
+        return jsonify({"message": "Analytics datastore unavailable."}), 503
+
+    payload = request.get_json(silent=True) or {}
+    try:
+        body = PartyAnalyticsRequest(**payload)
+    except ValidationError as exc:
+        errors = exc.errors() if hasattr(exc, "errors") else []
+        return jsonify({"message": "Invalid analytics event.", "errors": errors}), 400
+
+    if not (body.partyId or body.partySlug):
+        return jsonify({"message": "Invalid analytics event.", "errors": [{"loc": ["partyId", "partySlug"], "msg": "Provide partyId or partySlug."}]}), 400
+
+    party_id_input = body.partyId.strip() if isinstance(body.partyId, str) else body.partyId
+    party_slug_input = sanitize_analytics_text(body.partySlug)
+
+    party = find_party_for_analytics(party_id_input, party_slug_input)
+    if not party:
+        return jsonify({"message": "Party not found."}), 404
+
+    party_identifier = party.get("_id")
+    if party_identifier is None:
+        return jsonify({"message": "Party not found."}), 404
+
+    if not is_party_live(party):
+        try:
+            party_analytics_collection.delete_one({"partyId": str(party_identifier)})
+        except Exception:  # pragma: no cover - best effort cleanup
+            pass
+        return jsonify({"message": "Party is archived."}), 410
+
+    now = datetime.now(timezone.utc)
+    party_id = str(party_identifier)
+    slug = party_slug_input or sanitize_analytics_text(party.get("slug"))
+    name = sanitize_analytics_text(party.get("name"))
+    party_date = isoformat_or_none(party.get("date") or party.get("startsAt"))
+
+    update = {
+        "$set": {
+            "partyId": party_id,
+            "partySlug": slug,
+            "partyName": name,
+            "partyDate": party_date,
+            "updatedAt": now,
+        },
+        "$setOnInsert": {"views": 0, "redirects": 0},
+        "$inc": {metric: 1},
+    }
+    if metric == "views":
+        update["$set"]["lastViewAt"] = now
+    elif metric == "redirects":
+        update["$set"]["lastRedirectAt"] = now
+
+    try:
+        party_analytics_collection.update_one({"partyId": party_id}, update, upsert=True)
+    except Exception as exc:  # pragma: no cover - best effort persistence
+        app.logger.error(f"Failed to persist party analytics: {exc}")
+        return jsonify({"message": "Failed to record analytics event."}), 500
+
+    return jsonify({"message": "Recorded"}), 202
+
+
+@app.route("/api/analytics/party-view", methods=["POST"])
+@limiter.limit("240 per minute")
+def record_party_view():
+    """Increment the view counter for a party analytics record."""
+    return record_party_interaction("views")
+
+
+@app.route("/api/analytics/party-redirect", methods=["POST"])
+@limiter.limit("240 per minute")
+def record_party_redirect():
+    """Increment the redirect counter for a party analytics record."""
+    return record_party_interaction("redirects")
 
 
 @app.route("/api/analytics/summary", methods=["GET"])
@@ -1122,29 +1228,27 @@ def analytics_page():
         body = """<!doctype html><html lang='en'><head><meta charset='utf-8'><title>Analytics</title></head><body><h1>Analytics</h1><p>Unable to render analytics dashboard.</p></body></html>"""
         return body, 500, {"Content-Type": "text/html; charset=utf-8"}
 
-    def render_table(title: str, headers: list[str], rows: list[list[str]]):
-        header_html = "".join(f"<th>{html.escape(col)}</th>" for col in headers)
-        if not rows:
-            row_html = f"<tr><td colspan='{len(headers)}'>No data recorded.</td></tr>"
-        else:
-            row_html = "".join(
-                "<tr>" + "".join(f"<td>{html.escape(str(cell))}</td>" for cell in row) + "</tr>"
-                for row in rows
-            )
-        return f"<section><h2>{html.escape(title)}</h2><table><thead><tr>{header_html}</tr></thead><tbody>{row_html}</tbody></table></section>"
+    parties = summary.get("parties", [])
+    unique_visitors = summary.get("uniqueVisitors24h", 0)
 
-    action_rows = [[item["category"], item["action"], item["count"]] for item in summary.get("actions", [])]
-    party_rows = [
-        [
-            item.get("label") or "",
-            item.get("path") or "",
-            item.get("partySlug") or item.get("partyId") or "",
-            item.get("count", 0),
-        ]
-        for item in summary.get("topPartyEntries", [])
-    ]
-    label_rows = [[item["label"], item["count"]] for item in summary.get("topLabels", [])]
-    path_rows = [[item["path"], item["count"]] for item in summary.get("topPaths", [])]
+    if parties:
+        rows = "".join(
+            "<tr>"
+            + "".join(
+                f"<td>{html.escape(str(value))}</td>"
+                for value in (
+                    item.get("name") or "",
+                    item.get("slug") or "",
+                    item.get("date") or "",
+                    item.get("views", 0),
+                    item.get("redirects", 0),
+                )
+            )
+            + "</tr>"
+            for item in parties
+        )
+    else:
+        rows = "<tr><td colspan='5'>No live parties found.</td></tr>"
 
     body = f"""<!doctype html>
 <html lang='en'>
@@ -1162,20 +1266,38 @@ def analytics_page():
       td {{ font-size: 0.95rem; }}
       .stats {{ display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 2rem; }}
       .stat {{ background: linear-gradient(135deg, #6366f1, #8b5cf6); color: white; padding: 1.25rem 1.5rem; border-radius: 16px; min-width: 200px; box-shadow: 0 20px 25px -15px rgba(99, 102, 241, 0.8); }}
-      .stat h3 {{ margin: 0 0 0.5rem; font-size: 0.9rem; text-transform: uppercase; letter-spacing: 0.12em; opacity: 0.9; }}
-      .stat p {{ margin: 0; font-size: 1.75rem; font-weight: 700; }}
+      .stat strong {{ display: block; font-size: 2rem; line-height: 1.1; margin-bottom: 0.25rem; }}
     </style>
   </head>
   <body>
-    <h1>Analytics overview</h1>
+    <h1>Parties247 analytics</h1>
     <div class='stats'>
-      <div class='stat'><h3>Total events tracked</h3><p>{summary.get('totalEvents', 0)}</p></div>
-      <div class='stat'><h3>Events in last {summary.get('windowDays', 30)} days</h3><p>{summary.get('recentEvents', 0)}</p></div>
+      <div class='stat'>
+        <strong>{unique_visitors}</strong>
+        <span>Unique visitors (last 24h)</span>
+      </div>
+      <div class='stat'>
+        <strong>{len(parties)}</strong>
+        <span>Live parties tracked</span>
+      </div>
     </div>
-    {render_table('Top actions', ['Category', 'Action', 'Count'], action_rows)}
-    {render_table('Party entries', ['Party', 'Path', 'Slug/ID', 'Count'], party_rows)}
-    {render_table('Top labels', ['Label', 'Count'], label_rows)}
-    {render_table('Top paths', ['Path', 'Count'], path_rows)}
+    <section>
+      <h2>Live party performance</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Slug</th>
+            <th>Date</th>
+            <th>Views</th>
+            <th>Redirects</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows}
+        </tbody>
+      </table>
+    </section>
   </body>
 </html>"""
 
@@ -1215,21 +1337,21 @@ OPENAPI_TEMPLATE = {
                 },
             }
         },
-        "/api/analytics/events": {
+        "/api/analytics/visitor": {
             "post": {
-                "summary": "Record analytics event",
-                "description": "Capture a user interaction from the Parties247 frontend or widgets.",
+                "summary": "Record unique visitor",
+                "description": "Mark a visitor session as active within the last 24 hours.",
                 "requestBody": {
                     "required": True,
                     "content": {
                         "application/json": {
-                            "schema": {"$ref": "#/components/schemas/AnalyticsEventRequest"}
+                            "schema": {"$ref": "#/components/schemas/AnalyticsVisitorRequest"}
                         }
                     }
                 },
                 "responses": {
-                    "201": {
-                        "description": "Event was recorded successfully.",
+                    "202": {
+                        "description": "Visitor was recorded successfully.",
                         "content": {
                             "application/json": {
                                 "schema": {
@@ -1242,7 +1364,7 @@ OPENAPI_TEMPLATE = {
                         }
                     },
                     "400": {
-                        "description": "Invalid analytics event payload.",
+                        "description": "Invalid analytics payload.",
                         "content": {
                             "application/json": {
                                 "schema": {
@@ -1271,10 +1393,126 @@ OPENAPI_TEMPLATE = {
                 }
             }
         },
+        "/api/analytics/party-view": {
+            "post": {
+                "summary": "Record party view",
+                "description": "Increment the view counter when a party page is opened.",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/PartyAnalyticsRequest"}
+                        }
+                    }
+                },
+                "responses": {
+                    "202": {
+                        "description": "View was recorded successfully.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string", "example": "Recorded"}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid analytics payload.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string"},
+                                        "errors": {"type": "array", "items": {"type": "object"}}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "404": {"description": "Party not found."},
+                    "410": {"description": "Party archived."},
+                    "503": {
+                        "description": "Analytics datastore unavailable.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string"}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/analytics/party-redirect": {
+            "post": {
+                "summary": "Record party redirect",
+                "description": "Increment the redirect counter when a user clicks a purchase link for the party.",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/PartyAnalyticsRequest"}
+                        }
+                    }
+                },
+                "responses": {
+                    "202": {
+                        "description": "Redirect was recorded successfully.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string", "example": "Recorded"}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid analytics payload.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string"},
+                                        "errors": {"type": "array", "items": {"type": "object"}}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "404": {"description": "Party not found."},
+                    "410": {"description": "Party archived."},
+                    "503": {
+                        "description": "Analytics datastore unavailable.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string"}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/analytics/summary": {
             "get": {
                 "summary": "Analytics summary",
-                "description": "Retrieve aggregated analytics counts for the last 30 days, including the parties visitors enter the most.",
+                "description": "Retrieve live party analytics including view and redirect totals plus unique visitors recorded in the last 24 hours.",
                 "responses": {
                     "200": {
                         "description": "Aggregated analytics counters.",
@@ -2092,89 +2330,47 @@ OPENAPI_TEMPLATE = {
                 },
                 "additionalProperties": True,
             },
-            "AnalyticsEventRequest": {
+            "AnalyticsVisitorRequest": {
                 "type": "object",
                 "properties": {
-                    "category": {"type": "string", "example": "page"},
-                    "action": {"type": "string", "example": "view"},
-                    "label": {"type": "string", "example": "home"},
-                    "value": {"type": "number", "example": 1},
-                    "path": {"type": "string", "example": "/"},
-                    "context": {"type": "object", "additionalProperties": True},
-                    "sessionId": {"type": "string"},
-                    "userId": {"type": "string"},
+                    "sessionId": {"type": "string"}
                 },
-                "required": ["category", "action"],
+                "required": ["sessionId"],
                 "additionalProperties": False,
             },
-            "AnalyticsActionBreakdown": {
+            "PartyAnalyticsRequest": {
                 "type": "object",
+                "description": "Identify a party by ID or slug to increment analytics counters.",
                 "properties": {
-                    "category": {"type": "string"},
-                    "action": {"type": "string"},
-                    "count": {"type": "integer", "minimum": 0},
-                },
-                "required": ["category", "action", "count"],
-            },
-            "AnalyticsTopEntry": {
-                "type": "object",
-                "properties": {
-                    "label": {"type": "string"},
-                    "count": {"type": "integer", "minimum": 0},
-                },
-                "required": ["label", "count"],
-            },
-            "AnalyticsTopPath": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "count": {"type": "integer", "minimum": 0},
-                },
-                "required": ["path", "count"],
-            },
-            "AnalyticsTopPartyEntry": {
-                "type": "object",
-                "properties": {
-                    "label": {"type": "string"},
-                    "path": {"type": "string"},
-                    "partySlug": {"type": "string"},
                     "partyId": {"type": "string"},
-                    "count": {"type": "integer", "minimum": 0},
+                    "partySlug": {"type": "string"},
                 },
-                "required": ["count"],
+                "additionalProperties": False,
+            },
+            "PartyAnalyticsEntry": {
+                "type": "object",
+                "properties": {
+                    "partyId": {"type": "string"},
+                    "slug": {"type": "string"},
+                    "name": {"type": "string"},
+                    "date": {"type": "string"},
+                    "views": {"type": "integer", "minimum": 0},
+                    "redirects": {"type": "integer", "minimum": 0},
+                },
+                "required": ["partyId", "views", "redirects"],
+                "additionalProperties": True,
             },
             "AnalyticsSummary": {
                 "type": "object",
                 "properties": {
-                    "windowDays": {"type": "integer", "minimum": 1},
-                    "totalEvents": {"type": "integer", "minimum": 0},
-                    "recentEvents": {"type": "integer", "minimum": 0},
-                    "actions": {
+                    "generatedAt": {"type": "string", "format": "date-time"},
+                    "uniqueVisitors24h": {"type": "integer", "minimum": 0},
+                    "parties": {
                         "type": "array",
-                        "items": {"$ref": "#/components/schemas/AnalyticsActionBreakdown"}
-                    },
-                    "topLabels": {
-                        "type": "array",
-                        "items": {"$ref": "#/components/schemas/AnalyticsTopEntry"}
-                    },
-                    "topPaths": {
-                        "type": "array",
-                        "items": {"$ref": "#/components/schemas/AnalyticsTopPath"}
-                    },
-                    "topPartyEntries": {
-                        "type": "array",
-                        "items": {"$ref": "#/components/schemas/AnalyticsTopPartyEntry"}
+                        "items": {"$ref": "#/components/schemas/PartyAnalyticsEntry"},
                     },
                 },
-                "required": [
-                    "windowDays",
-                    "totalEvents",
-                    "recentEvents",
-                    "actions",
-                    "topLabels",
-                    "topPaths",
-                    "topPartyEntries",
-                ],
+                "required": ["generatedAt", "uniqueVisitors24h", "parties"],
             },
             "CarouselUrlImportRequest": {
                 "type": "object",
@@ -2305,15 +2501,16 @@ class ReferralUpdateSchema(BaseModel):
         extra = "forbid"
 
 
-class AnalyticsEventSchema(BaseModel):
-    category: str
-    action: str
-    label: str | None = None
-    value: float | None = None
-    path: str | None = None
-    context: dict | None = None
-    sessionId: str | None = None
-    userId: str | None = None
+class AnalyticsVisitorRequest(BaseModel):
+    sessionId: str
+
+    class Config:
+        extra = "forbid"
+
+
+class PartyAnalyticsRequest(BaseModel):
+    partyId: str | None = None
+    partySlug: str | None = None
 
     class Config:
         extra = "forbid"

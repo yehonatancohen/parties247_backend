@@ -93,6 +93,8 @@ class _DB:
         self.tags = _Collection()
         self.settings = _Collection()
         self.analytics = _Collection()
+        self.partyAnalytics = _Collection()
+        self.analyticsVisitors = _Collection()
     def __getitem__(self, item):
         return self
 class _MongoClient:

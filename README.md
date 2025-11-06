@@ -96,9 +96,10 @@ All three endpoints ensure the related parties exist (creating them when necessa
 
 ## Analytics Instrumentation
 
-- Emit analytics events from the frontend via `POST /api/analytics/events`. Provide a JSON body containing a `category`, `action`, and optional `label`, `path`, `context`, `sessionId`, and `userId` values.
-- Aggregate captured events with `GET /api/analytics/summary`, which returns the top actions, most popular party entries, labels, and paths observed in the last 30 days.
-- Review a lightweight dashboard at [`/analytics`](http://localhost:3001/analytics) for a quick glance at recent activity without external tooling.
+- Register unique website visitors once per session via `POST /api/analytics/visitor` with a `sessionId` in the request body.
+- Increment a party view when a user opens the details page with `POST /api/analytics/party-view`, providing a `partyId` or `partySlug`.
+- Increment a party redirect conversion when a user clicks a purchase link with `POST /api/analytics/party-redirect`, providing a `partyId` or `partySlug`.
+- Retrieve aggregated stats with `GET /api/analytics/summary`, which lists live parties alongside their view and redirect totals plus the number of unique visitors recorded in the last 24 hours. A simplified dashboard is also available at [`/analytics`](http://localhost:3001/analytics).
 
 ## Testing
 Run the test suite with:

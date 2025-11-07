@@ -11,6 +11,17 @@ class _DummyCollection:
         return list(self._items)
 
 
+class _DummyAnalytics:
+    def __init__(self):
+        self.last_update = None
+
+    def update_one(self, filter, update, upsert=False):
+        self.last_update = {"filter": filter, "update": update, "upsert": upsert}
+
+    def delete_one(self, filter):  # pragma: no cover - not used in tests
+        self.last_update = {"deleted": filter}
+
+
 def test_event_detail_api_returns_purchase_url(monkeypatch):
     docs = [
         {
@@ -24,6 +35,9 @@ def test_event_detail_api_returns_purchase_url(monkeypatch):
     ]
 
     monkeypatch.setattr(app, "parties_collection", _DummyCollection(docs))
+
+    analytics = _DummyAnalytics()
+    monkeypatch.setattr(app, "party_analytics_collection", analytics)
 
     class _DummySettings:
         def find_one(self, filter):
@@ -41,6 +55,10 @@ def test_event_detail_api_returns_purchase_url(monkeypatch):
     assert event["referralCode"] == "buy-now"
     assert headers["Cache-Control"] == f"public, max-age={app.EVENT_CACHE_SECONDS}"
     assert headers["X-Robots-Tag"] == "noindex"
+    assert analytics.last_update is not None
+    update = analytics.last_update["update"]
+    assert update["$inc"]["views"] == 1
+    assert update["$set"]["partyId"] == "1"
 
 
 def test_event_detail_api_not_found(monkeypatch):

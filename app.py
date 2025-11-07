@@ -1124,41 +1124,29 @@ def record_unique_visitor():
     return jsonify({"message": "Recorded"}), 202
 
 
-def record_party_interaction(metric: str):
-    if party_analytics_collection is None or parties_collection is None:
-        return jsonify({"message": "Analytics datastore unavailable."}), 503
+def persist_party_metric(party: dict | None, metric: str) -> tuple[bool, str | None]:
+    """Persist the requested metric for the provided party document."""
 
-    payload = request.get_json(silent=True) or {}
-    try:
-        body = PartyAnalyticsRequest(**payload)
-    except ValidationError as exc:
-        errors = exc.errors() if hasattr(exc, "errors") else []
-        return jsonify({"message": "Invalid analytics event.", "errors": errors}), 400
+    if party_analytics_collection is None:
+        return False, "unavailable"
 
-    if not (body.partyId or body.partySlug):
-        return jsonify({"message": "Invalid analytics event.", "errors": [{"loc": ["partyId", "partySlug"], "msg": "Provide partyId or partySlug."}]}), 400
-
-    party_id_input = body.partyId.strip() if isinstance(body.partyId, str) else body.partyId
-    party_slug_input = sanitize_analytics_text(body.partySlug)
-
-    party = find_party_for_analytics(party_id_input, party_slug_input)
     if not party:
-        return jsonify({"message": "Party not found."}), 404
+        return False, "not_found"
 
     party_identifier = party.get("_id")
     if party_identifier is None:
-        return jsonify({"message": "Party not found."}), 404
+        return False, "not_found"
 
     if not is_party_live(party):
         try:
             party_analytics_collection.delete_one({"partyId": str(party_identifier)})
         except Exception:  # pragma: no cover - best effort cleanup
             pass
-        return jsonify({"message": "Party is archived."}), 410
+        return False, "archived"
 
     now = datetime.now(timezone.utc)
     party_id = str(party_identifier)
-    slug = party_slug_input or sanitize_analytics_text(party.get("slug"))
+    slug = sanitize_analytics_text(party.get("slug"))
     name = sanitize_analytics_text(party.get("name"))
     party_date = isoformat_or_none(party.get("date") or party.get("startsAt"))
 
@@ -1186,9 +1174,44 @@ def record_party_interaction(metric: str):
         party_analytics_collection.update_one({"partyId": party_id}, update, upsert=True)
     except Exception as exc:  # pragma: no cover - best effort persistence
         app.logger.error(f"Failed to persist party analytics: {exc}")
+        return False, "error"
+
+    return True, None
+
+
+def record_party_interaction(metric: str):
+    if party_analytics_collection is None or parties_collection is None:
+        return jsonify({"message": "Analytics datastore unavailable."}), 503
+
+    payload = request.get_json(silent=True) or {}
+    try:
+        body = PartyAnalyticsRequest(**payload)
+    except ValidationError as exc:
+        errors = exc.errors() if hasattr(exc, "errors") else []
+        return jsonify({"message": "Invalid analytics event.", "errors": errors}), 400
+
+    if not (body.partyId or body.partySlug):
+        return jsonify({"message": "Invalid analytics event.", "errors": [{"loc": ["partyId", "partySlug"], "msg": "Provide partyId or partySlug."}]}), 400
+
+    party_id_input = body.partyId.strip() if isinstance(body.partyId, str) else body.partyId
+    party_slug_input = sanitize_analytics_text(body.partySlug)
+
+    party = find_party_for_analytics(party_id_input, party_slug_input)
+    if not party:
+        return jsonify({"message": "Party not found."}), 404
+
+    success, reason = persist_party_metric(party, metric)
+    if success:
+        return jsonify({"message": "Recorded"}), 202
+
+    if reason == "archived":
+        return jsonify({"message": "Party is archived."}), 410
+    if reason == "unavailable":
+        return jsonify({"message": "Analytics datastore unavailable."}), 503
+    if reason == "error":
         return jsonify({"message": "Failed to record analytics event."}), 500
 
-    return jsonify({"message": "Recorded"}), 202
+    return jsonify({"message": "Party not found."}), 404
 
 
 @app.route("/api/analytics/party-view", methods=["POST"])
@@ -2792,6 +2815,12 @@ def event_detail_api(slug: str):
     event, original = find_event_by_slug(slug)
     if not event:
         return jsonify({"message": "Event not found."}), 404
+
+    updated, reason = persist_party_metric(original, "views") if original else (False, None)
+    if not updated and reason not in {None, "archived", "unavailable"}:
+        app.logger.warning(
+            f"Failed to increment view counter for event '{slug}': reason={reason}"
+        )
 
     referral = default_referral_code()
     original_copy = dict(original or {})

@@ -48,9 +48,15 @@ class FakePartyAnalyticsCollection:
     def update_one(self, filter, update, upsert=False):
         party_id = filter.get("partyId")
         existing = next((doc for doc in self.docs if doc.get("partyId") == party_id), None)
-        if not existing:
-            existing = {"partyId": party_id, "views": 0, "redirects": 0}
+        if not existing and upsert:
+            existing = {"partyId": party_id}
+            for key, value in update.get("$setOnInsert", {}).items():
+                existing[key] = value
+            existing.setdefault("views", 0)
+            existing.setdefault("redirects", 0)
             self.docs.append(existing)
+        elif not existing:
+            return SimpleNamespace(upserted_id=None)
         inc = update.get("$inc", {})
         for key, value in inc.items():
             existing[key] = existing.get(key, 0) + value

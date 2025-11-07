@@ -1170,9 +1170,13 @@ def record_party_interaction(metric: str):
             "partyDate": party_date,
             "updatedAt": now,
         },
-        "$setOnInsert": {"views": 0, "redirects": 0},
         "$inc": {metric: 1},
     }
+
+    initial_metrics = {"views": 0, "redirects": 0}
+    initial_metrics.pop(metric, None)
+    if initial_metrics:
+        update["$setOnInsert"] = initial_metrics
     if metric == "views":
         update["$set"]["lastViewAt"] = now
     elif metric == "redirects":

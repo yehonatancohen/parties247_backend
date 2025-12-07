@@ -66,8 +66,6 @@ GO_OUT_BASE_URL = "https://www.go-out.co"
 GO_OUT_EVENT_BASE = f"{GO_OUT_BASE_URL}/event/"
 GO_OUT_TICKETS_API_PATH = "/endOne/getEventsByTypeNew"
 GO_OUT_TICKETS_PREFIX = "/tickets/"
-NIGHTLIFE_CAROUSEL_TITLE = "חיי לילה"
-WEEKEND_CAROUSEL_TITLE = "סופ״ש"
 ISRAEL_TIMEZONE = timezone(timedelta(hours=3), name="Israel Daylight Time")
 
 CANONICAL_PATTERNS = {
@@ -2027,10 +2025,10 @@ OPENAPI_TEMPLATE = {
                 }
             }
         },
-        "/api/admin/sections": {
+        "/api/admin/carousels/reorder": {
             "post": {
-                "summary": "Import parties into a carousel",
-                "description": "Scrape a curated page for party links, ensure each party exists, and create a carousel using them. Requires admin token.",
+                "summary": "Reorder carousels",
+                "description": "Persist a new display order for the supplied carousel IDs. Requires admin token.",
                 "security": [{"bearerAuth": []}],
                 "requestBody": {
                     "required": True,
@@ -2038,11 +2036,53 @@ OPENAPI_TEMPLATE = {
                         "application/json": {
                             "schema": {
                                 "type": "object",
-                                "required": ["url"],
+                                "required": ["orderedIds"],
                                 "properties": {
-                                    "url": {"type": "string", "format": "uri"},
-                                    "carouselName": {"type": "string"},
-                                    "title": {"type": "string"}
+                                    "orderedIds": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": "Carousel IDs in their desired order."
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "200": {
+                        "description": "Carousels reordered.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string"}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "400": {"description": "Invalid payload or missing items."},
+                    "500": {"description": "Error reordering carousels."}
+                }
+            }
+        },
+        "/api/admin/sections": {
+            "post": {
+                "summary": "Create a section",
+                "description": "Persist a static section entry for the homepage. Requires admin token.",
+                "security": [{"bearerAuth": []}],
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["title", "content"],
+                                "properties": {
+                                    "title": {"type": "string"},
+                                    "content": {"type": "string"},
+                                    "slug": {"type": "string"}
                                 }
                             }
                         }
@@ -2050,34 +2090,15 @@ OPENAPI_TEMPLATE = {
                 },
                 "responses": {
                     "201": {
-                        "description": "Carousel created from section.",
+                        "description": "Section created.",
                         "content": {
                             "application/json": {
-                                "schema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "message": {"type": "string"},
-                                        "carousel": {"$ref": "#/components/schemas/Carousel"},
-                                        "partyCount": {"type": "integer"},
-                                        "warnings": {
-                                            "type": "array",
-                                            "items": {
-                                                "type": "object",
-                                                "properties": {
-                                                    "url": {"type": "string"},
-                                                    "error": {"type": "string"}
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                                "schema": {"$ref": "#/components/schemas/Section"}
                             }
                         }
                     },
                     "400": {"description": "Invalid payload."},
-                    "404": {"description": "No parties found at the provided URL."},
-                    "502": {"description": "Error fetching the source URL."},
-                    "500": {"description": "Server error while importing the section."}
+                    "500": {"description": "Server error while creating the section."}
                 }
             }
         },
@@ -2116,76 +2137,6 @@ OPENAPI_TEMPLATE = {
                     "400": {"description": "Invalid payload."},
                     "409": {"description": "Party already exists."},
                     "500": {"description": "Server error."},
-                },
-            }
-        },
-        "/api/admin/import/nightlife": {
-            "post": {
-                "summary": "Import Go-Out nightlife events",
-                "description": "Fetches the latest nightlife events from Go-Out and syncs the 'חיי לילה' carousel.",
-                "security": [{"bearerAuth": []}],
-                "responses": {
-                    "200": {
-                        "description": "Nightlife carousel updated.",
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "message": {"type": "string"},
-                                        "carousel": {"$ref": "#/components/schemas/Carousel"},
-                                        "addedCount": {"type": "integer"},
-                                        "sourceEventCount": {"type": "integer"},
-                                        "warnings": {
-                                            "type": "array",
-                                            "items": {
-                                                "type": "object",
-                                                "additionalProperties": True,
-                                            },
-                                        },
-                                    },
-                                },
-                            }
-                        },
-                    },
-                    "404": {"description": "No nightlife events were returned."},
-                    "500": {"description": "Unable to update nightlife carousel."},
-                    "502": {"description": "Failed to contact Go-Out."},
-                },
-            }
-        },
-        "/api/admin/import/weekend": {
-            "post": {
-                "summary": "Import Go-Out weekend events",
-                "description": "Fetches the weekend feed from Go-Out and syncs the 'סופ״ש' carousel.",
-                "security": [{"bearerAuth": []}],
-                "responses": {
-                    "200": {
-                        "description": "Weekend carousel updated.",
-                        "content": {
-                            "application/json": {
-                                "schema": {
-                                    "type": "object",
-                                    "properties": {
-                                        "message": {"type": "string"},
-                                        "carousel": {"$ref": "#/components/schemas/Carousel"},
-                                        "addedCount": {"type": "integer"},
-                                        "sourceEventCount": {"type": "integer"},
-                                        "warnings": {
-                                            "type": "array",
-                                            "items": {
-                                                "type": "object",
-                                                "additionalProperties": True,
-                                            },
-                                        },
-                                    },
-                                },
-                            }
-                        },
-                    },
-                    "404": {"description": "No weekend events were returned."},
-                    "500": {"description": "Unable to update weekend carousel."},
-                    "502": {"description": "Failed to contact Go-Out."},
                 },
             }
         },
@@ -2354,6 +2305,19 @@ OPENAPI_TEMPLATE = {
                         "type": "array",
                         "items": {"type": "string"}
                     }
+                },
+                "additionalProperties": True,
+            },
+            "Section": {
+                "type": "object",
+                "properties": {
+                    "_id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "content": {"type": "string"},
+                    "slug": {"type": "string"},
+                    "order": {"type": "integer"},
+                    "createdAt": {"type": "string", "format": "date-time"},
+                    "updatedAt": {"type": "string", "format": "date-time"}
                 },
                 "additionalProperties": True,
             },
@@ -2589,15 +2553,6 @@ class CarouselPartiesUpdateSchema(BaseModel):
 
 class CarouselReorderSchema(BaseModel):
     orderedIds: list[str]
-    class Config:
-        extra = "forbid"
-
-
-class CarouselImportRequest(BaseModel):
-    url: str
-    carouselName: str | None = None
-    title: str | None = None
-
     class Config:
         extra = "forbid"
 
@@ -3832,117 +3787,6 @@ def list_sections():
     return jsonify(items), 200
 
 
-def discover_event_urls_from_source(source_url: str) -> list[str]:
-    """Fetch a source page and extract party URLs from it."""
-    disable_proxies = {"http": None, "https": None}
-    response = requests.get(
-        source_url,
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=15,
-        proxies=disable_proxies,
-    )
-    response.raise_for_status()
-    return extract_event_urls_from_page(source_url, response.text)
-
-
-def _collect_go_out_event_urls(events: list, referral: str | None) -> list[str]:
-    urls: list[str] = []
-    for event in events or []:
-        slug = _extract_event_slug_from_ticket_item(event)
-        if not slug:
-            continue
-        slug = slug.lstrip("/")
-        if not slug:
-            continue
-        if "/" in slug:
-            slug = slug.rsplit("/", 1)[-1]
-        event_url = f"{GO_OUT_EVENT_BASE}{slug}"
-        event_url = append_affiliate_param(event_url, referral)
-        urls.append(event_url)
-    return urls
-
-
-def _format_iso_timestamp(now: datetime | None = None) -> str:
-    moment = (now or datetime.utcnow()).replace(tzinfo=timezone.utc)
-    formatted = moment.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
-    return f"{formatted}Z"
-
-
-def _format_weekend_recived_date(now: datetime | None = None) -> str:
-    moment = now or datetime.now(ISRAEL_TIMEZONE)
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=ISRAEL_TIMEZONE)
-    else:
-        moment = moment.astimezone(ISRAEL_TIMEZONE)
-    offset = moment.strftime("%z")
-    tz_name = moment.tzname() or "Israel Daylight Time"
-    base = moment.strftime("%a %b %d %Y %H:%M:%S")
-    return f"{base} GMT{offset} ({tz_name})"
-
-
-def scrape_nightlife_events(referral: str | None) -> list[str]:
-    payload = {
-        "skip": 0,
-        "limit": 50,
-        "location": "IL",
-        "Types": ["תל אביב", "מועדוני לילה"],
-        "recivedDate": _format_iso_timestamp(),
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Origin": GO_OUT_BASE_URL,
-        "Referer": f"{GO_OUT_BASE_URL}/tickets/nightlife",
-        "User-Agent": "Mozilla/5.0",
-    }
-    disable_proxies = {"http": None, "https": None}
-    response = requests.post(
-        urljoin(GO_OUT_BASE_URL, "/endOne/getEventsByTypeNew"),
-        json=payload,
-        headers=headers,
-        timeout=15,
-        proxies=disable_proxies,
-    )
-    response.raise_for_status()
-    try:
-        body = response.json()
-    except ValueError:
-        return []
-    events = body.get("events") if isinstance(body, dict) else []
-    return _collect_go_out_event_urls(events, referral)
-
-
-def scrape_weekend_events(referral: str | None) -> list[str]:
-    params = {
-        "limit": 50,
-        "skip": 0,
-        "recivedDate": _format_weekend_recived_date(),
-        "location": "IL",
-    }
-    headers = {
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9,he;q=0.8",
-        "Cache-Control": "no-cache",
-        "Referer": f"{GO_OUT_BASE_URL}/weekend",
-        "User-Agent": "Mozilla/5.0",
-    }
-    disable_proxies = {"http": None, "https": None}
-    response = requests.get(
-        urljoin(GO_OUT_BASE_URL, "/endOne/getWeekendEvents"),
-        params=params,
-        headers=headers,
-        timeout=15,
-        proxies=disable_proxies,
-    )
-    response.raise_for_status()
-    try:
-        body = response.json()
-    except ValueError:
-        return []
-    events = body.get("events") if isinstance(body, dict) else []
-    return _collect_go_out_event_urls(events, referral)
-
-
 def add_parties_to_carousel_from_urls(
     title: str, event_urls: Iterable[str], referral: str | None
 ) -> tuple[dict | None, int, list[dict]]:
@@ -3977,66 +3821,6 @@ def _import_carousel_from_urls(carousel_name: str, urls: list[str], referral: st
     if not urls:
         return None, 0, []
     return add_parties_to_carousel_from_urls(carousel_name, urls, referral)
-
-
-@app.route("/api/admin/import/nightlife", methods=["POST"])
-@limiter.limit("5 per minute")
-@protect
-def import_nightlife_carousel():
-    referral = default_referral_code()
-    try:
-        event_urls = scrape_nightlife_events(referral)
-    except requests.exceptions.RequestException as exc:
-        return jsonify({"message": "Unable to fetch nightlife events.", "error": str(exc)}), 502
-
-    if not event_urls:
-        return jsonify({"message": "No nightlife events were returned."}), 404
-
-    carousel_doc, added_count, warnings = _import_carousel_from_urls(
-        NIGHTLIFE_CAROUSEL_TITLE, event_urls, referral
-    )
-    if carousel_doc is None:
-        return jsonify({"message": "Unable to update nightlife carousel."}), 500
-
-    payload = {
-        "message": "Nightlife carousel updated.",
-        "carousel": serialize_carousel(carousel_doc),
-        "addedCount": added_count,
-        "sourceEventCount": len(event_urls),
-    }
-    if warnings:
-        payload["warnings"] = warnings
-    return jsonify(payload), 200
-
-
-@app.route("/api/admin/import/weekend", methods=["POST"])
-@limiter.limit("5 per minute")
-@protect
-def import_weekend_carousel():
-    referral = default_referral_code()
-    try:
-        event_urls = scrape_weekend_events(referral)
-    except requests.exceptions.RequestException as exc:
-        return jsonify({"message": "Unable to fetch weekend events.", "error": str(exc)}), 502
-
-    if not event_urls:
-        return jsonify({"message": "No weekend events were returned."}), 404
-
-    carousel_doc, added_count, warnings = _import_carousel_from_urls(
-        WEEKEND_CAROUSEL_TITLE, event_urls, referral
-    )
-    if carousel_doc is None:
-        return jsonify({"message": "Unable to update weekend carousel."}), 500
-
-    payload = {
-        "message": "Weekend carousel updated.",
-        "carousel": serialize_carousel(carousel_doc),
-        "addedCount": added_count,
-        "sourceEventCount": len(event_urls),
-    }
-    if warnings:
-        payload["warnings"] = warnings
-    return jsonify(payload), 200
 
 
 @app.route("/api/admin/import/carousel-urls", methods=["POST"])
@@ -4093,85 +3877,43 @@ def import_carousel_from_urls():
 @protect
 def add_section():
     payload = request.get_json(silent=True) or {}
-    if not payload.get("url"):
-        if sections_collection is None:
-            return jsonify({"message": "Storage unavailable."}), 503
-        try:
-            section_req = SectionCreateSchema(**payload)
-        except ValidationError as ve:
-            app.logger.warning(f"[VALIDATION] {ve}")
-            return jsonify({"message": "Invalid payload", "errors": ve.errors()}), 400
-        title = (section_req.title or "").strip()
-        content = section_req.content
-        if not title:
-            return jsonify({"message": "title is required"}), 400
-        slug_source = section_req.slug or title
-        slug = slugify_value(slug_source)
-        if not slug:
-            return jsonify({"message": "Unable to derive slug from provided data."}), 400
-        try:
-            last = sections_collection.find().sort("order", -1).limit(1)
-            last_order = next(last, {}).get("order", -1)
-        except Exception:
-            last_order = -1
-        now = isoformat_or_none(datetime.utcnow().replace(tzinfo=timezone.utc))
-        doc = {
-            "title": title,
-            "content": content,
-            "slug": slug,
-            "order": int(last_order) + 1,
-            "createdAt": now,
-            "updatedAt": now,
-        }
-        try:
-            result = sections_collection.insert_one(doc)
-            doc["_id"] = getattr(result, "inserted_id", doc.get("_id"))
-        except Exception as exc:
-            return jsonify({"message": "Error creating section", "error": str(exc)}), 500
-        payload = dict(doc)
-        if payload.get("_id") is not None:
-            payload["_id"] = str(payload["_id"])
-        return jsonify(payload), 201
-
-    if carousels_collection is None or parties_collection is None:
+    if sections_collection is None:
         return jsonify({"message": "Storage unavailable."}), 503
     try:
-        req = CarouselImportRequest(**payload)
+        section_req = SectionCreateSchema(**payload)
     except ValidationError as ve:
         app.logger.warning(f"[VALIDATION] {ve}")
         return jsonify({"message": "Invalid payload", "errors": ve.errors()}), 400
-
-    title = (req.carouselName or req.title or "").strip()
+    title = (section_req.title or "").strip()
+    content = section_req.content
     if not title:
-        return jsonify({"message": "carouselName or title is required"}), 400
-    source_url = (req.url or "").strip()
-    if not source_url or not is_url_allowed(source_url):
-        return jsonify({"message": "URL is not allowed."}), 400
-
+        return jsonify({"message": "title is required"}), 400
+    slug_source = section_req.slug or title
+    slug = slugify_value(slug_source)
+    if not slug:
+        return jsonify({"message": "Unable to derive slug from provided data."}), 400
     try:
-        event_urls = discover_event_urls_from_source(source_url)
-    except requests.exceptions.RequestException as exc:
-        return jsonify({"message": "Unable to fetch source URL.", "error": str(exc)}), 502
-
-    if not event_urls:
-        return jsonify({"message": "No parties were found at the provided URL."}), 404
-
-    referral = default_referral_code()
-    carousel_doc, added_count, warnings = add_parties_to_carousel_from_urls(
-        title, event_urls, referral
-    )
-
-    if carousel_doc is None:
-        return jsonify({"message": "No parties could be imported from the provided URL."}), 404
-
-    payload = {
-        "message": "Carousel created from section.",
-        "carousel": serialize_carousel(carousel_doc),
-        "partyCount": len(carousel_doc.get("partyIds", [])),
-        "addedCount": added_count,
+        last = sections_collection.find().sort("order", -1).limit(1)
+        last_order = next(last, {}).get("order", -1)
+    except Exception:
+        last_order = -1
+    now = isoformat_or_none(datetime.utcnow().replace(tzinfo=timezone.utc))
+    doc = {
+        "title": title,
+        "content": content,
+        "slug": slug,
+        "order": int(last_order) + 1,
+        "createdAt": now,
+        "updatedAt": now,
     }
-    if warnings:
-        payload["warnings"] = warnings
+    try:
+        result = sections_collection.insert_one(doc)
+        doc["_id"] = getattr(result, "inserted_id", doc.get("_id"))
+    except Exception as exc:
+        return jsonify({"message": "Error creating section", "error": str(exc)}), 500
+    payload = dict(doc)
+    if payload.get("_id") is not None:
+        payload["_id"] = str(payload["_id"])
     return jsonify(payload), 201
 
 

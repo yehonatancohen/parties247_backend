@@ -166,8 +166,9 @@ def test_api_docs_and_openapi_spec():
     assert '/api/analytics/visitor' in data['paths']
     assert '/api/analytics/party-view' in data['paths']
     assert '/api/analytics/party-redirect' in data['paths']
-    assert '/api/admin/import/nightlife' in data['paths']
-    assert '/api/admin/import/weekend' in data['paths']
+    assert '/api/admin/carousels/reorder' in data['paths']
+    assert '/api/admin/import/nightlife' not in data['paths']
+    assert '/api/admin/import/weekend' not in data['paths']
     assert data['servers'][0]['url'] == 'http://localhost'
 
     html, status, headers = app.docs_page()

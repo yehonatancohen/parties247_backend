@@ -2958,7 +2958,23 @@ def get_parties():
     try:
         items = []
         referral = default_referral_code()
+        now = datetime.now(timezone.utc)
+        yesterday_date = (now - timedelta(days=1)).date()
+        cleanup_cutoff = now - timedelta(days=30)
         for party in parties_collection.find().sort("date", 1):
+            party_id = party.get("_id")
+            event_date = parse_datetime(party.get("date") or party.get("startsAt"))
+            if event_date:
+                event_date = event_date.astimezone(timezone.utc)
+                if event_date <= cleanup_cutoff:
+                    if party_id is not None:
+                        try:
+                            parties_collection.delete_one({"_id": party_id})
+                        except Exception as exc:  # pragma: no cover - best effort cleanup
+                            app.logger.warning(f"Failed to delete stale party {party_id}: {exc}")
+                    continue
+                if event_date.date() == yesterday_date:
+                    continue
             party["_id"] = str(party["_id"])
             slug = party.get("slug")
             if not slug:

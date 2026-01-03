@@ -1567,6 +1567,22 @@ OPENAPI_TEMPLATE = {
             "get": {
                 "summary": "List parties",
                 "description": "Fetch the public parties currently tracked by Parties247.",
+                "parameters": [
+                    {
+                        "name": "date",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "string", "format": "date"},
+                        "description": "ISO-8601 date (YYYY-MM-DD) used to filter results to a specific calendar day.",
+                    },
+                    {
+                        "name": "upcoming",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "boolean"},
+                        "description": "When true, limit results to parties occurring today or later.",
+                    },
+                ],
                 "responses": {
                     "200": {
                         "description": "Array of party objects.",
@@ -1576,6 +1592,19 @@ OPENAPI_TEMPLATE = {
                                     "type": "array",
                                     "items": {"$ref": "#/components/schemas/Party"},
                                 }
+                            }
+                        },
+                    },
+                    "400": {
+                        "description": "Invalid query parameters.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string"},
+                                    },
+                                },
                             }
                         },
                     },
@@ -2961,6 +2990,23 @@ def get_parties():
         now = datetime.now(timezone.utc)
         yesterday_date = (now - timedelta(days=1)).date()
         cleanup_cutoff = now - timedelta(days=30)
+        try:
+            date_param = request.args.get("date")  # type: ignore[attr-defined]
+        except Exception:
+            date_param = None
+        try:
+            upcoming_param = request.args.get("upcoming")  # type: ignore[attr-defined]
+        except Exception:
+            upcoming_param = None
+        filter_date = None
+        upcoming_only = False
+        if date_param:
+            parsed_filter = parse_datetime(date_param)
+            if not parsed_filter:
+                return jsonify({"message": "Invalid date filter."}), 400
+            filter_date = parsed_filter.date()
+        if upcoming_param is not None:
+            upcoming_only = str(upcoming_param).strip().lower() in {"1", "true", "yes", "on"}
         for party in parties_collection.find().sort("date", 1):
             party_id = party.get("_id")
             event_date = parse_datetime(party.get("date") or party.get("startsAt"))
@@ -2973,7 +3019,16 @@ def get_parties():
                         except Exception as exc:  # pragma: no cover - best effort cleanup
                             app.logger.warning(f"Failed to delete stale party {party_id}: {exc}")
                     continue
+                if filter_date and event_date.date() != filter_date:
+                    continue
+                if upcoming_only and event_date.date() < now.date():
+                    continue
                 if event_date.date() == yesterday_date:
+                    continue
+            else:
+                if filter_date:
+                    continue
+                if upcoming_only:
                     continue
             party["_id"] = str(party["_id"])
             slug = party.get("slug")

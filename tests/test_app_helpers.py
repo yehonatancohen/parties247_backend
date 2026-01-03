@@ -2,6 +2,7 @@ import os
 import sys
 import types
 import pytest
+from datetime import datetime, timedelta, timezone
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 import app
@@ -108,6 +109,124 @@ def test_get_parties_appends_default_ref(monkeypatch):
     slugs = {item['_id']: item.get('slug') for item in payload}
     assert slugs['1'] == 'my-great-party'
     assert slugs['2'] == 'existing-slug'
+
+
+def test_get_parties_filters_by_date(monkeypatch):
+    docs = [
+        {
+            '_id': '1',
+            'goOutUrl': 'https://example.com/event?foo=1',
+            'originalUrl': 'https://example.com/event',
+            'date': '2099-01-01T00:00:00',
+            'name': 'My Great Party',
+        },
+        {
+            '_id': '2',
+            'goOutUrl': 'https://example.com/other?ref=keep',
+            'date': '2099-01-02T00:00:00',
+            'slug': 'existing-slug',
+        },
+    ]
+
+    class DummyCursor:
+        def __init__(self, items):
+            self._items = items
+
+        def sort(self, key, direction):
+            return sorted(self._items, key=lambda d: d.get(key))
+
+        def __iter__(self):
+            return iter(self._items)
+
+    class DummyCollection:
+        def find(self):
+            return DummyCursor(list(docs))
+
+    class DummySettings:
+        def find_one(self, filter):
+            return {'value': 'default-ref'}
+
+    class DummyRequest:
+        args = {'date': '2099-01-02'}
+
+    monkeypatch.setattr(app, 'request', DummyRequest())
+    monkeypatch.setattr(app, 'parties_collection', DummyCollection())
+    monkeypatch.setattr(app, 'settings_collection', DummySettings())
+
+    payload, status = app.get_parties()
+    assert status == 200
+    assert [item['_id'] for item in payload] == ['2']
+
+
+def test_get_parties_validates_date_filter(monkeypatch):
+    class DummyCursor:
+        def __init__(self, items):
+            self._items = items
+
+        def sort(self, key, direction):
+            return sorted(self._items, key=lambda d: d.get(key))
+
+        def __iter__(self):
+            return iter(self._items)
+
+    class DummyCollection:
+        def find(self):
+            return DummyCursor([])
+
+    class DummySettings:
+        def find_one(self, filter):
+            return {'value': 'default-ref'}
+
+    class DummyRequest:
+        args = {'date': 'not-a-date'}
+
+    monkeypatch.setattr(app, 'request', DummyRequest())
+    monkeypatch.setattr(app, 'parties_collection', DummyCollection())
+    monkeypatch.setattr(app, 'settings_collection', DummySettings())
+
+    payload, status = app.get_parties()
+    assert status == 400
+    assert payload['message'] == 'Invalid date filter.'
+
+
+def test_get_parties_filters_upcoming(monkeypatch):
+    now = datetime.now(timezone.utc)
+    today = now.isoformat()
+    tomorrow = (now + timedelta(days=1)).isoformat()
+    two_days_ago = (now - timedelta(days=2)).isoformat()
+
+    class DummyCursor:
+        def __init__(self, items):
+            self._items = items
+
+        def sort(self, key, direction):
+            return sorted(self._items, key=lambda d: d.get(key))
+
+        def __iter__(self):
+            return iter(self._items)
+
+    class DummyCollection:
+        def find(self):
+            return DummyCursor([
+                {'_id': '1', 'date': two_days_ago},
+                {'_id': '2', 'date': today},
+                {'_id': '3', 'date': tomorrow},
+            ])
+
+    class DummySettings:
+        def find_one(self, filter):
+            return {'value': 'default-ref'}
+
+    class DummyRequest:
+        args = {'upcoming': 'true'}
+
+    monkeypatch.setattr(app, 'request', DummyRequest())
+    monkeypatch.setattr(app, 'parties_collection', DummyCollection())
+    monkeypatch.setattr(app, 'settings_collection', DummySettings())
+
+    payload, status = app.get_parties()
+    assert status == 200
+    assert [item['_id'] for item in payload] == ['2', '3']
 
 
 def test_protect_decorator():

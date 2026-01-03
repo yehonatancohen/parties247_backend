@@ -93,13 +93,17 @@ Curated carousels can be organized through the admin API:
 
 ### Filtering parties
 
-Clients can narrow the public party list to a specific calendar day using the optional `date` query parameter on `GET /api/parties`:
+Clients can narrow the public party list using optional query parameters on `GET /api/parties`:
 
 ```http
 GET /api/parties?date=2024-12-31
+GET /api/parties?olderThan=2024-11-15
 ```
 
-The value should be an ISO-8601 date (YYYY-MM-DD). Invalid values return a `400 Bad Request` response.
+- `date` filters results to a specific calendar day.
+- `olderThan` returns only parties strictly before the provided date.
+
+Both values should be ISO-8601 dates (YYYY-MM-DD). Invalid values return a `400 Bad Request` response.
 
 ## Analytics Instrumentation
 

@@ -188,6 +188,84 @@ def test_get_parties_validates_date_filter(monkeypatch):
     assert payload['message'] == 'Invalid date filter.'
 
 
+def test_get_parties_filters_by_older_than(monkeypatch):
+    docs = [
+        {
+            '_id': '1',
+            'goOutUrl': 'https://example.com/event?foo=1',
+            'originalUrl': 'https://example.com/event',
+            'date': '2099-01-01T00:00:00',
+            'name': 'Old Party',
+        },
+        {
+            '_id': '2',
+            'goOutUrl': 'https://example.com/other?ref=keep',
+            'date': '2099-01-03T00:00:00',
+            'slug': 'existing-slug',
+        },
+    ]
+
+    class DummyCursor:
+        def __init__(self, items):
+            self._items = items
+
+        def sort(self, key, direction):
+            return sorted(self._items, key=lambda d: d.get(key))
+
+        def __iter__(self):
+            return iter(self._items)
+
+    class DummyCollection:
+        def find(self):
+            return DummyCursor(list(docs))
+
+    class DummySettings:
+        def find_one(self, filter):
+            return {'value': 'default-ref'}
+
+    class DummyRequest:
+        args = {'olderThan': '2099-01-02'}
+
+    monkeypatch.setattr(app, 'request', DummyRequest())
+    monkeypatch.setattr(app, 'parties_collection', DummyCollection())
+    monkeypatch.setattr(app, 'settings_collection', DummySettings())
+
+    payload, status = app.get_parties()
+    assert status == 200
+    assert [item['_id'] for item in payload] == ['1']
+
+
+def test_get_parties_validates_older_than(monkeypatch):
+    class DummyCursor:
+        def __init__(self, items):
+            self._items = items
+
+        def sort(self, key, direction):
+            return sorted(self._items, key=lambda d: d.get(key))
+
+        def __iter__(self):
+            return iter(self._items)
+
+    class DummyCollection:
+        def find(self):
+            return DummyCursor([])
+
+    class DummySettings:
+        def find_one(self, filter):
+            return {'value': 'default-ref'}
+
+    class DummyRequest:
+        args = {'olderThan': 'not-a-date'}
+
+    monkeypatch.setattr(app, 'request', DummyRequest())
+    monkeypatch.setattr(app, 'parties_collection', DummyCollection())
+    monkeypatch.setattr(app, 'settings_collection', DummySettings())
+
+    payload, status = app.get_parties()
+    assert status == 400
+    assert payload['message'] == 'Invalid olderThan filter.'
+
+
 def test_protect_decorator():
     flask_mod = sys.modules['flask']
     app.JWT_SECRET = 'secret'

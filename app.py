@@ -1574,6 +1574,13 @@ OPENAPI_TEMPLATE = {
                         "required": False,
                         "schema": {"type": "string", "format": "date"},
                         "description": "ISO-8601 date (YYYY-MM-DD) used to filter results to a specific calendar day.",
+                    },
+                    {
+                        "name": "olderThan",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "string", "format": "date"},
+                        "description": "ISO-8601 date (YYYY-MM-DD); only parties strictly before this date are returned.",
                     }
                 ],
                 "responses": {
@@ -2987,12 +2994,22 @@ def get_parties():
             date_param = request.args.get("date")  # type: ignore[attr-defined]
         except Exception:
             date_param = None
+        try:
+            older_than_param = request.args.get("olderThan")  # type: ignore[attr-defined]
+        except Exception:
+            older_than_param = None
         filter_date = None
+        older_than_date = None
         if date_param:
             parsed_filter = parse_datetime(date_param)
             if not parsed_filter:
                 return jsonify({"message": "Invalid date filter."}), 400
             filter_date = parsed_filter.date()
+        if older_than_param:
+            parsed_filter = parse_datetime(older_than_param)
+            if not parsed_filter:
+                return jsonify({"message": "Invalid olderThan filter."}), 400
+            older_than_date = parsed_filter.date()
         for party in parties_collection.find().sort("date", 1):
             party_id = party.get("_id")
             event_date = parse_datetime(party.get("date") or party.get("startsAt"))
@@ -3007,9 +3024,13 @@ def get_parties():
                     continue
                 if filter_date and event_date.date() != filter_date:
                     continue
+                if older_than_date and event_date.date() >= older_than_date:
+                    continue
                 if event_date.date() == yesterday_date:
                     continue
             elif filter_date:
+                continue
+            elif older_than_date:
                 continue
             party["_id"] = str(party["_id"])
             slug = party.get("slug")

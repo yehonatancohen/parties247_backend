@@ -91,6 +91,20 @@ Curated carousels can be organized through the admin API:
 - Browse the human-friendly overview at [`/docs`](http://localhost:3001/docs) when the server is running.
 - Consume the machine-readable OpenAPI description at [`/openapi.json`](http://localhost:3001/openapi.json). Import this file into tools like Postman, Hoppscotch, or VS Code's REST client for interactive exploration.
 
+### Filtering parties
+
+Clients can narrow the public party list using optional query parameters on `GET /api/parties`:
+
+```http
+GET /api/parties?date=2024-12-31
+GET /api/parties?olderThan=2024-11-15
+```
+
+- `date` filters results to a specific calendar day.
+- `olderThan` returns only parties strictly before the provided date.
+
+Both values should be ISO-8601 dates (YYYY-MM-DD). Invalid values return a `400 Bad Request` response.
+
 ## Analytics Instrumentation
 
 - Register unique website visitors once per session via `POST /api/analytics/visitor` with a `sessionId` in the request body.

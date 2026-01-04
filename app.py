@@ -2262,7 +2262,7 @@ OPENAPI_TEMPLATE = {
         "/api/admin/update-party/{partyId}": {
             "put": {
                 "summary": "Update a party",
-                "description": "Update select fields on an existing party. Requires admin token.",
+                "description": "Update select fields on an existing party. Supports editing titles, slugs, images, URLs, timing, descriptions, and location metadata. Requires admin token.",
                 "security": [{"bearerAuth": []}],
                 "parameters": [
                     {
@@ -2276,11 +2276,7 @@ OPENAPI_TEMPLATE = {
                     "required": True,
                     "content": {
                         "application/json": {
-                            "schema": {
-                                "type": "object",
-                                "description": "Any subset of party fields to update.",
-                                "additionalProperties": True,
-                            }
+                            "schema": {"$ref": "#/components/schemas/PartyUpdateRequest"}
                         }
                     },
                 },
@@ -2317,6 +2313,34 @@ OPENAPI_TEMPLATE = {
                     "tags": {"type": "array", "items": {"type": "string"}},
                 },
                 "additionalProperties": True,
+            },
+            "PartyUpdateRequest": {
+                "type": "object",
+                "description": "Optional fields an admin can edit on a party. Unspecified fields remain unchanged.",
+                "properties": {
+                    "title": {"type": "string", "description": "Display title; maps to the party name."},
+                    "slug": {"type": "string", "description": "Custom slug override used for lookups."},
+                    "image": {"type": "string", "format": "uri", "description": "Primary image URL; updates imageUrl and images."},
+                    "url": {"type": "string", "format": "uri", "description": "Canonical event URL; also sets originalUrl."},
+                    "name": {"type": "string", "description": "Existing name field for backward compatibility."},
+                    "imageUrl": {"type": "string", "format": "uri", "description": "Image URL field stored directly on the party."},
+                    "date": {"type": "string", "description": "Date value stored alongside startsAt."},
+                    "time": {"type": "string", "format": "date-time", "description": "Convenience alias for startsAt/date."},
+                    "startsAt": {"type": "string", "format": "date-time", "description": "Event start time in ISO-8601 format."},
+                    "endsAt": {"type": "string", "format": "date-time", "description": "Event end time in ISO-8601 format."},
+                    "location": {"type": "string", "description": "Freeform location text."},
+                    "description": {"type": "string", "description": "Detailed party description."},
+                    "region": {"type": "string", "description": "Region or city grouping."},
+                    "musicType": {"type": "string", "description": "Music genre or tag."},
+                    "eventType": {"type": "string", "description": "Type of event (festival, concert, etc.)."},
+                    "age": {"type": "string", "description": "Age restriction text."},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags applied to the party."},
+                    "originalUrl": {"type": "string", "format": "uri", "description": "Source URL of the party."},
+                    "canonicalUrl": {"type": "string", "format": "uri", "description": "Normalized canonical URL of the party."},
+                    "goOutUrl": {"type": "string", "format": "uri", "description": "Go-Out source URL if applicable."},
+                    "referralCode": {"type": "string", "description": "Referral code appended to outbound links."},
+                },
+                "additionalProperties": False,
             },
             "Event": {
                 "type": "object",

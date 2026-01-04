@@ -79,6 +79,32 @@ Admin endpoints are protected using short‑lived JSON Web Tokens (JWTs).
    ```
 5. To verify that a token is still valid, POST to `/api/admin/verify-token`.
 
+## Party Management
+
+Use the admin API to update party metadata when scraping needs to be corrected or supplemented:
+
+- `PUT /api/admin/update-party/{partyId}` accepts partial updates for fields such as `title`, `slug` (stored as a slug override), `image`, `url` (sets both `canonicalUrl` and `originalUrl`), `location`, `description`, `tags`, `musicType`, `eventType`, `age`, and time fields (`time`/`startsAt`/`endsAt`).
+- The convenience `time` field sets both `startsAt` and `date` when provided, and `image` automatically updates `imageUrl` and the `images` array.
+
+Example request:
+
+```http
+PUT /api/admin/update-party/664f80d9f3d4f5b123456789
+Authorization: Bearer <jwt>
+Content-Type: application/json
+
+{
+  "title": "Sunset Rooftop Session",
+  "slug": "sunset-rooftop-session",
+  "image": "https://cdn.example.com/rooftop.jpg",
+  "url": "https://tickets.example.com/events/rooftop",
+  "startsAt": "2024-08-03T17:30:00Z",
+  "location": "Tel Aviv Port",
+  "tags": ["house", "sunset"],
+  "description": "Golden hour beats with guest DJs."
+}
+```
+
 ## Carousel Management
 
 Curated carousels can be organized through the admin API:

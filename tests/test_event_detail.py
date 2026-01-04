@@ -26,8 +26,8 @@ def test_event_detail_api_returns_purchase_url(monkeypatch):
     docs = [
         {
             "_id": "1",
-            "slug": "thursday-moon-02-10",
-            "name": "Thursday Moon",
+            "slug": "should-be-ignored",
+            "name": "Thursday Moon 02/10",
             "date": "2099-02-10T20:00:00",
             "goOutUrl": "https://tickets.example.com/buy",
             "originalUrl": "https://tickets.example.com/info",

@@ -653,10 +653,14 @@ def normalize_event(doc: dict) -> dict:
     if isinstance(slug_source, dict):
         slug_source = slug_source.get("en") or slug_source.get("he")
 
-    slug = slugify_value(slug_source or title.get("en") or title.get("he"))
+    slug_override = doc.get("slugOverride")
+    slug = slugify_value(
+        slug_override or slug_source or title.get("en") or title.get("he")
+    )
     if not slug:
         slug = (
-            doc.get("slug")
+            slug_override
+            or doc.get("slug")
             or doc.get("slug_en")
             or doc.get("slug_he")
             or slugify_value(doc.get("canonicalUrl"))
@@ -825,8 +829,22 @@ def find_event_by_slug(slug: str) -> tuple[dict | None, dict | None]:
     docs = all_events()
     for doc in docs:
         normalized = normalize_event(doc)
-        candidate = (normalized.get("slug") or "").casefold()
-        if candidate == slug_key:
+        candidates = {(normalized.get("slug") or "").casefold()}
+        slug_source = doc.get("name") or doc.get("title")
+        if isinstance(slug_source, dict):
+            slug_source = slug_source.get("en") or slug_source.get("he")
+        fallback_slug = slugify_value(slug_source) if slug_source else ""
+        if fallback_slug:
+            candidates.add(fallback_slug.casefold())
+        slug_override = doc.get("slugOverride")
+        if slug_override:
+            candidates.add(str(slug_override).casefold())
+        explicit_slug = doc.get("slug") or doc.get("slug_en") or doc.get("slug_he")
+        if isinstance(explicit_slug, dict):
+            explicit_slug = explicit_slug.get("en") or explicit_slug.get("he")
+        if explicit_slug:
+            candidates.add(str(explicit_slug).casefold())
+        if slug_key in candidates:
             return normalized, doc
     return None, None
 
@@ -2553,9 +2571,16 @@ class AddPartyRequest(BaseModel):
         extra = "forbid"
 
 class PartyUpdateSchema(BaseModel):
+    title: str | None = None
+    slug: str | None = None
+    image: str | None = None
+    url: str | None = None
     name: str | None = None
     imageUrl: str | None = None
     date: str | None = None
+    time: str | None = None
+    startsAt: str | None = None
+    endsAt: str | None = None
     location: str | None = None
     description: str | None = None
     region: str | None = None
@@ -2973,6 +2998,36 @@ def update_party(party_id):
         obj_id = ObjectId(party_id)
         update = PartyUpdateSchema(**payload)
         data = update.dict(exclude_unset=True)
+
+        if "title" in data:
+            data.setdefault("name", data.pop("title"))
+
+        if "slug" in data:
+            slug_value = data.pop("slug")
+            if slug_value is not None:
+                data["slugOverride"] = slug_value
+                data.setdefault("slug", slug_value)
+
+        if "image" in data:
+            image_value = data.pop("image")
+            if image_value is not None:
+                data["imageUrl"] = image_value
+                data["images"] = [image_value]
+
+        if "url" in data:
+            url_value = data.pop("url")
+            if url_value is not None:
+                data["canonicalUrl"] = url_value
+                data.setdefault("originalUrl", url_value)
+
+        if "time" in data:
+            time_value = data.pop("time")
+            if time_value is not None:
+                data["startsAt"] = time_value
+                data["date"] = time_value
+
+        if data.get("startsAt") and not data.get("date"):
+            data["date"] = data["startsAt"]
         if not data:
             return jsonify({"message": "No valid fields provided."}), 400
         result = parties_collection.update_one({"_id": obj_id}, {"$set": data})

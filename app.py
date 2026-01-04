@@ -648,10 +648,19 @@ def all_events() -> list[dict]:
 
 
 def normalize_event(doc: dict) -> dict:
-    slug = doc.get("slug") or doc.get("slug_en") or doc.get("slug_he")
-    if not slug:
-        slug = slugify_value(doc.get("canonicalUrl")) or slugify_value(doc.get("name"))
     title = extract_bilingual(doc, "name", fallback=doc.get("title"))
+    slug_source = doc.get("name") or doc.get("title")
+    if isinstance(slug_source, dict):
+        slug_source = slug_source.get("en") or slug_source.get("he")
+
+    slug = slugify_value(slug_source or title.get("en") or title.get("he"))
+    if not slug:
+        slug = (
+            doc.get("slug")
+            or doc.get("slug_en")
+            or doc.get("slug_he")
+            or slugify_value(doc.get("canonicalUrl"))
+        )
     description = extract_bilingual(doc, "description")
     summary = extract_bilingual(doc, "summary", fallback=description.get("en") or description.get("he"))
     starts_at = isoformat_or_none(doc.get("startsAt") or doc.get("date"))

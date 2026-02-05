@@ -631,6 +631,125 @@ def build_analytics_summary(window_hours: int = 24) -> dict:
     return summary
 
 
+def build_time_series_analytics(start: datetime, end: datetime, interval: str = "day", party_slug: str | None = None) -> list[dict]:
+    """
+    Build time-series analytics for visits, party views, and purchases.
+    
+    Args:
+        start: Start datetime (timezone-aware)
+        end: End datetime (timezone-aware)
+        interval: Aggregation granularity ("hour" or "day")
+        party_slug: Optional party slug to filter metrics
+    
+    Returns:
+        List of time buckets with metrics
+    """
+    if visitor_analytics_collection is None or party_analytics_collection is None:
+        raise RuntimeError("Analytics datastore unavailable")
+    
+    # Query both collections for the time range
+    query = {"createdAt": {"$gte": start, "$lte": end}}
+    
+    try:
+        visitor_docs = list(visitor_analytics_collection.find(query))
+        party_event_docs = []
+        
+        # Get party analytics documents (views and redirects)
+        for doc in fetch_all_documents(party_analytics_collection):
+            last_viewed = parse_datetime(doc.get("lastViewedAt"))
+            last_redirect = parse_datetime(doc.get("lastRedirectAt"))
+            
+            # Include if any activity in range
+            if (last_viewed and start <= last_viewed <= end) or (last_redirect and start <= last_redirect <= end):
+                party_event_docs.append(doc)
+                
+    except Exception as exc:
+        app.logger.error(f"Failed to read analytics events: {exc}")
+        raise
+
+    buckets = {}
+    
+    # Process visitor events (for visits)
+    for doc in visitor_docs:
+        created_at = parse_datetime(doc.get("createdAt"))
+        if not created_at:
+            continue
+        
+        if interval == "hour":
+            key = created_at.strftime("%Y-%m-%dT%H:00:00Z")
+        else:
+            key = created_at.strftime("%Y-%m-%d")
+            
+        if key not in buckets:
+            buckets[key] = {
+                "timestamp": key,
+                "visits": set(),
+                "partyViews": 0,
+                "purchases": 0
+            }
+            
+        session_id = doc.get("sessionId")
+        if session_id:
+            buckets[key]["visits"].add(session_id)
+    
+    # Process party events (for views and purchases/redirects)
+    for doc in party_event_docs:
+        doc_party_id = doc.get("partyId")
+        
+        # If filtering by party, check if this matches
+        if party_slug:
+            party_doc = find_party_for_analytics(party_id=str(doc_party_id) if doc_party_id else None, party_slug=None)
+            if not party_doc or sanitize_analytics_text(party_doc.get("slug")) != sanitize_analytics_text(party_slug):
+                continue
+        
+        # Process views
+        last_viewed = parse_datetime(doc.get("lastViewedAt"))
+        if last_viewed and start <= last_viewed <= end:
+            if interval == "hour":
+                key = last_viewed.strftime("%Y-%m-%dT%H:00:00Z")
+            else:
+                key = last_viewed.strftime("%Y-%m-%d")
+                
+            if key not in buckets:
+                buckets[key] = {
+                    "timestamp": key,
+                    "visits": set(),
+                    "partyViews": 0,
+                    "purchases": 0
+                }
+            
+            views = int(doc.get("views", 0) or 0)
+            buckets[key]["partyViews"] += views
+        
+        # Process purchases (redirects to ticket page)
+        last_redirect = parse_datetime(doc.get("lastRedirectAt"))
+        if last_redirect and start <= last_redirect <= end:
+            if interval == "hour":
+                key = last_redirect.strftime("%Y-%m-%dT%H:00:00Z")
+            else:
+                key = last_redirect.strftime("%Y-%m-%d")
+                
+            if key not in buckets:
+                buckets[key] = {
+                    "timestamp": key,
+                    "visits": set(),
+                    "partyViews": 0,
+                    "purchases": 0
+                }
+            
+            redirects = int(doc.get("redirects", 0) or 0)
+            buckets[key]["purchases"] += redirects
+
+    # Convert sets to counts
+    results = []
+    for key, data in buckets.items():
+        data["visits"] = len(data["visits"])
+        results.append(data)
+        
+    results.sort(key=lambda x: x["timestamp"])
+    return results
+
+
 def all_events() -> list[dict]:
     if parties_collection is None:
         return []
@@ -1267,6 +1386,58 @@ def analytics_summary():
     return jsonify(summary), 200
 
 
+@app.route("/api/admin/analytics/detailed", methods=["GET"])
+@protect
+def analytics_detailed():
+    """Return time-series analytics for visits, views, and purchases."""
+    start_str = request.args.get("start")
+    end_str = request.args.get("end")
+    range_param = request.args.get("range", "7d")
+    interval = request.args.get("interval", "day")
+    party_slug = request.args.get("partyId")
+    
+    now = datetime.now(timezone.utc)
+    
+    start = None
+    end = None
+    
+    # Parse provided dates
+    if start_str and end_str:
+        start = parse_datetime(start_str)
+        end = parse_datetime(end_str)
+    
+    # Use presets if no custom range
+    if not start:
+        if range_param == "24h":
+            start = now - timedelta(hours=24)
+            end = now
+        elif range_param == "30d":
+            start = now - timedelta(days=30)
+            end = now
+        else:
+            # default 7d
+            start = now - timedelta(days=7)
+            end = now
+            
+    if not end:
+        end = now
+
+    try:
+        data = build_time_series_analytics(start, end, interval, party_slug)
+    except RuntimeError:
+        return jsonify({"message": "Analytics datastore unavailable."}), 503
+    except Exception as exc:
+        app.logger.error(f"Failed to build detailed analytics: {exc}")
+        return jsonify({"message": "Failed to build detailed analytics."}), 500
+        
+    return jsonify({
+        "data": data,
+        "range": range_param,
+        "interval": interval,
+        "partyId": party_slug
+    }), 200
+
+
 @app.route("/analytics", methods=["GET"])
 def analytics_page():
     """Render a lightweight HTML dashboard summarizing analytics events."""
@@ -1587,6 +1758,76 @@ OPENAPI_TEMPLATE = {
                             }
                         }
                     }
+                }
+            }
+        },
+        "/api/admin/analytics/detailed": {
+            "get": {
+                "summary": "Detailed time-series analytics",
+                "description": "Retrieve hourly or daily analytics metrics including website visits, party views, and purchases. Requires admin authentication.",
+                "security": [{"bearerAuth": []}],
+                "parameters": [
+                    {
+                        "name": "start",
+                        "in": "query",
+                        "schema": {"type": "string", "format": "date-time"},
+                        "description": "Start date/time (ISO 8601 format). If not provided, uses preset range."
+                    },
+                    {
+                        "name": "end",
+                        "in": "query",
+                        "schema": {"type": "string", "format": "date-time"},
+                        "description": "End date/time (ISO 8601 format). If not provided, uses preset range."
+                    },
+                    {
+                        "name": "range",
+                        "in": "query",
+                        "schema": {"type": "string", "enum": ["24h", "7d", "30d"], "default": "7d"},
+                        "description": "Preset time range. Ignored if start/end are provided."
+                    },
+                    {
+                        "name": "interval",
+                        "in": "query",
+                        "schema": {"type": "string", "enum": ["hour", "day"], "default": "day"},
+                        "description": "Time bucket granularity for aggregation."
+                    },
+                    {
+                        "name": "partyId",
+                        "in": "query",
+                        "schema": {"type": "string"},
+                        "description": "Optional party slug to filter metrics to a specific party."
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Time-series analytics data.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "timestamp": {"type": "string", "description": "ISO timestamp or date for the bucket"},
+                                                    "visits": {"type": "integer", "description": "Unique website visits in this period"},
+                                                    "partyViews": {"type": "integer", "description": "Total party page views in this period"},
+                                                    "purchases": {"type": "integer", "description": "Ticket purchase clicks in this period"}
+                                                }
+                                            }
+                                        },
+                                        "range": {"type": "string"},
+                                        "interval": {"type": "string"},
+                                        "partyId": {"type": "string", "nullable": True}
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "401": {"description": "Unauthorized - valid admin token required."},
+                    "503": {"description": "Analytics datastore unavailable."}
                 }
             }
         },

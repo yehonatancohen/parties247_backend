@@ -140,6 +140,50 @@ GET /api/parties?upcoming=true
 - Increment a party redirect conversion when a user clicks a purchase link with `POST /api/analytics/party-redirect`, providing a `partyId` or `partySlug`.
 - Retrieve aggregated stats with `GET /api/analytics/summary`, which lists live parties alongside their view and redirect totals plus the number of unique visitors recorded in the last 24 hours. A simplified dashboard is also available at [`/analytics`](http://localhost:3001/analytics).
 
+### Detailed Time-Series Analytics (Admin)
+
+For admin dashboards, the API provides detailed hourly or daily analytics via the protected endpoint `GET /api/admin/analytics/detailed`. This endpoint requires a valid admin JWT token.
+
+**Query Parameters:**
+- `range` – Preset time range: `24h`, `7d`, or `30d` (default: `7d`)
+- `start` / `end` – Custom date range (ISO 8601 format). Overrides `range` if provided.
+- `interval` – Time bucket granularity: `hour` or `day` (default: `day`)
+- `partyId` – Optional party slug to filter metrics to a specific party
+
+**Example Request:**
+```http
+GET /api/admin/analytics/detailed?range=7d&interval=day
+Authorization: Bearer <jwt>
+```
+
+**Example Response:**
+```json
+{
+  "data": [
+    {
+      "timestamp": "2024-12-25",
+      "visits": 150,
+      "partyViews": 45,
+      "purchases": 8
+    },
+    {
+      "timestamp": "2024-12-26",
+      "visits": 203,
+      "partyViews": 62,
+      "purchases": 12
+    }
+  ],
+  "range": "7d",
+  "interval": "day",
+  "partyId": null
+}
+```
+
+**Metrics Explained:**
+- `visits` – Unique website visits (sessions) in the time period
+- `partyViews` – Total party page views in the time period
+- `purchases` – Ticket purchase link clicks (redirects) in the time period
+
 ## Testing
 Run the test suite with:
 ```bash

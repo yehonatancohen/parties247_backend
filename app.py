@@ -356,6 +356,7 @@ try:
     settings_collection: Collection = db.settings
     party_analytics_collection: Collection = db.partyAnalytics
     visitor_analytics_collection: Collection = db.analyticsVisitors
+    analytics_collection: Collection = db.analytics
 
     try:
         parties_collection.update_many(
@@ -406,6 +407,7 @@ try:
     ensure_index(settings_collection, [("key", 1)], name="unique_key", unique=True)
     ensure_index(party_analytics_collection, [("partyId", 1)], name="unique_party", unique=True)
     ensure_index(visitor_analytics_collection, [("sessionId", 1)], name="unique_session", unique=True)
+    ensure_index(analytics_collection, [("category", 1), ("action", 1)], name="category_action")
     ensure_index(
         visitor_analytics_collection,
         [("createdAt", 1)],
@@ -423,6 +425,7 @@ except Exception as e:
     settings_collection = None
     party_analytics_collection = None
     visitor_analytics_collection = None
+    analytics_collection = None
 
 
 def record_setting_hit(key: str, extra: dict | None = None):
@@ -644,42 +647,93 @@ def build_time_series_analytics(start: datetime, end: datetime, interval: str = 
     Returns:
         List of time buckets with metrics
     """
-    if visitor_analytics_collection is None or party_analytics_collection is None:
+    if visitor_analytics_collection is None or analytics_collection is None:
         raise RuntimeError("Analytics datastore unavailable")
     
-    # Query both collections for the time range
-    query = {"createdAt": {"$gte": start, "$lte": end}}
+    # Query visitor analytics for unique sessions (Visits)
+    visitor_query = {"createdAt": {"$gte": start, "$lte": end}}
+    try:
+        visitor_docs = list(visitor_analytics_collection.find(visitor_query))
+    except Exception as exc:
+        app.logger.error(f"Failed to read visitor analytics: {exc}")
+        raise
+
+    # Query analytics events for party views and purchases
+    # We look for category="party" and action IN ["view", "redirect"]
+    party_event_query = {
+        "createdAt": {"$gte": start, "$lte": end},
+        "category": "party",
+        "action": {"$in": ["view", "redirect"]}
+    }
     
     try:
-        visitor_docs = list(visitor_analytics_collection.find(query))
-        party_event_docs = []
-        
-        # Get party analytics documents (views and redirects)
-        for doc in fetch_all_documents(party_analytics_collection):
-            last_viewed = parse_datetime(doc.get("lastViewedAt"))
-            last_redirect = parse_datetime(doc.get("lastRedirectAt"))
-            
-            # Include if any activity in range
-            if (last_viewed and start <= last_viewed <= end) or (last_redirect and start <= last_redirect <= end):
-                party_event_docs.append(doc)
-                
+        party_events = list(analytics_collection.find(party_event_query))
     except Exception as exc:
         app.logger.error(f"Failed to read analytics events: {exc}")
         raise
 
+    # Resolve filtering if party_slug is provided
+    target_ids = set()
+    if party_slug:
+        # User input might be an ID or a Slug. We accept both by resolving loosely.
+        # We also look up the party to get its canonical ID and Slug to be safe.
+        p = find_party_for_analytics(party_slug, party_slug)
+        if p:
+            if p.get("_id"):
+                target_ids.add(str(p["_id"]))
+            if p.get("slug"):
+                target_ids.add(p.get("slug"))
+        # Also add the raw input just in case analytics were logged with raw input before resolution
+        target_ids.add(party_slug)
+
     buckets = {}
     
-    # Process visitor events (for visits)
+    # helper to get bucket key
+    def get_key(dt):
+        if interval == "hour":
+            return dt.strftime("%Y-%m-%dT%H:00:00Z")
+        return dt.strftime("%Y-%m-%d")
+
+    # 1. Process visits
     for doc in visitor_docs:
         created_at = parse_datetime(doc.get("createdAt"))
         if not created_at:
             continue
+        key = get_key(created_at)
         
-        if interval == "hour":
-            key = created_at.strftime("%Y-%m-%dT%H:00:00Z")
-        else:
-            key = created_at.strftime("%Y-%m-%d")
+        if key not in buckets:
+            buckets[key] = {
+                "timestamp": key,
+                "visits": set(),
+                "partyViews": 0,
+                "purchases": 0
+            }
+        
+        session_id = doc.get("sessionId")
+        if session_id:
+            buckets[key]["visits"].add(session_id)
             
+    # 2. Process party events
+    for doc in party_events:
+        # Filter if needed
+        if target_ids:
+            # Match either partyId or label (slug)
+            doc_id = doc.get("partyId")
+            doc_label = doc.get("label")
+            matched = False
+            if doc_id and str(doc_id) in target_ids:
+                matched = True
+            elif doc_label and doc_label in target_ids:
+                matched = True
+            
+            if not matched:
+                continue
+        
+        created_at = parse_datetime(doc.get("createdAt"))
+        if not created_at:
+            continue
+            
+        key = get_key(created_at)
         if key not in buckets:
             buckets[key] = {
                 "timestamp": key,
@@ -688,57 +742,11 @@ def build_time_series_analytics(start: datetime, end: datetime, interval: str = 
                 "purchases": 0
             }
             
-        session_id = doc.get("sessionId")
-        if session_id:
-            buckets[key]["visits"].add(session_id)
-    
-    # Process party events (for views and purchases/redirects)
-    for doc in party_event_docs:
-        doc_party_id = doc.get("partyId")
-        
-        # If filtering by party, check if this matches
-        if party_slug:
-            party_doc = find_party_for_analytics(party_id=str(doc_party_id) if doc_party_id else None, party_slug=None)
-            if not party_doc or sanitize_analytics_text(party_doc.get("slug")) != sanitize_analytics_text(party_slug):
-                continue
-        
-        # Process views
-        last_viewed = parse_datetime(doc.get("lastViewedAt"))
-        if last_viewed and start <= last_viewed <= end:
-            if interval == "hour":
-                key = last_viewed.strftime("%Y-%m-%dT%H:00:00Z")
-            else:
-                key = last_viewed.strftime("%Y-%m-%d")
-                
-            if key not in buckets:
-                buckets[key] = {
-                    "timestamp": key,
-                    "visits": set(),
-                    "partyViews": 0,
-                    "purchases": 0
-                }
-            
-            views = int(doc.get("views", 0) or 0)
-            buckets[key]["partyViews"] += views
-        
-        # Process purchases (redirects to ticket page)
-        last_redirect = parse_datetime(doc.get("lastRedirectAt"))
-        if last_redirect and start <= last_redirect <= end:
-            if interval == "hour":
-                key = last_redirect.strftime("%Y-%m-%dT%H:00:00Z")
-            else:
-                key = last_redirect.strftime("%Y-%m-%d")
-                
-            if key not in buckets:
-                buckets[key] = {
-                    "timestamp": key,
-                    "visits": set(),
-                    "partyViews": 0,
-                    "purchases": 0
-                }
-            
-            redirects = int(doc.get("redirects", 0) or 0)
-            buckets[key]["purchases"] += redirects
+        action = doc.get("action")
+        if action == "view":
+            buckets[key]["partyViews"] += 1
+        elif action == "redirect":
+            buckets[key]["purchases"] += 1
 
     # Convert sets to counts
     results = []
@@ -1310,7 +1318,7 @@ def persist_party_metric(party: dict | None, metric: str) -> tuple[bool, str | N
     if initial_metrics:
         update["$setOnInsert"] = initial_metrics
     if metric == "views":
-        update["$set"]["lastViewAt"] = now
+        update["$set"]["lastViewedAt"] = now
     elif metric == "redirects":
         update["$set"]["lastRedirectAt"] = now
 
@@ -1346,6 +1354,21 @@ def record_party_interaction(metric: str):
 
     success, reason = persist_party_metric(party, metric)
     if success:
+        # Also log to main event stream for time-series aggregation
+        if analytics_collection is not None:
+            try:
+                record = {
+                    "category": "party",
+                    "action": "view" if metric == "views" else "redirect",
+                    "label": sanitize_analytics_text(party.get("slug")),
+                    "partyId": str(party["_id"]),
+                    "createdAt": datetime.now(timezone.utc),
+                    "context": {"partyId": str(party["_id"]), "metric": metric}
+                }
+                analytics_collection.insert_one(record)
+            except Exception as e:
+                app.logger.error(f"Failed to log party stream event: {e}")
+
         return jsonify({"message": "Recorded"}), 202
 
     if reason == "archived":

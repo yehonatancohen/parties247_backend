@@ -1445,6 +1445,11 @@ def analytics_detailed():
     if not end:
         end = now
 
+    if party_slug:
+        # Validate party existence to prevent confusion (e.g. passing "hour" as partyId)
+        if not find_party_for_analytics(party_slug, party_slug):
+             return jsonify({"message": f"Party '{party_slug}' not found."}), 404
+
     try:
         data = build_time_series_analytics(start, end, interval, party_slug)
     except RuntimeError:

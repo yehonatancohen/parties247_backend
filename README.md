@@ -83,7 +83,7 @@ Admin endpoints are protected using short‑lived JSON Web Tokens (JWTs).
 
 Use the admin API to update party metadata when scraping needs to be corrected or supplemented:
 
-- `PUT /api/admin/update-party/{partyId}` accepts partial updates for fields such as `title`, `slug` (stored as a slug override), `image`, `url` (sets both `canonicalUrl` and `originalUrl`), `location`, `description`, `tags`, `musicType`, `eventType`, `age`, and time fields (`time`/`startsAt`/`endsAt`).
+- `PUT /api/admin/update-party/{partyId}` accepts partial updates for fields such as `title`, `slug` (stored as a slug override), `image`, `url` (sets both `canonicalUrl` and `originalUrl`), `location`, `description`, `tags`, `musicType`, `eventType`, `age`, `pixelId` (Meta Pixel ID for conversion tracking), and time fields (`time`/`startsAt`/`endsAt`).
 - The convenience `time` field sets both `startsAt` and `date` when provided, and `image` automatically updates `imageUrl` and the `images` array.
 
 Example request:

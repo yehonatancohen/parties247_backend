@@ -2583,6 +2583,7 @@ OPENAPI_TEMPLATE = {
                     "audiences": {"type": "array", "items": {"type": "string"}},
                     "musicGenres": {"type": "array", "items": {"type": "string"}},
                     "areas": {"type": "array", "items": {"type": "string"}},
+                    "pixelId": {"type": "string", "nullable": True, "description": "Meta Pixel ID for conversion tracking."},
                 },
                 "additionalProperties": True,
             },
@@ -2611,6 +2612,7 @@ OPENAPI_TEMPLATE = {
                     "canonicalUrl": {"type": "string", "format": "uri", "description": "Normalized canonical URL of the party."},
                     "goOutUrl": {"type": "string", "format": "uri", "description": "Go-Out source URL if applicable."},
                     "referralCode": {"type": "string", "description": "Referral code appended to outbound links."},
+                    "pixelId": {"type": "string", "description": "Meta Pixel ID for conversion tracking on this party."},
                 },
                 "additionalProperties": False,
             },
@@ -2888,8 +2890,10 @@ class PartyUpdateSchema(BaseModel):
     canonicalUrl: str | None = None
     goOutUrl: str | None = None
     referralCode: str | None = None
+    pixelId: str | None = None
     class Config:
         extra = "forbid"
+
 
 # --- Carousel schemas ---
 class CarouselCreateSchema(BaseModel):

@@ -2465,6 +2465,41 @@ OPENAPI_TEMPLATE = {
                 },
             }
         },
+        "/api/admin/clone-party": {
+            "post": {
+                "summary": "Clone a party",
+                "description": "Create a copy of an existing party with a new slug, purchase link, and optional tracking overrides. Requires admin token.",
+                "security": [{"bearerAuth": []}],
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/ClonePartyRequest"}
+                        }
+                    },
+                },
+                "responses": {
+                    "201": {
+                        "description": "Party cloned.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string"},
+                                        "party": {"$ref": "#/components/schemas/Party"},
+                                    },
+                                }
+                            }
+                        },
+                    },
+                    "400": {"description": "Invalid payload or slug."},
+                    "404": {"description": "Source party not found."},
+                    "409": {"description": "New slug already exists."},
+                    "500": {"description": "Server error."},
+                },
+            }
+        },
         "/api/admin/import/carousel-urls": {
             "post": {
                 "summary": "Import carousel from explicit URLs",
@@ -2586,6 +2621,18 @@ OPENAPI_TEMPLATE = {
                     "pixelId": {"type": "string", "nullable": True, "description": "Meta Pixel ID for conversion tracking."},
                 },
                 "additionalProperties": True,
+            },
+            "ClonePartyRequest": {
+                "type": "object",
+                "required": ["sourceSlug", "newSlug", "purchaseLink"],
+                "properties": {
+                    "sourceSlug": {"type": "string", "description": "Slug of the party to copy from."},
+                    "newSlug": {"type": "string", "description": "New unique slug for the cloned party."},
+                    "purchaseLink": {"type": "string", "format": "uri", "description": "New purchase URL (replaces original)."},
+                    "referralCode": {"type": "string", "nullable": True, "description": "Optional new referral code."},
+                    "pixelId": {"type": "string", "nullable": True, "description": "Optional new Meta Pixel ID."},
+                },
+                "additionalProperties": False,
             },
             "PartyUpdateRequest": {
                 "type": "object",
@@ -2864,6 +2911,16 @@ class PartyAnalyticsRequest(BaseModel):
 class AddPartyRequest(BaseModel):
     url: str
     carouselName: str | None = None
+
+    class Config:
+        extra = "forbid"
+
+class ClonePartyRequest(BaseModel):
+    sourceSlug: str
+    newSlug: str
+    purchaseLink: str
+    referralCode: str | None = None
+    pixelId: str | None = None
 
     class Config:
         extra = "forbid"
@@ -3276,6 +3333,64 @@ def add_party():
     except errors.DuplicateKeyError as e:
         app.logger.warning(f"[DB] DuplicateKeyError: {getattr(e, 'details', None)}")
         return jsonify({"message": "This party has already been added."}), 409
+        app.logger.error(f"[DB] {str(e)}")
+        return jsonify({"message": f"An error occurred: {str(e)}"}), 500
+
+@app.route("/api/admin/clone-party", methods=["POST"])
+@limiter.limit("20 per minute")
+@protect
+def clone_party():
+    payload = request.get_json(silent=True) or {}
+    try:
+        req = ClonePartyRequest(**payload)
+    except ValidationError as ve:
+        app.logger.warning(f"[VALIDATION] {ve}")
+        return jsonify({"message": "Invalid request", "errors": ve.errors()}), 400
+
+    new_slug = slugify_value(req.newSlug)
+    if not new_slug:
+        return jsonify({"message": "Invalid new slug."}), 400
+
+    if parties_collection.find_one({"slug": new_slug}):
+         return jsonify({"message": "New slug already exists."}), 409
+
+    _, source_doc = find_event_by_slug(req.sourceSlug)
+    if not source_doc:
+         return jsonify({"message": "Source party not found."}), 404
+
+    new_party = copy.deepcopy(source_doc)
+    new_party.pop("_id", None)
+    
+    new_party["slug"] = new_slug
+    new_party["slugOverride"] = new_slug
+    
+    canonical = normalize_url(req.purchaseLink)
+    new_party["originalUrl"] = req.purchaseLink
+    new_party["canonicalUrl"] = canonical
+    new_party["goOutUrl"] = canonical
+
+    if req.referralCode is not None:
+        new_party["referralCode"] = req.referralCode
+    
+    if req.pixelId is not None:
+        new_party["pixelId"] = req.pixelId
+    
+    # Update title/name based on slug? 
+    # Usually better to keep original name or maybe user wants to change it later.
+    # The request doesn't include name change.
+    
+    try:
+         res = parties_collection.insert_one(new_party)
+         new_party["_id"] = str(res.inserted_id)
+         
+         event_view = normalize_event(new_party)
+         notify_indexers([event_view.get("canonicalUrl")])
+         trigger_revalidation(event_related_paths(event_view))
+         
+         return jsonify({
+            "message": "Party cloned successfully!",
+            "party": normalize_event(new_party)
+         }), 201
     except Exception as e:
         app.logger.error(f"[DB] {str(e)}")
         return jsonify({"message": f"An error occurred: {str(e)}"}), 500

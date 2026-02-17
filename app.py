@@ -626,10 +626,29 @@ def build_analytics_summary(window_hours: int = 24) -> dict:
         )
     )
 
+    # --- Traffic source breakdown ---
+    source_counts = {}
+    device_counts = {}
+    for doc in visitor_docs:
+        created_at = parse_datetime(doc.get("createdAt"))
+        if not (created_at and created_at >= visitor_cutoff):
+            continue
+        source = doc.get("trafficSource") or _parse_referrer_source(doc.get("referer"), (doc.get("utm") or {}).get("source"))
+        source_counts[source] = source_counts.get(source, 0) + 1
+        device = doc.get("deviceType") or _parse_device_type(doc.get("userAgent"))
+        device_counts[device] = device_counts.get(device, 0) + 1
+
+    def to_breakdown_list(d):
+        total = sum(d.values()) or 1
+        items = sorted(d.items(), key=lambda x: x[1], reverse=True)
+        return [{"label": k, "count": v, "percent": round(v / total * 100, 1)} for k, v in items]
+
     summary = {
         "generatedAt": now.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
         "uniqueVisitors24h": int(unique_visitors),
         "parties": live_parties,
+        "trafficSources": to_breakdown_list(source_counts),
+        "devices": to_breakdown_list(device_counts),
     }
     return summary
 
@@ -1230,10 +1249,78 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 
+def _parse_device_type(user_agent_str: str | None) -> str:
+    """Derive device type from User-Agent string."""
+    if not user_agent_str:
+        return "unknown"
+    ua = user_agent_str.lower()
+    if any(k in ua for k in ("mobile", "android", "iphone", "ipod", "windows phone")):
+        return "mobile"
+    if any(k in ua for k in ("ipad", "tablet")):
+        return "tablet"
+    if any(k in ua for k in ("bot", "crawl", "spider", "lighthouse")):
+        return "bot"
+    return "desktop"
+
+
+def _parse_browser(user_agent_str: str | None) -> str:
+    """Derive browser name from User-Agent string."""
+    if not user_agent_str:
+        return "unknown"
+    ua = user_agent_str.lower()
+    if "edg" in ua:
+        return "Edge"
+    if "opr" in ua or "opera" in ua:
+        return "Opera"
+    if "chrome" in ua and "safari" in ua:
+        return "Chrome"
+    if "firefox" in ua:
+        return "Firefox"
+    if "safari" in ua:
+        return "Safari"
+    if "msie" in ua or "trident" in ua:
+        return "IE"
+    return "Other"
+
+
+def _parse_os(user_agent_str: str | None) -> str:
+    """Derive OS from User-Agent string."""
+    if not user_agent_str:
+        return "unknown"
+    ua = user_agent_str.lower()
+    if "windows" in ua:
+        return "Windows"
+    if "mac os" in ua or "macintosh" in ua:
+        return "macOS"
+    if "iphone" in ua or "ipad" in ua:
+        return "iOS"
+    if "android" in ua:
+        return "Android"
+    if "linux" in ua:
+        return "Linux"
+    return "Other"
+
+
+def _parse_referrer_source(referrer: str | None, utm_source: str | None) -> str:
+    """Categorize traffic source from referrer URL or UTM source."""
+    if utm_source:
+        return sanitize_analytics_text(utm_source) or "direct"
+    if not referrer:
+        return "direct"
+    ref = referrer.lower()
+    if any(d in ref for d in ("google.", "bing.", "yahoo.", "duckduckgo.", "yandex.")):
+        return "organic_search"
+    if any(d in ref for d in ("facebook.", "fb.", "instagram.", "t.co", "twitter.", "x.com", "tiktok.", "linkedin.", "whatsapp.")):
+        return "social"
+    if any(d in ref for d in ("parties247", "localhost")):
+        return "direct"
+    return "referral"
+
+
 @app.route("/api/analytics/visitor", methods=["POST"])
 @limiter.limit("120 per minute")
 def record_unique_visitor():
-    """Record a unique visitor session for the last 24 hours."""
+    """Record a unique visitor session with enriched context data."""
     if visitor_analytics_collection is None:
         return jsonify({"message": "Analytics datastore unavailable."}), 503
     payload = request.get_json(silent=True) or {}
@@ -1248,20 +1335,52 @@ def record_unique_visitor():
         return jsonify({"message": "Invalid analytics event.", "errors": [{"loc": ["sessionId"], "msg": "sessionId is required."}]}), 400
 
     now = datetime.now(timezone.utc)
+    user_agent = sanitize_analytics_text(request.headers.get("User-Agent"))
+    referer = sanitize_analytics_text(body.referrer or request.headers.get("Referer"))
+    client_ip = sanitize_analytics_text(extract_client_ip(request))
+
     record = {
         "sessionId": session_id,
         "createdAt": now,
     }
 
-    user_agent = sanitize_analytics_text(request.headers.get("User-Agent"))
-    referer = sanitize_analytics_text(request.headers.get("Referer"))
-    client_ip = sanitize_analytics_text(extract_client_ip(request))
     if user_agent:
         record["userAgent"] = user_agent
+        record["deviceType"] = _parse_device_type(user_agent)
+        record["browser"] = _parse_browser(user_agent)
+        record["os"] = _parse_os(user_agent)
     if referer:
         record["referer"] = referer
     if client_ip:
         record["clientIp"] = client_ip
+
+    # Page context
+    if body.pageUrl:
+        record["pageUrl"] = sanitize_analytics_text(body.pageUrl)
+    if body.language:
+        record["language"] = sanitize_analytics_text(body.language)
+    if body.timezone:
+        record["timezone"] = sanitize_analytics_text(body.timezone)
+    if body.screenWidth and body.screenHeight:
+        record["screen"] = f"{body.screenWidth}x{body.screenHeight}"
+
+    # UTM parameters
+    utm = {}
+    if body.utmSource:
+        utm["source"] = sanitize_analytics_text(body.utmSource)
+    if body.utmMedium:
+        utm["medium"] = sanitize_analytics_text(body.utmMedium)
+    if body.utmCampaign:
+        utm["campaign"] = sanitize_analytics_text(body.utmCampaign)
+    if body.utmTerm:
+        utm["term"] = sanitize_analytics_text(body.utmTerm)
+    if body.utmContent:
+        utm["content"] = sanitize_analytics_text(body.utmContent)
+    if utm:
+        record["utm"] = utm
+
+    # Traffic source classification
+    record["trafficSource"] = _parse_referrer_source(referer, body.utmSource)
 
     try:
         visitor_analytics_collection.update_one(
@@ -1354,17 +1473,34 @@ def record_party_interaction(metric: str):
 
     success, reason = persist_party_metric(party, metric)
     if success:
-        # Also log to main event stream for time-series aggregation
+        # Also log to main event stream for time-series aggregation with visitor context
         if analytics_collection is not None:
             try:
+                user_agent = sanitize_analytics_text(request.headers.get("User-Agent"))
+                client_ip = sanitize_analytics_text(extract_client_ip(request))
+                referer = sanitize_analytics_text(body.referrer or request.headers.get("Referer"))
+                session_id = sanitize_analytics_text(body.sessionId)
+
                 record = {
                     "category": "party",
                     "action": "view" if metric == "views" else "redirect",
                     "label": sanitize_analytics_text(party.get("slug")),
                     "partyId": str(party["_id"]),
+                    "partyName": sanitize_analytics_text(party.get("name")),
                     "createdAt": datetime.now(timezone.utc),
-                    "context": {"partyId": str(party["_id"]), "metric": metric}
+                    "context": {"partyId": str(party["_id"]), "metric": metric},
                 }
+                if session_id:
+                    record["sessionId"] = session_id
+                if user_agent:
+                    record["userAgent"] = user_agent
+                    record["deviceType"] = _parse_device_type(user_agent)
+                if client_ip:
+                    record["clientIp"] = client_ip
+                if referer:
+                    record["referer"] = referer
+                    record["trafficSource"] = _parse_referrer_source(referer, None)
+
                 analytics_collection.insert_one(record)
             except Exception as e:
                 app.logger.error(f"Failed to log party stream event: {e}")
@@ -1407,6 +1543,194 @@ def analytics_summary():
         app.logger.error(f"Failed to build analytics summary: {exc}")
         return jsonify({"message": "Failed to build analytics summary."}), 500
     return jsonify(summary), 200
+
+
+@app.route("/api/analytics/recent", methods=["GET"])
+@limiter.limit("30 per minute")
+def analytics_recent():
+    """Return the most recent analytics events for the live activity feed."""
+    if analytics_collection is None and visitor_analytics_collection is None:
+        return jsonify({"events": []}), 200
+
+    events = []
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=24)
+
+    # Fetch recent party events (views + redirects)
+    if analytics_collection is not None:
+        try:
+            party_query = {"createdAt": {"$gte": cutoff}, "category": "party"}
+            try:
+                party_docs = list(
+                    analytics_collection.find(party_query).sort("createdAt", -1).limit(50)
+                )
+            except TypeError:
+                party_docs = list(analytics_collection.find(party_query))
+                party_docs.sort(key=lambda d: d.get("createdAt", ""), reverse=True)
+                party_docs = party_docs[:50]
+
+            for doc in party_docs:
+                action = doc.get("action", "view")
+                event_type = "purchase" if action == "redirect" else "view"
+                device_type = doc.get("deviceType") or _parse_device_type(doc.get("userAgent"))
+                source = doc.get("trafficSource") or _parse_referrer_source(doc.get("referer"), None)
+
+                details_parts = []
+                if device_type and device_type != "unknown":
+                    details_parts.append(f"📱 {device_type}" if device_type == "mobile" else f"🖥️ {device_type}")
+                if source and source != "direct":
+                    details_parts.append(f"🔗 {source}")
+
+                events.append({
+                    "id": str(doc.get("_id", "")),
+                    "type": event_type,
+                    "partyName": doc.get("partyName") or doc.get("label") or "",
+                    "partyId": doc.get("partyId") or "",
+                    "timestamp": isoformat_or_none(doc.get("createdAt")) or now.isoformat(),
+                    "details": " · ".join(details_parts) if details_parts else None,
+                })
+        except Exception as exc:
+            app.logger.error(f"Failed to read recent party events: {exc}")
+
+    # Fetch recent visitor sessions
+    if visitor_analytics_collection is not None:
+        try:
+            visitor_query = {"createdAt": {"$gte": cutoff}}
+            try:
+                visitor_docs = list(
+                    visitor_analytics_collection.find(visitor_query).sort("createdAt", -1).limit(20)
+                )
+            except TypeError:
+                visitor_docs = list(visitor_analytics_collection.find(visitor_query))
+                visitor_docs.sort(key=lambda d: d.get("createdAt", ""), reverse=True)
+                visitor_docs = visitor_docs[:20]
+
+            for doc in visitor_docs:
+                device_type = doc.get("deviceType") or _parse_device_type(doc.get("userAgent"))
+                source = doc.get("trafficSource") or _parse_referrer_source(doc.get("referer"), None)
+                browser = doc.get("browser") or _parse_browser(doc.get("userAgent"))
+
+                details_parts = []
+                if device_type and device_type != "unknown":
+                    details_parts.append(f"📱 {device_type}" if device_type == "mobile" else f"🖥️ {device_type}")
+                if browser and browser != "unknown":
+                    details_parts.append(browser)
+                if source and source != "direct":
+                    details_parts.append(f"🔗 {source}")
+                elif source == "direct":
+                    details_parts.append("ישיר")
+
+                events.append({
+                    "id": str(doc.get("_id", "")),
+                    "type": "visit",
+                    "partyName": None,
+                    "partyId": None,
+                    "timestamp": isoformat_or_none(doc.get("createdAt")) or now.isoformat(),
+                    "details": " · ".join(details_parts) if details_parts else None,
+                })
+        except Exception as exc:
+            app.logger.error(f"Failed to read recent visitors: {exc}")
+
+    # Sort all events by timestamp descending and limit
+    events.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
+    events = events[:50]
+
+    return jsonify({"events": events}), 200
+
+
+@app.route("/api/admin/analytics/visitors", methods=["GET"])
+@protect
+def analytics_visitors():
+    """Return detailed visitor data with device, browser, traffic source info."""
+    if visitor_analytics_collection is None:
+        return jsonify({"message": "Analytics datastore unavailable."}), 503
+
+    range_param = request.args.get("range", "24h")
+    now = datetime.now(timezone.utc)
+
+    if range_param == "7d":
+        cutoff = now - timedelta(days=7)
+    elif range_param == "30d":
+        cutoff = now - timedelta(days=30)
+    else:
+        cutoff = now - timedelta(hours=24)
+
+    try:
+        try:
+            docs = list(visitor_analytics_collection.find({"createdAt": {"$gte": cutoff}}))
+        except TypeError:
+            docs = list(visitor_analytics_collection.find())
+    except Exception as exc:
+        app.logger.error(f"Failed to read visitor analytics: {exc}")
+        return jsonify({"message": "Failed to read visitor analytics."}), 500
+
+    # Build aggregated breakdowns
+    device_counts = {}
+    browser_counts = {}
+    os_counts = {}
+    source_counts = {}
+    language_counts = {}
+    referrer_domains = {}
+    total = 0
+
+    visitors_list = []
+    for doc in docs:
+        created_at = parse_datetime(doc.get("createdAt"))
+        if created_at and created_at < cutoff:
+            continue
+        total += 1
+
+        device = doc.get("deviceType") or _parse_device_type(doc.get("userAgent"))
+        browser = doc.get("browser") or _parse_browser(doc.get("userAgent"))
+        os_name = doc.get("os") or _parse_os(doc.get("userAgent"))
+        source = doc.get("trafficSource") or _parse_referrer_source(doc.get("referer"), (doc.get("utm") or {}).get("source"))
+        lang = doc.get("language") or "unknown"
+
+        device_counts[device] = device_counts.get(device, 0) + 1
+        browser_counts[browser] = browser_counts.get(browser, 0) + 1
+        os_counts[os_name] = os_counts.get(os_name, 0) + 1
+        source_counts[source] = source_counts.get(source, 0) + 1
+        language_counts[lang] = language_counts.get(lang, 0) + 1
+
+        ref = doc.get("referer")
+        if ref:
+            try:
+                domain = urlparse(ref).netloc or ref
+                referrer_domains[domain] = referrer_domains.get(domain, 0) + 1
+            except Exception:
+                pass
+
+        visitors_list.append({
+            "sessionId": doc.get("sessionId"),
+            "timestamp": isoformat_or_none(doc.get("createdAt")),
+            "deviceType": device,
+            "browser": browser,
+            "os": os_name,
+            "trafficSource": source,
+            "referer": doc.get("referer"),
+            "language": lang,
+            "screen": doc.get("screen"),
+            "pageUrl": doc.get("pageUrl"),
+            "utm": doc.get("utm"),
+        })
+
+    visitors_list.sort(key=lambda v: v.get("timestamp") or "", reverse=True)
+
+    def to_breakdown(d):
+        items = sorted(d.items(), key=lambda x: x[1], reverse=True)
+        return [{"label": k, "count": v, "percent": round(v / total * 100, 1) if total > 0 else 0} for k, v in items]
+
+    return jsonify({
+        "total": total,
+        "range": range_param,
+        "devices": to_breakdown(device_counts),
+        "browsers": to_breakdown(browser_counts),
+        "operatingSystems": to_breakdown(os_counts),
+        "trafficSources": to_breakdown(source_counts),
+        "languages": to_breakdown(language_counts),
+        "topReferrers": to_breakdown(referrer_domains),
+        "visitors": visitors_list[:100],
+    }), 200
 
 
 @app.route("/api/admin/analytics/detailed", methods=["GET"])
@@ -2895,6 +3219,17 @@ class ReferralUpdateSchema(BaseModel):
 
 class AnalyticsVisitorRequest(BaseModel):
     sessionId: str
+    pageUrl: str | None = None
+    referrer: str | None = None
+    utmSource: str | None = None
+    utmMedium: str | None = None
+    utmCampaign: str | None = None
+    utmTerm: str | None = None
+    utmContent: str | None = None
+    screenWidth: int | None = None
+    screenHeight: int | None = None
+    language: str | None = None
+    timezone: str | None = None
 
     class Config:
         extra = "forbid"
@@ -2903,6 +3238,8 @@ class AnalyticsVisitorRequest(BaseModel):
 class PartyAnalyticsRequest(BaseModel):
     partyId: str | None = None
     partySlug: str | None = None
+    sessionId: str | None = None
+    referrer: str | None = None
 
     class Config:
         extra = "forbid"

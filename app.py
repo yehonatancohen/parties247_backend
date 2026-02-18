@@ -3517,11 +3517,41 @@ def scrape_ticket_price_only(url: str) -> int | None:
     if not is_url_allowed(url):
         return None
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers, timeout=10)
-        price_match = re.search(r"החל מ-?(\d+)", response.text)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
+        }
+        response = requests.get(url, headers=headers, timeout=15)
+        # Force UTF-8 encoding for Hebrew content if not automatically detected correctly
+        if response.encoding and response.encoding.lower() not in ('utf-8', 'utf8'):
+             response.encoding = 'utf-8'
+             
+        # Regex to find "החל מ-X" or "החל מ X"
+        # Handles potential whitespace around hyphen
+        price_match = re.search(r"החל מ(?:-| )?\s*(\d+)", response.text)
+        
         if price_match:
             return int(price_match.group(1))
+            
+        # Fallback: Look for specific JSON structure in __NEXT_DATA__ if simple regex fails
+        # This is more expensive but reliable
+        try:
+            soup = BeautifulSoup(response.text, "html.parser")
+            script_tag = soup.find("script", {"id": "__NEXT_DATA__"})
+            if script_tag:
+                 data = json.loads(script_tag.string)
+                 # Traverse to find ticket/price info
+                 # Structure varies, but often in props.pageProps.event.TicketTypes or similar
+                 # We can recursively search for keys like "Price", "price"
+                 # Or just re-search the JSON string for the pattern as it might be cleaner text
+                 json_str = script_tag.string
+                 json_price_match = re.search(r"החל מ(?:-| )?\s*(\d+)", json_str) # Hebrew in JSON might be escaped though
+                 if json_price_match:
+                     return int(json_price_match.group(1))
+        except Exception:
+            pass
+            
     except Exception as e:
         app.logger.warning(f"[PRICE SCAN] Error fetching {url}: {e}")
     return None

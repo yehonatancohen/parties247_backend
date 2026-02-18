@@ -9,3 +9,4 @@ pydantic
 Flask-Limiter
 PyJWT
 bcrypt
+Flask-APScheduler

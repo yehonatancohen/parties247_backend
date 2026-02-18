@@ -3527,6 +3527,32 @@ def scrape_ticket_price_only(url: str) -> int | None:
         if response.encoding and response.encoding.lower() not in ('utf-8', 'utf8'):
              response.encoding = 'utf-8'
              
+        # Try parsing JSON-LD first (Most robust)
+        try:
+            soup = BeautifulSoup(response.text, "html.parser")
+            ld_scripts = soup.find_all("script", type="application/ld+json")
+            for script in ld_scripts:
+                if not script.string:
+                    continue
+                try:
+                    data = json.loads(script.string)
+                    # Data can be a dict or list of dicts
+                    items = data if isinstance(data, list) else [data]
+                    for item in items:
+                        if item.get("@type") in ("Event", "Product"):
+                            offers = item.get("offers")
+                            if offers:
+                                # Offers can be list or dict
+                                offer_list = offers if isinstance(offers, list) else [offers]
+                                for offer in offer_list:
+                                    price = offer.get("price")
+                                    if price:
+                                        return int(float(price))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
         # Regex to find "החל מ-X" or "החל מ X"
         # Handles potential whitespace around hyphen
         price_match = re.search(r"החל מ(?:-| )?\s*(\d+)", response.text)
@@ -3535,18 +3561,12 @@ def scrape_ticket_price_only(url: str) -> int | None:
             return int(price_match.group(1))
             
         # Fallback: Look for specific JSON structure in __NEXT_DATA__ if simple regex fails
-        # This is more expensive but reliable
         try:
-            soup = BeautifulSoup(response.text, "html.parser")
             script_tag = soup.find("script", {"id": "__NEXT_DATA__"})
             if script_tag:
-                 data = json.loads(script_tag.string)
-                 # Traverse to find ticket/price info
-                 # Structure varies, but often in props.pageProps.event.TicketTypes or similar
-                 # We can recursively search for keys like "Price", "price"
-                 # Or just re-search the JSON string for the pattern as it might be cleaner text
+                 # Just re-search the JSON string for the pattern as it might be cleaner text
                  json_str = script_tag.string
-                 json_price_match = re.search(r"החל מ(?:-| )?\s*(\d+)", json_str) # Hebrew in JSON might be escaped though
+                 json_price_match = re.search(r"החל מ(?:-| )?\s*(\d+)", json_str) 
                  if json_price_match:
                      return int(json_price_match.group(1))
         except Exception:

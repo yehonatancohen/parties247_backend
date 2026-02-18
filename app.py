@@ -3283,8 +3283,10 @@ class PartyUpdateSchema(BaseModel):
     originalUrl: str | None = None
     canonicalUrl: str | None = None
     goOutUrl: str | None = None
+    goOutUrl: str | None = None
     referralCode: str | None = None
     pixelId: str | None = None
+    ticketPrice: int | None = None
     class Config:
         extra = "forbid"
 
@@ -3481,7 +3483,17 @@ def scrape_party_details(url: str):
             "areas": classification["areas"],
             "originalUrl": url,
             "canonicalUrl": canonical,
+            "ticketPrice": None,
         }
+
+        # Extract ticket price from raw text
+        price_match = re.search(r"החל מ-?(\d+)", response.text)
+        if price_match:
+            try:
+               party_details["ticketPrice"] = int(price_match.group(1))
+            except (ValueError, TypeError):
+               pass
+
         if go_out:
             party_details["goOutUrl"] = go_out
 

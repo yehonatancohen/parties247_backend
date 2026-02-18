@@ -33,13 +33,18 @@ from bson.objectid import ObjectId
 import requests
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, ValidationError
+from flask_apscheduler import APScheduler
 
 # --- App setup ---
 load_dotenv()
 app = Flask(__name__)
 app.config["RATELIMIT_HEADERS_ENABLED"] = True
+app.config["SCHEDULER_API_ENABLED"] = True
 CORS(app)
 limiter = Limiter(get_remote_address, app=app)
+scheduler = APScheduler()
+scheduler.init_app(app)
+scheduler.start()
 logging.basicConfig(level=logging.INFO)
 
 CANONICAL_BASE_URL = (os.environ.get("CANONICAL_BASE_URL") or "https://parties247-website.vercel.app").rstrip("/")
@@ -3507,6 +3512,81 @@ def scrape_party_details(url: str):
     except Exception as e:
         app.logger.error(f"[SCRAPER] error: {e}")
         raise
+
+def scrape_ticket_price_only(url: str) -> int | None:
+    if not is_url_allowed(url):
+        return None
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(url, headers=headers, timeout=10)
+        price_match = re.search(r"החל מ-?(\d+)", response.text)
+        if price_match:
+            return int(price_match.group(1))
+    except Exception as e:
+        app.logger.warning(f"[PRICE SCAN] Error fetching {url}: {e}")
+    return None
+
+@scheduler.task("cron", id="daily_price_scan", hour=0)
+def scheduled_price_scan():
+    with app.app_context():
+        app.logger.info("[PRICE SCAN] Starting daily price scan...")
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=1)
+        
+        # Determine "active" parties by checking if they are not significantly in the past
+        # Since 'date' might be string, we iterate and check. 
+        # For efficiency, we can limit to parties created/updated recently or just scan all since dataset isn't huge.
+        cursor = parties_collection.find({})
+        count = 0
+        updated = 0
+            
+        for party in cursor:
+            try:
+                p_date_val = party.get("date") or party.get("startsAt")
+                p_date = parse_datetime(p_date_val)
+                
+                # If party is more than 24h old (past), skip update
+                if p_date and p_date < cutoff:
+                    continue
+                
+                url = party.get("originalUrl") or party.get("goOutUrl")
+                if not url:
+                    continue
+
+                new_price = scrape_ticket_price_only(url)
+                
+                # Update if price is found and different (or if it was missing)
+                # Note: If new_price is None, we DO NOT clear the existing price, as scraping might fail temporarily.
+                old_price = party.get("ticketPrice")
+                
+                if new_price is not None and new_price != old_price:
+                    parties_collection.update_one(
+                        {"_id": party["_id"]},
+                        {"$set": {"ticketPrice": new_price}}
+                    )
+                    updated += 1
+                count += 1
+            except Exception as e:
+                app.logger.error(f"[PRICE SCAN] Error processing party {party.get('_id')}: {e}")
+                continue
+                
+        app.logger.info(f"[PRICE SCAN] Completed. Checked {count} parties, updated {updated}.")
+        return {"checked": count, "updated": updated}
+
+@app.route("/api/admin/update-prices", methods=["POST"])
+@protect
+def manual_price_scan():
+    try:
+        # Run in background to avoid timeout? Or just run it. 
+        # It's lightweight so it should be fine, but if there are many parties, it might timeout.
+        # Let's run it directly for now as requested "scan all parties".
+        # If the user has many parties, we might want to thread it.
+        # But given the user said "only price so it wont be a long process", we assume it's fast enough.
+        # We'll just call the function.
+        result = scheduled_price_scan() 
+        return jsonify({"message": "Price scan completed.", "details": result}), 200
+    except Exception as e:
+        return jsonify({"message": "Error running price scan", "error": str(e)}), 500
 
 # --- Routes ---
 

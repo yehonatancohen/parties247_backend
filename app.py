@@ -3419,6 +3419,25 @@ def get_tags(text: str, location: str) -> list:
             tags.append(tag)
     return list(set(tags))
 
+def _extract_price_from_schema_org(schema_org) -> float | None:
+    """
+    Parse the schemaOrg FAQPage from go-out.co __NEXT_DATA__ to extract the
+    final ticket price (including service fee).
+    FAQ answer contains e.g. "מתחילים ב-86.80₪ (מחיר סופי כולל עמלות)"
+    """
+    if not schema_org:
+        return None
+    faq_items = schema_org if isinstance(schema_org, list) else [schema_org]
+    for faq_item in faq_items:
+        if not faq_item or faq_item.get("@type") != "FAQPage":
+            continue
+        for question in faq_item.get("mainEntity", []):
+            answer_text = question.get("acceptedAnswer", {}).get("text", "")
+            m = re.search(r"([\d]+\.?\d*)₪", answer_text)
+            if m:
+                return round(float(m.group(1)), 2)
+    return None
+
 # --- Scraper ---
 def scrape_party_details(url: str):
     if not is_url_allowed(url):
@@ -3491,12 +3510,10 @@ def scrape_party_details(url: str):
             "ticketPrice": None,
         }
 
-        # Extract ticket price from TicketTypes in __NEXT_DATA__ (most reliable source)
-        ticket_types = event_data.get("TicketTypes", [])
-        if ticket_types:
-            prices = [t["Price"] for t in ticket_types if t.get("Price") is not None]
-            if prices:
-                party_details["ticketPrice"] = int(min(prices))
+        # Extract ticket price from schemaOrg FAQ — contains the final price including service fee
+        # e.g. "מתחילים ב-86.80₪ (מחיר סופי כולל עמלות)"
+        ticket_price = _extract_price_from_schema_org(event_data.get("schemaOrg"))
+        party_details["ticketPrice"] = ticket_price
 
         if go_out:
             party_details["goOutUrl"] = go_out
@@ -3527,18 +3544,16 @@ def scrape_ticket_price_only(url: str) -> int | None:
              response.encoding = 'utf-8'
              
         # Parse TicketTypes from __NEXT_DATA__ (most reliable source — always present,
-        # handles multiple ticket tiers, no dependency on rendered HTML text)
+        # handles multiple ticket tiers, includes service fee)
         try:
             soup = BeautifulSoup(response.text, "html.parser")
             script_tag = soup.find("script", {"id": "__NEXT_DATA__"})
             if script_tag and script_tag.string:
                 json_data = json.loads(script_tag.string)
                 event_data = json_data.get("props", {}).get("pageProps", {}).get("event", {})
-                ticket_types = event_data.get("TicketTypes", [])
-                if ticket_types:
-                    prices = [t["Price"] for t in ticket_types if t.get("Price") is not None]
-                    if prices:
-                        return int(min(prices))
+                price = _extract_price_from_schema_org(event_data.get("schemaOrg"))
+                if price is not None:
+                    return price
         except Exception:
             pass
 

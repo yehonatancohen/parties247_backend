@@ -3492,7 +3492,7 @@ def scrape_party_details(url: str):
         }
 
         # Extract ticket price from raw text
-        price_match = re.search(r"החל מ-?(\d+)", response.text)
+        price_match = re.search(r"החל מ\s*-?\s*(\d+)", response.text)
         if price_match:
             try:
                party_details["ticketPrice"] = int(price_match.group(1))
@@ -3546,7 +3546,7 @@ def scrape_ticket_price_only(url: str) -> int | None:
                                 offer_list = offers if isinstance(offers, list) else [offers]
                                 for offer in offer_list:
                                     price = offer.get("price")
-                                    if price:
+                                    if price is not None and str(price) != "":
                                         return int(float(price))
                 except Exception:
                     continue
@@ -3555,18 +3555,18 @@ def scrape_ticket_price_only(url: str) -> int | None:
 
         # Regex to find "החל מ-X" or "החל מ X"
         # Handles potential whitespace around hyphen
-        price_match = re.search(r"החל מ(?:-| )?\s*(\d+)", response.text)
-        
+        price_match = re.search(r"החל מ\s*-?\s*(\d+)", response.text)
+
         if price_match:
             return int(price_match.group(1))
-            
+
         # Fallback: Look for specific JSON structure in __NEXT_DATA__ if simple regex fails
         try:
             script_tag = soup.find("script", {"id": "__NEXT_DATA__"})
             if script_tag:
                  # Just re-search the JSON string for the pattern as it might be cleaner text
                  json_str = script_tag.string
-                 json_price_match = re.search(r"החל מ(?:-| )?\s*(\d+)", json_str) 
+                 json_price_match = re.search(r"החל מ\s*-?\s*(\d+)", json_str)
                  if json_price_match:
                      return int(json_price_match.group(1))
         except Exception:

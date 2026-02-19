@@ -3491,13 +3491,12 @@ def scrape_party_details(url: str):
             "ticketPrice": None,
         }
 
-        # Extract ticket price from raw text
-        price_match = re.search(r"החל מ\s*-?\s*(\d+)", response.text)
-        if price_match:
-            try:
-               party_details["ticketPrice"] = int(price_match.group(1))
-            except (ValueError, TypeError):
-               pass
+        # Extract ticket price from TicketTypes in __NEXT_DATA__ (most reliable source)
+        ticket_types = event_data.get("TicketTypes", [])
+        if ticket_types:
+            prices = [t["Price"] for t in ticket_types if t.get("Price") is not None]
+            if prices:
+                party_details["ticketPrice"] = int(min(prices))
 
         if go_out:
             party_details["goOutUrl"] = go_out
@@ -3527,13 +3526,21 @@ def scrape_ticket_price_only(url: str) -> int | None:
         if response.encoding and response.encoding.lower() not in ('utf-8', 'utf8'):
              response.encoding = 'utf-8'
              
-        # Regex to find "החל מ - X" in the displayed button text (most accurate, reflects the price shown to users)
-        # JSON-LD structured data is intentionally skipped here because go-out.co's JSON-LD price
-        # is the base ticket price before their service fee, causing a ~15 ILS discrepancy.
-        price_match = re.search(r"החל מ\s*-?\s*(\d+)", response.text)
-
-        if price_match:
-            return int(price_match.group(1))
+        # Parse TicketTypes from __NEXT_DATA__ (most reliable source — always present,
+        # handles multiple ticket tiers, no dependency on rendered HTML text)
+        try:
+            soup = BeautifulSoup(response.text, "html.parser")
+            script_tag = soup.find("script", {"id": "__NEXT_DATA__"})
+            if script_tag and script_tag.string:
+                json_data = json.loads(script_tag.string)
+                event_data = json_data.get("props", {}).get("pageProps", {}).get("event", {})
+                ticket_types = event_data.get("TicketTypes", [])
+                if ticket_types:
+                    prices = [t["Price"] for t in ticket_types if t.get("Price") is not None]
+                    if prices:
+                        return int(min(prices))
+        except Exception:
+            pass
 
     except Exception as e:
         app.logger.warning(f"[PRICE SCAN] Error fetching {url}: {e}")

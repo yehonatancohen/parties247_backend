@@ -36,8 +36,7 @@ from pydantic import BaseModel, ValidationError
 from flask_apscheduler import APScheduler
 
 # --- App setup ---
-_env_file = os.environ.get("ENV_FILE", ".env")
-load_dotenv(_env_file)
+load_dotenv()
 app = Flask(__name__)
 app.config["RATELIMIT_HEADERS_ENABLED"] = True
 app.config["SCHEDULER_API_ENABLED"] = True

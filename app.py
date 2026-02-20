@@ -3291,7 +3291,7 @@ class PartyUpdateSchema(BaseModel):
     goOutUrl: str | None = None
     referralCode: str | None = None
     pixelId: str | None = None
-    ticketPrice: int | None = None
+    ticketPrice: float | None = None
     class Config:
         extra = "forbid"
 

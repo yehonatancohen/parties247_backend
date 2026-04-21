@@ -3292,6 +3292,7 @@ class PartyUpdateSchema(BaseModel):
     referralCode: str | None = None
     pixelId: str | None = None
     ticketPrice: float | None = None
+    soldOut: bool | None = None
     class Config:
         extra = "forbid"
 
@@ -3419,6 +3420,70 @@ def get_tags(text: str, location: str) -> list:
             tags.append(tag)
     return list(set(tags))
 
+def _extract_price_from_tickets(event_data: dict) -> float | None:
+    """
+    Extract the minimum available final ticket price from go-out's Tickets array.
+    Final price = Price * (1 + Commision/100) where Commision is per-ticket commission.
+    Skips sold-out and inactive tiers.
+    """
+    tickets = event_data.get("Tickets")
+    if not isinstance(tickets, list) or not tickets:
+        return None
+
+    min_price: float | None = None
+    for t in tickets:
+        if not isinstance(t, dict):
+            continue
+        if not t.get("Active", True):
+            continue
+        amount = t.get("Amount", 0)
+        sold = t.get("sold", 0)
+        try:
+            if int(sold) >= int(amount):
+                continue
+        except (TypeError, ValueError):
+            pass
+        try:
+            base = float(t["Price"])
+            commission = float(t.get("Commision", 0))  # go-out misspells "Commission"
+            final = round(base * (1 + commission / 100), 2)
+            if final > 0 and (min_price is None or final < min_price):
+                min_price = final
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    return min_price
+
+
+def _is_sold_out(event_data: dict) -> bool:
+    """
+    Return True when all tickets for the event are sold out.
+    Uses go-out's pre-computed cheapestTicket field (None = sold out) and
+    falls back to inspecting the Tickets array directly.
+    """
+    if "cheapestTicket" in event_data and event_data.get("cheapestTicket") is None:
+        return True
+    tickets = event_data.get("Tickets") or []
+    if isinstance(tickets, list) and tickets:
+        for t in tickets:
+            if not isinstance(t, dict):
+                continue
+            if not t.get("Active", True):
+                continue
+            try:
+                if int(t.get("sold", 0)) < int(t.get("Amount", 1)):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
+    return False
+
+
+def _extract_price_from_ticket_types(event_data: dict) -> float | None:
+    """Legacy wrapper — go-out uses 'Tickets', not 'TicketTypes'."""
+    return _extract_price_from_tickets(event_data)
+
+
 def _extract_price_from_schema_org(schema_org) -> float | None:
     """
     Parse the schemaOrg FAQPage from go-out.co __NEXT_DATA__ to extract the
@@ -3433,9 +3498,10 @@ def _extract_price_from_schema_org(schema_org) -> float | None:
             continue
         for question in faq_item.get("mainEntity", []):
             answer_text = question.get("acceptedAnswer", {}).get("text", "")
-            m = re.search(r"([\d]+\.?\d*)₪", answer_text)
+            m = re.search(r"([\d,]+\.?\d*)₪", answer_text)
             if m:
-                return round(float(m.group(1)), 2)
+                price_str = m.group(1).replace(",", "")
+                return round(float(price_str), 2)
     return None
 
 # --- Scraper ---
@@ -3510,10 +3576,13 @@ def scrape_party_details(url: str):
             "ticketPrice": None,
         }
 
-        # Extract ticket price from schemaOrg FAQ — contains the final price including service fee
-        # e.g. "מתחילים ב-86.80₪ (מחיר סופי כולל עמלות)"
-        ticket_price = _extract_price_from_schema_org(event_data.get("schemaOrg"))
+        sold_out = _is_sold_out(event_data)
+        ticket_price = None if sold_out else (
+            _extract_price_from_schema_org(event_data.get("schemaOrg"))
+            or _extract_price_from_tickets(event_data)
+        )
         party_details["ticketPrice"] = ticket_price
+        party_details["soldOut"] = sold_out
 
         if go_out:
             party_details["goOutUrl"] = go_out
@@ -3529,7 +3598,11 @@ def scrape_party_details(url: str):
         app.logger.error(f"[SCRAPER] error: {e}")
         raise
 
-def scrape_ticket_price_only(url: str) -> int | None:
+def scrape_ticket_info(url: str) -> dict | None:
+    """
+    Fetch a go-out event page and return {"price": float|None, "soldOut": bool}.
+    Returns None if the page couldn't be fetched at all (network error).
+    """
     if not is_url_allowed(url):
         return None
     try:
@@ -3539,72 +3612,70 @@ def scrape_ticket_price_only(url: str) -> int | None:
             "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
         }
         response = requests.get(url, headers=headers, timeout=15)
-        # Force UTF-8 encoding for Hebrew content if not automatically detected correctly
         if response.encoding and response.encoding.lower() not in ('utf-8', 'utf8'):
-             response.encoding = 'utf-8'
-             
-        # Parse TicketTypes from __NEXT_DATA__ (most reliable source — always present,
-        # handles multiple ticket tiers, includes service fee)
-        try:
-            soup = BeautifulSoup(response.text, "html.parser")
-            script_tag = soup.find("script", {"id": "__NEXT_DATA__"})
-            if script_tag and script_tag.string:
-                json_data = json.loads(script_tag.string)
-                event_data = json_data.get("props", {}).get("pageProps", {}).get("event", {})
-                price = _extract_price_from_schema_org(event_data.get("schemaOrg"))
-                if price is not None:
-                    return price
-        except Exception:
-            pass
+            response.encoding = 'utf-8'
 
+        soup = BeautifulSoup(response.text, "html.parser")
+        script_tag = soup.find("script", {"id": "__NEXT_DATA__"})
+        if script_tag and script_tag.string:
+            json_data = json.loads(script_tag.string)
+            event_data = json_data.get("props", {}).get("pageProps", {}).get("event", {})
+            sold_out = _is_sold_out(event_data)
+            price = None if sold_out else (
+                _extract_price_from_schema_org(event_data.get("schemaOrg"))
+                or _extract_price_from_tickets(event_data)
+            )
+            return {"price": price, "soldOut": sold_out}
     except Exception as e:
         app.logger.warning(f"[PRICE SCAN] Error fetching {url}: {e}")
     return None
 
-@scheduler.task("cron", id="daily_price_scan", hour=0)
+
+def scrape_ticket_price_only(url: str) -> float | None:
+    """Legacy wrapper kept for any external callers."""
+    info = scrape_ticket_info(url)
+    return info["price"] if info else None
+
+@scheduler.task("cron", id="price_scan", hour="*/2")
 def scheduled_price_scan():
     with app.app_context():
-        app.logger.info("[PRICE SCAN] Starting daily price scan...")
+        app.logger.info("[PRICE SCAN] Starting scan...")
         now = datetime.now(timezone.utc)
         cutoff = now - timedelta(days=1)
-        
-        # Determine "active" parties by checking if they are not significantly in the past
-        # Since 'date' might be string, we iterate and check. 
-        # For efficiency, we can limit to parties created/updated recently or just scan all since dataset isn't huge.
+
         cursor = parties_collection.find({})
         count = 0
         updated = 0
-            
+
         for party in cursor:
             try:
                 p_date_val = party.get("date") or party.get("startsAt")
                 p_date = parse_datetime(p_date_val)
-                
-                # If party is more than 24h old (past), skip update
                 if p_date and p_date < cutoff:
                     continue
-                
+
                 url = party.get("originalUrl") or party.get("goOutUrl")
                 if not url:
                     continue
 
-                new_price = scrape_ticket_price_only(url)
-                
-                # Update if price is found and different (or if it was missing)
-                # Note: If new_price is None, we DO NOT clear the existing price, as scraping might fail temporarily.
-                old_price = party.get("ticketPrice")
-                
-                if new_price is not None and new_price != old_price:
-                    parties_collection.update_one(
-                        {"_id": party["_id"]},
-                        {"$set": {"ticketPrice": new_price}}
-                    )
+                info = scrape_ticket_info(url)
+                if info is None:
+                    continue  # network error — leave existing values intact
+
+                changes = {}
+                if info["price"] != party.get("ticketPrice"):
+                    changes["ticketPrice"] = info["price"]
+                if info["soldOut"] != party.get("soldOut", False):
+                    changes["soldOut"] = info["soldOut"]
+
+                if changes:
+                    parties_collection.update_one({"_id": party["_id"]}, {"$set": changes})
                     updated += 1
                 count += 1
             except Exception as e:
                 app.logger.error(f"[PRICE SCAN] Error processing party {party.get('_id')}: {e}")
                 continue
-                
+
         app.logger.info(f"[PRICE SCAN] Completed. Checked {count} parties, updated {updated}.")
         return {"checked": count, "updated": updated}
 

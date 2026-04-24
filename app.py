@@ -110,11 +110,41 @@ def absolute_url(path: str) -> str:
     return f"{CANONICAL_BASE_URL}{path}"
 
 
+_HE_TO_LATIN = {
+    'א': 'a', 'ב': 'b', 'ג': 'g', 'ד': 'd', 'ה': 'h', 'ו': 'v',
+    'ז': 'z', 'ח': 'ch', 'ט': 't', 'י': 'y', 'כ': 'k', 'ך': 'k',
+    'ל': 'l', 'מ': 'm', 'ם': 'm', 'נ': 'n', 'ן': 'n', 'ס': 's',
+    'ע': 'a', 'פ': 'p', 'ף': 'f', 'צ': 'ts', 'ץ': 'ts', 'ק': 'k',
+    'ר': 'r', 'ש': 'sh', 'ת': 't',
+}
+
+def _transliterate_hebrew(text: str) -> str:
+    return ''.join(_HE_TO_LATIN.get(c, c) for c in text)
+
 def slugify_value(value: str | None) -> str | None:
     if not value:
         return None
+    value = _transliterate_hebrew(value)
     slug = re.sub(r"[^0-9a-zA-Z]+", "-", value.lower()).strip("-")
     return slug or None
+
+def slugify_party(name: str | None, date_str: str | None) -> str | None:
+    """Generate an SEO-friendly slug from party name + date (month-year)."""
+    base = slugify_value(name)
+    if not base:
+        return None
+    if date_str:
+        try:
+            dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            month = dt.strftime("%B").lower()   # e.g. "april"
+            year = str(dt.year)                 # e.g. "2026"
+            base = f"{base}-{month}-{year}"
+        except Exception:
+            pass
+    # Trim to 80 chars at a word boundary
+    if len(base) > 80:
+        base = base[:80].rsplit("-", 1)[0]
+    return base or None
 
 
 def parse_datetime(value) -> datetime | None:
@@ -3821,7 +3851,7 @@ def add_party():
         party_data = scrape_party_details(url)
         referral = default_referral_code()
         apply_default_referral(party_data, referral)
-        party_data.setdefault("slug", slugify_value(party_data.get("name")))
+        party_data.setdefault("slug", slugify_party(party_data.get("name"), party_data.get("date")))
         canonical = party_data["canonicalUrl"]
         res = parties_collection.update_one(
             {"$or": [{"canonicalUrl": canonical}, {"goOutUrl": canonical}]},

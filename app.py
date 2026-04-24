@@ -54,7 +54,7 @@ INDEXNOW_KEY_LOCATION = os.environ.get("INDEXNOW_KEY_LOCATION")
 REVALIDATE_ENDPOINT = os.environ.get("REVALIDATE_ENDPOINT")
 REVALIDATE_SECRET = os.environ.get("REVALIDATE_SECRET")
 
-EVENT_CACHE_SECONDS = 1800
+EVENT_CACHE_SECONDS = 300
 LIST_CACHE_SECONDS = 600
 FEED_CACHE_SECONDS = 900
 ICS_CACHE_SECONDS = 3600
@@ -3636,7 +3636,7 @@ def scrape_ticket_price_only(url: str) -> float | None:
     info = scrape_ticket_info(url)
     return info["price"] if info else None
 
-@scheduler.task("cron", id="price_scan", hour="*/2")
+@scheduler.task("cron", id="price_scan", minute="*/30")
 def scheduled_price_scan():
     with app.app_context():
         app.logger.info("[PRICE SCAN] Starting scan...")

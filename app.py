@@ -34,6 +34,7 @@ import requests
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, ValidationError
 from flask_apscheduler import APScheduler
+import threading
 
 # --- App setup ---
 load_dotenv()
@@ -46,6 +47,30 @@ scheduler = APScheduler()
 scheduler.init_app(app)
 scheduler.start()
 logging.basicConfig(level=logging.INFO)
+
+# --- Go-Out Scraper + Telegram Bot config ---
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_MANAGER_CHAT_ID = os.environ.get("TELEGRAM_MANAGER_CHAT_ID", "")
+
+GOOUT_ACCOUNTS_CONFIG = []
+for idx in ("1", "2"):
+    email = os.environ.get(f"GOOUT_ACCOUNT{idx}_EMAIL", "")
+    password = os.environ.get(f"GOOUT_ACCOUNT{idx}_PASSWORD", "")
+    referral = os.environ.get(f"GOOUT_ACCOUNT{idx}_REFERRAL", "")
+    if email and password:
+        GOOUT_ACCOUNTS_CONFIG.append({
+            "account_id": f"account{idx}",
+            "email": email,
+            "password": password,
+            "referral": referral,
+        })
+
+GOOUT_SCRAPE_HOUR = int(os.environ.get("GOOUT_SCRAPE_HOUR", "6"))
+
+# Telegram manager and Go-Out DB references (initialised after MongoDB)
+telegram_mgr = None
+goout_sessions_collection = None
+goout_pending_collection = None
 
 CANONICAL_BASE_URL = (os.environ.get("CANONICAL_BASE_URL") or "https://parties247-website.vercel.app").rstrip("/")
 INDEXNOW_KEY = os.environ.get("INDEXNOW_KEY")
@@ -450,6 +475,13 @@ try:
         expireAfterSeconds=172800,
     )
 
+    # --- Go-Out scraper collections ---
+    goout_sessions_collection = db.goout_sessions
+    goout_pending_collection = db.goout_pending
+    ensure_index(goout_sessions_collection, [("account_id", 1)], name="unique_account", unique=True)
+    ensure_index(goout_pending_collection, [("goOutUrl", 1)], name="pending_goout_url")
+    ensure_index(goout_pending_collection, [("status", 1)], name="pending_status")
+
     app.logger.info("Connected to MongoDB and ensured indexes.")
 except Exception as e:
     app.logger.error(f"Error connecting to MongoDB Atlas: {e}")
@@ -461,6 +493,8 @@ except Exception as e:
     party_analytics_collection = None
     visitor_analytics_collection = None
     analytics_collection = None
+    goout_sessions_collection = None
+    goout_pending_collection = None
 
 
 def record_setting_hit(key: str, extra: dict | None = None):
@@ -5362,6 +5396,178 @@ def classify_party_data(title: str, description: str, location: str) -> dict:
 @protect
 def verify_token():
     return jsonify({"message": "Token is valid."}), 200
+
+
+# ===================================================================
+# Go-Out Scraper Integration
+# ===================================================================
+
+def _get_goout_db():
+    """Return the MongoDB database handle for Go-Out modules."""
+    try:
+        return db
+    except NameError:
+        return None
+
+
+def _trigger_goout_scrape():
+    """Run the Go-Out daily scrape in a background thread."""
+    def _run():
+        with app.app_context():
+            from goout_scraper import GoOutAccount, run_daily_scrape
+            accounts = [
+                GoOutAccount(**cfg) for cfg in GOOUT_ACCOUNTS_CONFIG
+            ]
+            if not accounts:
+                app.logger.warning("[GOOUT] No accounts configured.")
+                return
+            run_daily_scrape(accounts, _get_goout_db(), telegram_mgr, app)
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+
+@scheduler.task("cron", id="goout_daily_scrape", hour=GOOUT_SCRAPE_HOUR, minute=0)
+def scheduled_goout_scrape():
+    """Daily scrape of Go-Out organizer panels for new events."""
+    app.logger.info("[GOOUT] Scheduled daily scrape triggered.")
+    _trigger_goout_scrape()
+
+
+# --- Go-Out Admin API ---
+
+@app.route("/api/admin/goout/status", methods=["GET"])
+@protect
+def goout_status():
+    """Return scraper status and pending counts."""
+    pending_count = 0
+    sessions = []
+    try:
+        if goout_pending_collection is not None:
+            pending_count = goout_pending_collection.count_documents({"status": "pending"})
+    except Exception:
+        pass
+    try:
+        if goout_sessions_collection is not None:
+            for doc in goout_sessions_collection.find({}):
+                doc.pop("_id", None)
+                doc.pop("storage_state", None)  # Don't expose session tokens
+                sessions.append(doc)
+    except Exception:
+        pass
+    return jsonify({
+        "pendingCount": pending_count,
+        "accounts": len(GOOUT_ACCOUNTS_CONFIG),
+        "sessions": sessions,
+    }), 200
+
+
+@app.route("/api/admin/goout/scrape", methods=["POST"])
+@protect
+def goout_trigger_scrape():
+    """Manually trigger a Go-Out scrape."""
+    _trigger_goout_scrape()
+    return jsonify({"message": "Scrape triggered in background."}), 202
+
+
+@app.route("/api/admin/goout/pending", methods=["GET"])
+@protect
+def goout_list_pending():
+    """List pending parties from Go-Out scrape."""
+    if goout_pending_collection is None:
+        return jsonify({"message": "Database unavailable."}), 503
+    try:
+        docs = list(goout_pending_collection.find({"status": "pending"}).limit(50))
+        for doc in docs:
+            doc["_id"] = str(doc["_id"])
+        return jsonify(docs), 200
+    except Exception as exc:
+        return jsonify({"message": str(exc)}), 500
+
+
+@app.route("/api/admin/goout/approve/<pending_id>", methods=["POST"])
+@protect
+def goout_approve(pending_id):
+    """Approve a pending Go-Out party."""
+    if goout_pending_collection is None or parties_collection is None:
+        return jsonify({"message": "Database unavailable."}), 503
+    try:
+        doc = goout_pending_collection.find_one({"_id": ObjectId(pending_id)})
+    except Exception:
+        return jsonify({"message": "Invalid ID."}), 400
+    if not doc or doc.get("status") != "pending":
+        return jsonify({"message": "Not found or already processed."}), 404
+
+    party_data = doc.get("party_data", {})
+    party_data.setdefault("slug", slugify_party(party_data.get("name"), party_data.get("date")))
+    canonical = party_data.get("canonicalUrl")
+    go_out_url = party_data.get("goOutUrl")
+    or_clauses = []
+    if canonical:
+        or_clauses.append({"canonicalUrl": canonical})
+    if go_out_url:
+        or_clauses.append({"goOutUrl": go_out_url})
+    query = {"$or": or_clauses} if or_clauses else {"name": party_data.get("name")}
+
+    try:
+        parties_collection.update_one(query, {"$setOnInsert": party_data}, upsert=True)
+        goout_pending_collection.update_one(
+            {"_id": ObjectId(pending_id)},
+            {"$set": {"status": "approved", "approved_at": datetime.now(timezone.utc)}},
+        )
+        event_view = normalize_event(party_data)
+        notify_indexers([event_view.get("canonicalUrl")])
+        trigger_revalidation(event_related_paths(event_view))
+        return jsonify({"message": "Party approved and added."}), 200
+    except Exception as exc:
+        return jsonify({"message": str(exc)}), 500
+
+
+@app.route("/api/admin/goout/reject/<pending_id>", methods=["POST"])
+@protect
+def goout_reject(pending_id):
+    """Reject a pending Go-Out party."""
+    if goout_pending_collection is None:
+        return jsonify({"message": "Database unavailable."}), 503
+    try:
+        result = goout_pending_collection.update_one(
+            {"_id": ObjectId(pending_id)},
+            {"$set": {"status": "rejected", "rejected_at": datetime.now(timezone.utc)}},
+        )
+        if result.modified_count == 0:
+            return jsonify({"message": "Not found."}), 404
+        return jsonify({"message": "Party rejected."}), 200
+    except Exception as exc:
+        return jsonify({"message": str(exc)}), 500
+
+
+# --- Telegram Bot + Go-Out Startup ---
+
+def _init_telegram_bot():
+    """Initialise and start the Telegram manager bot."""
+    global telegram_mgr
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_MANAGER_CHAT_ID:
+        app.logger.warning("[TELEGRAM] Bot token or chat ID not configured; bot disabled.")
+        return
+    try:
+        from telegram_manager import TelegramManager
+        telegram_mgr = TelegramManager(
+            token=TELEGRAM_BOT_TOKEN,
+            manager_chat_id=TELEGRAM_MANAGER_CHAT_ID,
+            db_getter=_get_goout_db,
+        )
+        telegram_mgr.on_scrape_requested = _trigger_goout_scrape
+        telegram_mgr.start_in_background()
+        app.logger.info("[TELEGRAM] Bot started.")
+    except Exception as exc:
+        app.logger.error(f"[TELEGRAM] Failed to start bot: {exc}")
+
+
+# Start the Telegram bot when the module loads (after MongoDB init)
+try:
+    _init_telegram_bot()
+except Exception as exc:
+    app.logger.error(f"[TELEGRAM] Init error: {exc}")
+
 
 if __name__ == "__main__":
     flask_env = os.environ.get("FLASK_ENV", "production").lower()

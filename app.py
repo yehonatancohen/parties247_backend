@@ -51,8 +51,6 @@ logging.basicConfig(level=logging.INFO)
 # --- Go-Out / VM scraper config ---
 # The scraper VM calls back with this token; backend verifies it.
 SERVICE_TOKEN: str = os.environ.get("SERVICE_TOKEN", "")
-# URL of the goout-scraper VM service (used to proxy manual-scrape requests).
-GOOUT_SCRAPER_URL: str = os.environ.get("GOOUT_SCRAPER_URL", "").rstrip("/")
 
 goout_sessions_collection = None
 goout_pending_collection = None
@@ -5421,22 +5419,6 @@ def goout_status():
     }), 200
 
 
-@app.route("/api/admin/goout/manual-scrape", methods=["POST"])
-@protect
-def goout_manual_scrape():
-    """Proxy a manual-scrape request to the VM goout-scraper service."""
-    if not GOOUT_SCRAPER_URL:
-        return jsonify({"message": "GOOUT_SCRAPER_URL not configured."}), 503
-    try:
-        resp = requests.post(
-            f"{GOOUT_SCRAPER_URL}/scrape",
-            headers={"X-Service-Token": SERVICE_TOKEN},
-            timeout=10,
-        )
-        return jsonify(resp.json()), resp.status_code
-    except Exception as exc:
-        app.logger.error(f"[GOOUT] Failed to contact scraper VM: {exc}")
-        return jsonify({"message": "Could not reach scraper service."}), 502
 
 
 @app.route("/api/admin/goout/pending", methods=["GET"])
@@ -5511,6 +5493,51 @@ def goout_reject(pending_id):
         if result.modified_count == 0:
             return jsonify({"message": "Not found."}), 404
         return jsonify({"message": "Party rejected."}), 200
+    except Exception as exc:
+        return jsonify({"message": str(exc)}), 500
+
+
+@app.route("/api/admin/goout/edit-approve/<pending_id>", methods=["POST"])
+@protect
+def goout_edit_approve(pending_id):
+    """Edit fields then approve a pending Go-Out party."""
+    if goout_pending_collection is None or parties_collection is None:
+        return jsonify({"message": "Database unavailable."}), 503
+    data = request.get_json(silent=True) or {}
+    edits: dict = data.get("edits", {})
+    try:
+        doc = goout_pending_collection.find_one({"_id": ObjectId(pending_id)})
+    except Exception:
+        return jsonify({"message": "Invalid ID."}), 400
+    if not doc or doc.get("status") != "pending":
+        return jsonify({"message": "Not found or already processed."}), 404
+
+    party_data = {**doc.get("party_data", {}), **edits}
+    party_data.setdefault("slug", slugify_party(party_data.get("name"), party_data.get("date")))
+    canonical = party_data.get("canonicalUrl")
+    go_out_url = party_data.get("goOutUrl")
+    or_clauses = []
+    if canonical:
+        or_clauses.append({"canonicalUrl": canonical})
+    if go_out_url:
+        or_clauses.append({"goOutUrl": go_out_url})
+    query = {"$or": or_clauses} if or_clauses else {"name": party_data.get("name")}
+
+    try:
+        result = parties_collection.update_one(query, {"$setOnInsert": party_data}, upsert=True)
+        party_db_id = str(result.upserted_id) if result.upserted_id else None
+        if not party_db_id:
+            existing = parties_collection.find_one(query, {"_id": 1})
+            if existing:
+                party_db_id = str(existing["_id"])
+        goout_pending_collection.update_one(
+            {"_id": ObjectId(pending_id)},
+            {"$set": {"status": "approved", "approved_at": datetime.now(timezone.utc), "party_data": party_data}},
+        )
+        event_view = normalize_event(party_data)
+        notify_indexers([event_view.get("canonicalUrl")])
+        trigger_revalidation(event_related_paths(event_view))
+        return jsonify({"message": "Party edited and approved.", "party_db_id": party_db_id}), 200
     except Exception as exc:
         return jsonify({"message": str(exc)}), 500
 

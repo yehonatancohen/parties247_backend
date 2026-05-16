@@ -48,31 +48,14 @@ scheduler.init_app(app)
 scheduler.start()
 logging.basicConfig(level=logging.INFO)
 
-# --- Go-Out Scraper + Telegram Bot config ---
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_MANAGER_CHAT_ID = os.environ.get("TELEGRAM_MANAGER_CHAT_ID", "")
+# --- Go-Out / VM scraper config ---
+# The scraper VM calls back with this token; backend verifies it.
+SERVICE_TOKEN: str = os.environ.get("SERVICE_TOKEN", "")
+# URL of the goout-scraper VM service (used to proxy manual-scrape requests).
+GOOUT_SCRAPER_URL: str = os.environ.get("GOOUT_SCRAPER_URL", "").rstrip("/")
 
-GOOUT_ACCOUNTS_CONFIG = []
-for idx in ("1", "2"):
-    email = os.environ.get(f"GOOUT_ACCOUNT{idx}_EMAIL", "")
-    password = os.environ.get(f"GOOUT_ACCOUNT{idx}_PASSWORD", "")
-    referral = os.environ.get(f"GOOUT_ACCOUNT{idx}_REFERRAL", "")
-    if email and password:
-        GOOUT_ACCOUNTS_CONFIG.append({
-            "account_id": f"account{idx}",
-            "email": email,
-            "password": password,
-            "referral": referral,
-        })
-
-GOOUT_SCRAPE_HOUR = int(os.environ.get("GOOUT_SCRAPE_HOUR", "6"))
-
-# Telegram manager and Go-Out DB references (initialised after MongoDB)
-telegram_mgr = None
 goout_sessions_collection = None
 goout_pending_collection = None
-_goout_scrape_running: bool = False
-_goout_last_scrape: str | None = None
 
 CANONICAL_BASE_URL = (os.environ.get("CANONICAL_BASE_URL") or "https://parties247-website.vercel.app").rstrip("/")
 INDEXNOW_KEY = os.environ.get("INDEXNOW_KEY")
@@ -1297,6 +1280,13 @@ def protect(f):
                 return jsonify({"message": "Invalid token."}), 401
         return jsonify({"message": "Unauthorized."}), 401
     return decorated_function
+
+def _check_service_token() -> bool:
+    """Return True if the request carries the correct service-to-service token."""
+    if not SERVICE_TOKEN:
+        return False
+    return request.headers.get("X-Service-Token", "") == SERVICE_TOKEN
+
 
 def apply_security_headers(response):
     """Apply a minimal set of security headers on every response."""
@@ -5404,48 +5394,6 @@ def verify_token():
 # Go-Out Scraper Integration
 # ===================================================================
 
-def _get_goout_db():
-    """Return the MongoDB database handle for Go-Out modules."""
-    try:
-        return db
-    except NameError:
-        return None
-
-
-def _trigger_goout_scrape(force_send: bool = False):
-    """Run the Go-Out scrape in a background thread."""
-    global _goout_scrape_running, _goout_last_scrape
-    if _goout_scrape_running:
-        app.logger.info("[GOOUT] Scrape already running, skipping.")
-        return
-    _goout_scrape_running = True
-
-    def _run():
-        global _goout_scrape_running, _goout_last_scrape
-        try:
-            with app.app_context():
-                from goout_scraper import GoOutAccount, run_daily_scrape
-                accounts = [GoOutAccount(**cfg) for cfg in GOOUT_ACCOUNTS_CONFIG]
-                if not accounts:
-                    app.logger.warning("[GOOUT] No accounts configured.")
-                    return
-                run_daily_scrape(accounts, _get_goout_db(), telegram_mgr, app, force_send=force_send)
-        finally:
-            _goout_scrape_running = False
-            from datetime import datetime, timezone
-            _goout_last_scrape = datetime.now(timezone.utc).isoformat()
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-
-
-@scheduler.task("cron", id="goout_daily_scrape", hour=GOOUT_SCRAPE_HOUR, minute=0)
-def scheduled_goout_scrape():
-    """Daily scrape of Go-Out organizer panels for new events."""
-    app.logger.info("[GOOUT] Scheduled daily scrape triggered.")
-    _trigger_goout_scrape()
-
-
 # --- Go-Out Admin API ---
 
 @app.route("/api/admin/goout/status", methods=["GET"])
@@ -5469,27 +5417,26 @@ def goout_status():
         pass
     return jsonify({
         "pendingCount": pending_count,
-        "accounts": len(GOOUT_ACCOUNTS_CONFIG),
-        "isRunning": _goout_scrape_running,
-        "lastRun": _goout_last_scrape,
         "sessions": sessions,
     }), 200
-
-
-@app.route("/api/admin/goout/scrape", methods=["POST"])
-@protect
-def goout_trigger_scrape():
-    """Manually trigger a Go-Out scrape."""
-    _trigger_goout_scrape()
-    return jsonify({"message": "Scrape triggered in background."}), 202
 
 
 @app.route("/api/admin/goout/manual-scrape", methods=["POST"])
 @protect
 def goout_manual_scrape():
-    """Trigger a manual Go-Out scrape that sends ALL found parties."""
-    _trigger_goout_scrape(force_send=True)
-    return jsonify({"message": "Manual scan started. Check Telegram for updates."}), 202
+    """Proxy a manual-scrape request to the VM goout-scraper service."""
+    if not GOOUT_SCRAPER_URL:
+        return jsonify({"message": "GOOUT_SCRAPER_URL not configured."}), 503
+    try:
+        resp = requests.post(
+            f"{GOOUT_SCRAPER_URL}/scrape",
+            headers={"X-Service-Token": SERVICE_TOKEN},
+            timeout=10,
+        )
+        return jsonify(resp.json()), resp.status_code
+    except Exception as exc:
+        app.logger.error(f"[GOOUT] Failed to contact scraper VM: {exc}")
+        return jsonify({"message": "Could not reach scraper service."}), 502
 
 
 @app.route("/api/admin/goout/pending", methods=["GET"])
@@ -5532,7 +5479,12 @@ def goout_approve(pending_id):
     query = {"$or": or_clauses} if or_clauses else {"name": party_data.get("name")}
 
     try:
-        parties_collection.update_one(query, {"$setOnInsert": party_data}, upsert=True)
+        result = parties_collection.update_one(query, {"$setOnInsert": party_data}, upsert=True)
+        party_db_id = str(result.upserted_id) if result.upserted_id else None
+        if not party_db_id:
+            existing = parties_collection.find_one(query, {"_id": 1})
+            if existing:
+                party_db_id = str(existing["_id"])
         goout_pending_collection.update_one(
             {"_id": ObjectId(pending_id)},
             {"$set": {"status": "approved", "approved_at": datetime.now(timezone.utc)}},
@@ -5540,7 +5492,7 @@ def goout_approve(pending_id):
         event_view = normalize_event(party_data)
         notify_indexers([event_view.get("canonicalUrl")])
         trigger_revalidation(event_related_paths(event_view))
-        return jsonify({"message": "Party approved and added."}), 200
+        return jsonify({"message": "Party approved and added.", "party_db_id": party_db_id}), 200
     except Exception as exc:
         return jsonify({"message": str(exc)}), 500
 
@@ -5563,33 +5515,130 @@ def goout_reject(pending_id):
         return jsonify({"message": str(exc)}), 500
 
 
-# --- Telegram Bot + Go-Out Startup ---
+# --- Internal service-to-service endpoints (called by goout-scraper VM) ---
 
-def _init_telegram_bot():
-    """Initialise and start the Telegram manager bot."""
-    global telegram_mgr
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_MANAGER_CHAT_ID:
-        app.logger.warning("[TELEGRAM] Bot token or chat ID not configured; bot disabled.")
-        return
+@app.route("/api/internal/scrape-party", methods=["POST"])
+def internal_scrape_party():
+    if not _check_service_token():
+        return jsonify({"message": "Unauthorized."}), 401
+    data = request.get_json(silent=True) or {}
+    url = data.get("url", "")
+    if not url:
+        return jsonify({"message": "Missing url."}), 400
     try:
-        from telegram_manager import TelegramManager
-        telegram_mgr = TelegramManager(
-            token=TELEGRAM_BOT_TOKEN,
-            manager_chat_id=TELEGRAM_MANAGER_CHAT_ID,
-            db_getter=_get_goout_db,
-        )
-        telegram_mgr.on_scrape_requested = lambda: _trigger_goout_scrape(force_send=True)
-        telegram_mgr.start_in_background()
-        app.logger.info("[TELEGRAM] Bot started.")
+        party_data = scrape_party_details(url)
+        return jsonify(party_data), 200
+    except ValueError as exc:
+        return jsonify({"message": str(exc)}), 400
     except Exception as exc:
-        app.logger.error(f"[TELEGRAM] Failed to start bot: {exc}")
+        app.logger.error(f"[INTERNAL] scrape-party error for {url}: {exc}")
+        return jsonify({"message": str(exc)}), 500
 
 
-# Start the Telegram bot when the module loads (after MongoDB init)
-try:
-    _init_telegram_bot()
-except Exception as exc:
-    app.logger.error(f"[TELEGRAM] Init error: {exc}")
+@app.route("/api/internal/goout/approve/<pending_id>", methods=["POST"])
+def internal_goout_approve(pending_id):
+    if not _check_service_token():
+        return jsonify({"message": "Unauthorized."}), 401
+    if goout_pending_collection is None or parties_collection is None:
+        return jsonify({"message": "Database unavailable."}), 503
+    try:
+        doc = goout_pending_collection.find_one({"_id": ObjectId(pending_id)})
+    except Exception:
+        return jsonify({"message": "Invalid ID."}), 400
+    if not doc or doc.get("status") != "pending":
+        return jsonify({"message": "Not found or already processed."}), 404
+
+    party_data = doc.get("party_data", {})
+    party_data.setdefault("slug", slugify_party(party_data.get("name"), party_data.get("date")))
+    canonical = party_data.get("canonicalUrl")
+    go_out_url = party_data.get("goOutUrl")
+    or_clauses = []
+    if canonical:
+        or_clauses.append({"canonicalUrl": canonical})
+    if go_out_url:
+        or_clauses.append({"goOutUrl": go_out_url})
+    query = {"$or": or_clauses} if or_clauses else {"name": party_data.get("name")}
+
+    try:
+        result = parties_collection.update_one(query, {"$setOnInsert": party_data}, upsert=True)
+        party_db_id = str(result.upserted_id) if result.upserted_id else None
+        if not party_db_id:
+            existing = parties_collection.find_one(query, {"_id": 1})
+            if existing:
+                party_db_id = str(existing["_id"])
+        goout_pending_collection.update_one(
+            {"_id": ObjectId(pending_id)},
+            {"$set": {"status": "approved", "approved_at": datetime.now(timezone.utc)}},
+        )
+        event_view = normalize_event(party_data)
+        notify_indexers([event_view.get("canonicalUrl")])
+        trigger_revalidation(event_related_paths(event_view))
+        return jsonify({"message": "Party approved and added.", "party_db_id": party_db_id}), 200
+    except Exception as exc:
+        return jsonify({"message": str(exc)}), 500
+
+
+@app.route("/api/internal/goout/reject/<pending_id>", methods=["POST"])
+def internal_goout_reject(pending_id):
+    if not _check_service_token():
+        return jsonify({"message": "Unauthorized."}), 401
+    if goout_pending_collection is None:
+        return jsonify({"message": "Database unavailable."}), 503
+    try:
+        result = goout_pending_collection.update_one(
+            {"_id": ObjectId(pending_id)},
+            {"$set": {"status": "rejected", "rejected_at": datetime.now(timezone.utc)}},
+        )
+        if result.modified_count == 0:
+            return jsonify({"message": "Not found."}), 404
+        return jsonify({"message": "Party rejected."}), 200
+    except Exception as exc:
+        return jsonify({"message": str(exc)}), 500
+
+
+@app.route("/api/internal/goout/edit-approve/<pending_id>", methods=["POST"])
+def internal_goout_edit_approve(pending_id):
+    if not _check_service_token():
+        return jsonify({"message": "Unauthorized."}), 401
+    if goout_pending_collection is None or parties_collection is None:
+        return jsonify({"message": "Database unavailable."}), 503
+    data = request.get_json(silent=True) or {}
+    edits: dict = data.get("edits", {})
+    try:
+        doc = goout_pending_collection.find_one({"_id": ObjectId(pending_id)})
+    except Exception:
+        return jsonify({"message": "Invalid ID."}), 400
+    if not doc or doc.get("status") != "pending":
+        return jsonify({"message": "Not found or already processed."}), 404
+
+    party_data = {**doc.get("party_data", {}), **edits}
+    party_data.setdefault("slug", slugify_party(party_data.get("name"), party_data.get("date")))
+    canonical = party_data.get("canonicalUrl")
+    go_out_url = party_data.get("goOutUrl")
+    or_clauses = []
+    if canonical:
+        or_clauses.append({"canonicalUrl": canonical})
+    if go_out_url:
+        or_clauses.append({"goOutUrl": go_out_url})
+    query = {"$or": or_clauses} if or_clauses else {"name": party_data.get("name")}
+
+    try:
+        result = parties_collection.update_one(query, {"$setOnInsert": party_data}, upsert=True)
+        party_db_id = str(result.upserted_id) if result.upserted_id else None
+        if not party_db_id:
+            existing = parties_collection.find_one(query, {"_id": 1})
+            if existing:
+                party_db_id = str(existing["_id"])
+        goout_pending_collection.update_one(
+            {"_id": ObjectId(pending_id)},
+            {"$set": {"status": "approved", "approved_at": datetime.now(timezone.utc), "party_data": party_data}},
+        )
+        event_view = normalize_event(party_data)
+        notify_indexers([event_view.get("canonicalUrl")])
+        trigger_revalidation(event_related_paths(event_view))
+        return jsonify({"message": "Party edited and approved.", "party_db_id": party_db_id}), 200
+    except Exception as exc:
+        return jsonify({"message": str(exc)}), 500
 
 
 if __name__ == "__main__":

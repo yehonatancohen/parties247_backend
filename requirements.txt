@@ -10,5 +10,3 @@ Flask-Limiter
 PyJWT
 bcrypt
 Flask-APScheduler
-playwright
-python-telegram-bot

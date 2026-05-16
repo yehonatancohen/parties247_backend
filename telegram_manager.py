@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 _tfa_requests: dict[str, asyncio.Event] = {}
 _tfa_codes: dict[str, str | None] = {}
 _edit_sessions: dict[int, str] = {}  # chat_msg_id -> pending_id being edited
+_carousel_selections: dict[str, list[str]] = {}  # pending_id -> [carousel_id, ...]
 
 
 class TelegramManager:
@@ -89,6 +90,14 @@ class TelegramManager:
                 return db.parties
         return None
 
+    @property
+    def _carousels_collection(self):
+        if self._db_getter:
+            db = self._db_getter()
+            if db is not None:
+                return db.carousels
+        return None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -119,6 +128,7 @@ class TelegramManager:
         self._app.add_handler(CommandHandler("approve_all", self._cmd_approve_all))
         self._app.add_handler(CommandHandler("sessions", self._cmd_sessions))
         self._app.add_handler(CommandHandler("help", self._cmd_help))
+        self._app.add_handler(CommandHandler("cancel", self._cmd_cancel))
         self._app.add_handler(
             CallbackQueryHandler(self._handle_callback)
         )
@@ -167,6 +177,7 @@ class TelegramManager:
             "/pending — List pending parties\n"
             "/approve\\_all — Approve all pending\n"
             "/sessions — Go-Out session status\n"
+            "/cancel — Cancel current edit session\n"
             "/help — Show this message",
             parse_mode="Markdown",
         )
@@ -206,7 +217,7 @@ class TelegramManager:
     async def _cmd_scrape(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._is_manager(update):
             return
-        await update.message.reply_text("🔄 Triggering scrape... This may take a few minutes.")
+        await update.message.reply_text("🔄 Triggering manual scan... Check here for party messages shortly.")
         if self.on_scrape_requested:
             try:
                 self.on_scrape_requested()
@@ -247,8 +258,8 @@ class TelegramManager:
             return
         approved = 0
         for doc in docs:
-            success = self._approve_pending_party(str(doc["_id"]))
-            if success:
+            party_id = self._approve_pending_party(str(doc["_id"]))
+            if party_id:
                 approved += 1
         await update.message.reply_text(
             f"✅ Approved {approved}/{len(docs)} parties."
@@ -304,70 +315,145 @@ class TelegramManager:
 
         if data.startswith("approve:"):
             pending_id = data.split(":", 1)[1]
-            success = self._approve_pending_party(pending_id)
-            if success:
-                await query.edit_message_text(
-                    query.message.text + "\n\n✅ *APPROVED*",
+            # Fetch party_data before approving so we can do carousel suggestion
+            try:
+                from bson.objectid import ObjectId
+                coll = self._pending_collection
+                doc = coll.find_one({"_id": ObjectId(pending_id)}) if coll else None
+                party_data = doc.get("party_data", {}) if doc else {}
+            except Exception:
+                party_data = {}
+
+            party_db_id = self._approve_pending_party(pending_id)
+            if party_db_id:
+                await query.edit_message_caption(
+                    (query.message.caption or query.message.text or "") + "\n\n✅ *APPROVED*",
+                    parse_mode="Markdown",
+                ) if query.message.photo else await query.edit_message_text(
+                    (query.message.text or "") + "\n\n✅ *APPROVED*",
                     parse_mode="Markdown",
                 )
+                # Send carousel selection as follow-up
+                await self._send_carousel_selection(pending_id, party_data)
             else:
                 await query.edit_message_text(
-                    query.message.text + "\n\n❌ *Failed to approve*",
+                    (query.message.text or "") + "\n\n❌ *Failed to approve*",
                     parse_mode="Markdown",
                 )
 
         elif data.startswith("reject:"):
             pending_id = data.split(":", 1)[1]
             success = self._reject_pending_party(pending_id)
-            if success:
-                await query.edit_message_text(
-                    query.message.text + "\n\n❌ *REJECTED*",
-                    parse_mode="Markdown",
-                )
-            else:
-                await query.edit_message_text(
-                    query.message.text + "\n\n⚠️ *Failed to reject*",
-                    parse_mode="Markdown",
-                )
+            msg_text = (query.message.caption or query.message.text or "") if query.message.photo else (query.message.text or "")
+            suffix = "\n\n❌ *REJECTED*" if success else "\n\n⚠️ *Failed to reject*"
+            try:
+                if query.message.photo:
+                    await query.edit_message_caption(msg_text + suffix, parse_mode="Markdown")
+                else:
+                    await query.edit_message_text(msg_text + suffix, parse_mode="Markdown")
+            except Exception:
+                pass
 
         elif data.startswith("edit:"):
             pending_id = data.split(":", 1)[1]
             _edit_sessions[update.effective_chat.id] = pending_id
-            await query.edit_message_text(
-                query.message.text
+            msg_text = (query.message.caption or query.message.text or "") if query.message.photo else (query.message.text or "")
+            edit_prompt = (
+                msg_text
                 + "\n\n✏️ *EDIT MODE*\n"
-                "Send me the fields to change as JSON, e.g.:\n"
-                '`{"name": "New Name", "location": "Tel Aviv"}`\n\n'
-                "Available fields: name, description, date, location, "
-                "tags, referralCode, musicType, eventType, region, age",
-                parse_mode="Markdown",
+                "Send me the fields to change as JSON:\n"
+                '`{"name": "...", "location": {...}, "date": "...", "tags": [...], '
+                '"musicType": "...", "eventType": "...", "region": "...", "age": "...", '
+                '"ticketPrice": 0, "imageUrl": "...", "referralCode": "..."}`'
             )
+            try:
+                if query.message.photo:
+                    await query.edit_message_caption(edit_prompt, parse_mode="Markdown")
+                else:
+                    await query.edit_message_text(edit_prompt, parse_mode="Markdown")
+            except Exception:
+                pass
 
         elif data.startswith("2fa:"):
-            # 2FA availability confirmation
             parts = data.split(":", 2)
             account_id = parts[1] if len(parts) > 1 else ""
             action = parts[2] if len(parts) > 2 else ""
             if action == "ready":
                 await query.edit_message_text(
-                    f"🔐 Great! I'll send the 2FA code request for *{account_id}* now.\n"
-                    "Please reply with the 6-digit code when you receive it.",
+                    f"🔐 Great! Click login for *{account_id}* — reply with the 6-digit code when it arrives.",
                     parse_mode="Markdown",
                 )
-                # Signal that manager is available
                 key = f"2fa_avail_{account_id}"
                 if key in _tfa_requests:
                     _tfa_codes[key] = "ready"
                     _tfa_requests[key].set()
             elif action == "later":
                 await query.edit_message_text(
-                    f"⏳ OK, I'll try again later for *{account_id}*.",
-                    parse_mode="Markdown",
+                    f"⏳ OK, I'll try again later for *{account_id}*.", parse_mode="Markdown"
                 )
                 key = f"2fa_avail_{account_id}"
                 if key in _tfa_requests:
                     _tfa_codes[key] = None
                     _tfa_requests[key].set()
+
+        elif data.startswith("ctoggle:"):
+            # Toggle a carousel selection for a pending party
+            _, pending_id, carousel_id = data.split(":", 2)
+            selections = _carousel_selections.get(pending_id, [])
+            if carousel_id in selections:
+                selections.remove(carousel_id)
+            else:
+                selections.append(carousel_id)
+            _carousel_selections[pending_id] = selections
+
+            carousels = self._get_all_carousels()
+            keyboard = self._build_carousel_keyboard(pending_id, carousels, selections)
+            try:
+                await query.edit_message_reply_markup(reply_markup=keyboard)
+            except Exception:
+                pass
+
+        elif data.startswith("cdone:"):
+            _, pending_id = data.split(":", 1)
+            selections = _carousel_selections.pop(pending_id, [])
+            # Find party_db_id from approved pending doc
+            try:
+                from bson.objectid import ObjectId
+                coll = self._pending_collection
+                doc = coll.find_one({"_id": ObjectId(pending_id)}) if coll else None
+                party_db_id = doc.get("party_db_id") if doc else None
+                # If not stored on doc, look up by goOutUrl in parties collection
+                if not party_db_id and doc:
+                    goout_url = doc.get("goOutUrl") or doc.get("party_data", {}).get("goOutUrl")
+                    if goout_url:
+                        party = self._parties_collection.find_one({"goOutUrl": goout_url}, {"_id": 1})
+                        if party:
+                            party_db_id = str(party["_id"])
+            except Exception as e:
+                logger.error(f"cdone: failed to find party: {e}")
+                party_db_id = None
+
+            added_to = []
+            if party_db_id and selections:
+                for cid in selections:
+                    if self._add_party_to_carousel(cid, party_db_id):
+                        try:
+                            coll_c = self._carousels_collection
+                            cdoc = coll_c.find_one({"_id": ObjectId(cid)}, {"title": 1}) if coll_c else None
+                            added_to.append(cdoc.get("title", cid) if cdoc else cid)
+                        except Exception:
+                            added_to.append(cid)
+            if added_to:
+                await query.edit_message_text(
+                    f"✅ Added to: {', '.join(added_to)}",
+                    parse_mode="Markdown",
+                )
+            else:
+                await query.edit_message_text("✅ Saved (no carousels selected).")
+
+        elif data.startswith("cskip:"):
+            _carousel_selections.pop(data.split(":", 1)[1], None)
+            await query.edit_message_text("⏭ Carousel assignment skipped.")
 
     # ------------------------------------------------------------------
     # Text message handler (for 2FA codes and edit JSON)
@@ -379,41 +465,47 @@ class TelegramManager:
         text = (update.message.text or "").strip()
         chat_id = update.effective_chat.id
 
-        # Check if this is a 2FA code (6 digits)
         if text.isdigit() and len(text) == 6:
-            # Find any pending 2FA request
             for key, event in list(_tfa_requests.items()):
                 if key.startswith("2fa_code_") and not event.is_set():
                     _tfa_codes[key] = text
                     event.set()
                     await update.message.reply_text(
-                        f"✅ 2FA code received: `{text}`. Attempting login...",
+                        f"✅ 2FA code `{text}` received. Attempting login...",
                         parse_mode="Markdown",
                     )
                     return
-            await update.message.reply_text(
-                "ℹ️ No pending 2FA request. Code ignored."
-            )
+            await update.message.reply_text("ℹ️ No pending 2FA request. Code ignored.")
             return
 
-        # Check if this is an edit session
         if chat_id in _edit_sessions:
             pending_id = _edit_sessions.pop(chat_id)
             try:
                 edits = json.loads(text)
                 if not isinstance(edits, dict):
                     raise ValueError("Must be a JSON object")
-                success = self._edit_pending_party(pending_id, edits)
-                if success:
+                # Fetch party_data before editing for carousel suggestion
+                try:
+                    from bson.objectid import ObjectId
+                    coll = self._pending_collection
+                    doc = coll.find_one({"_id": ObjectId(pending_id)}) if coll else None
+                    orig_party_data = dict(doc.get("party_data", {})) if doc else {}
+                except Exception:
+                    orig_party_data = {}
+                orig_party_data.update({k: v for k, v in edits.items()})
+
+                party_db_id = self._edit_pending_party(pending_id, edits)
+                if party_db_id:
                     await update.message.reply_text("✅ Party updated and approved!")
+                    await self._send_carousel_selection(pending_id, orig_party_data)
                 else:
                     await update.message.reply_text("❌ Failed to update party.")
             except (json.JSONDecodeError, ValueError) as exc:
+                _edit_sessions[chat_id] = pending_id  # Put back so user can retry
                 await update.message.reply_text(
-                    f"❌ Invalid JSON: {exc}\n"
-                    "Please send valid JSON or use /pending to try again."
+                    f"❌ Invalid JSON: {exc}\nTry again or send /cancel to abort."
                 )
-                return
+            return
 
     # ------------------------------------------------------------------
     # Public API — called from scraper / scheduler
@@ -626,13 +718,13 @@ class TelegramManager:
     # Party approval/rejection helpers
     # ------------------------------------------------------------------
 
-    def _approve_pending_party(self, pending_id: str) -> bool:
-        """Move a pending party into the main parties collection."""
+    def _approve_pending_party(self, pending_id: str) -> str | None:
+        """Move a pending party into the main parties collection. Returns the party DB id or None."""
         from bson.objectid import ObjectId
         coll = self._pending_collection
         parties_coll = self._parties_collection
         if coll is None or parties_coll is None:
-            return False
+            return None
         try:
             from app import (
                 normalize_url, normalized_or_none_for_dedupe,
@@ -642,20 +734,19 @@ class TelegramManager:
             )
         except ImportError:
             logger.error("Cannot import app helpers for party approval")
-            return False
+            return None
 
         try:
             doc = coll.find_one({"_id": ObjectId(pending_id)})
         except Exception:
-            return False
+            return None
         if not doc or doc.get("status") != "pending":
-            return False
+            return None
 
         party_data = doc.get("party_data", {})
         if not party_data:
-            return False
+            return None
 
-        # Ensure slug
         party_data.setdefault(
             "slug", slugify_party(party_data.get("name"), party_data.get("date"))
         )
@@ -663,17 +754,12 @@ class TelegramManager:
         canonical = party_data.get("canonicalUrl")
         go_out_url = party_data.get("goOutUrl")
 
-        # Check if already exists
-        existing_query = {}
         or_clauses = []
         if canonical:
             or_clauses.append({"canonicalUrl": canonical})
         if go_out_url:
             or_clauses.append({"goOutUrl": go_out_url})
-        if or_clauses:
-            existing_query = {"$or": or_clauses}
-        else:
-            existing_query = {"name": party_data.get("name"), "date": party_data.get("date")}
+        existing_query = {"$or": or_clauses} if or_clauses else {"name": party_data.get("name"), "date": party_data.get("date")}
 
         try:
             result = parties_coll.update_one(
@@ -681,23 +767,23 @@ class TelegramManager:
                 {"$setOnInsert": party_data},
                 upsert=True,
             )
+            if result.upserted_id:
+                party_db_id = str(result.upserted_id)
+            else:
+                existing = parties_coll.find_one(existing_query, {"_id": 1})
+                party_db_id = str(existing["_id"]) if existing else None
         except Exception as exc:
             logger.error(f"Failed to insert approved party: {exc}")
-            return False
+            return None
 
-        # Mark as approved
         try:
             coll.update_one(
                 {"_id": ObjectId(pending_id)},
-                {"$set": {
-                    "status": "approved",
-                    "approved_at": datetime.now(timezone.utc),
-                }},
+                {"$set": {"status": "approved", "approved_at": datetime.now(timezone.utc)}},
             )
         except Exception:
             pass
 
-        # Trigger indexing
         try:
             event_view = normalize_event(party_data)
             notify_indexers([event_view.get("canonicalUrl")])
@@ -705,7 +791,7 @@ class TelegramManager:
         except Exception as exc:
             logger.warning(f"Post-approval indexing failed: {exc}")
 
-        return True
+        return party_db_id
 
     def _reject_pending_party(self, pending_id: str) -> bool:
         """Mark a pending party as rejected."""
@@ -725,27 +811,28 @@ class TelegramManager:
         except Exception:
             return False
 
-    def _edit_pending_party(self, pending_id: str, edits: dict) -> bool:
-        """Apply edits to a pending party and approve it."""
+    def _edit_pending_party(self, pending_id: str, edits: dict) -> str | None:
+        """Apply edits to a pending party and approve it. Returns party_db_id or None."""
         from bson.objectid import ObjectId
         coll = self._pending_collection
         if coll is None:
-            return False
+            return None
 
         allowed_fields = {
             "name", "description", "date", "location", "tags",
             "referralCode", "musicType", "eventType", "region", "age",
+            "imageUrl", "ticketPrice",
         }
         filtered = {k: v for k, v in edits.items() if k in allowed_fields}
         if not filtered:
-            return False
+            return None
 
         try:
             doc = coll.find_one({"_id": ObjectId(pending_id)})
         except Exception:
-            return False
+            return None
         if not doc:
-            return False
+            return None
 
         party_data = doc.get("party_data", {})
         party_data.update(filtered)
@@ -756,9 +843,108 @@ class TelegramManager:
                 {"$set": {"party_data": party_data}},
             )
         except Exception:
-            return False
+            return None
 
         return self._approve_pending_party(pending_id)
+
+    # ------------------------------------------------------------------
+    # Carousel helpers
+    # ------------------------------------------------------------------
+
+    def _get_all_carousels(self) -> list:
+        coll = self._carousels_collection
+        if coll is None:
+            return []
+        try:
+            return list(coll.find({}).sort("order", 1))
+        except Exception:
+            return []
+
+    def _suggest_carousels(self, party_data: dict, carousels: list) -> list[str]:
+        """Return carousel ids that seem relevant to this party."""
+        tags = {t.lower() for t in party_data.get("tags", [])}
+        music = (party_data.get("musicType") or "").lower()
+        etype = (party_data.get("eventType") or "").lower()
+        region = (party_data.get("region") or "").lower()
+        location = (party_data.get("location") or {})
+        if isinstance(location, dict):
+            location = (location.get("name") or "").lower()
+        else:
+            location = str(location).lower()
+
+        keywords = tags | {music, etype, region, location}
+        keywords.discard("")
+
+        suggested = []
+        for c in carousels:
+            title_lower = (c.get("title") or "").lower()
+            if any(kw and kw in title_lower for kw in keywords):
+                suggested.append(str(c["_id"]))
+        return suggested
+
+    def _build_carousel_keyboard(self, pending_id: str, carousels: list, selected_ids: list[str]) -> "InlineKeyboardMarkup":
+        selected_set = set(selected_ids)
+        rows = []
+        for c in carousels:
+            cid = str(c["_id"])
+            mark = "✅" if cid in selected_set else "⬜"
+            label = f"{mark} {c.get('title', cid)}"
+            rows.append([InlineKeyboardButton(label, callback_data=f"ctoggle:{pending_id}:{cid}")])
+        rows.append([
+            InlineKeyboardButton("✅ Done", callback_data=f"cdone:{pending_id}"),
+            InlineKeyboardButton("⏭ Skip", callback_data=f"cskip:{pending_id}"),
+        ])
+        return InlineKeyboardMarkup(rows)
+
+    def _add_party_to_carousel(self, carousel_id: str, party_id: str) -> bool:
+        from bson.objectid import ObjectId
+        coll = self._carousels_collection
+        if coll is None:
+            return False
+        try:
+            pid = ObjectId(party_id)
+            result = coll.update_one(
+                {"_id": ObjectId(carousel_id)},
+                {"$addToSet": {"partyIds": pid}},
+            )
+            return result.matched_count > 0
+        except Exception as exc:
+            logger.error(f"Failed to add party to carousel: {exc}")
+            return False
+
+    async def _send_carousel_selection(self, pending_id: str, party_data: dict):
+        """Send a follow-up message letting the user assign carousels."""
+        carousels = self._get_all_carousels()
+        if not carousels:
+            await self._app.bot.send_message(
+                chat_id=self.manager_chat_id,
+                text="ℹ️ No carousels configured — party added without carousel assignment.",
+                parse_mode="Markdown",
+            )
+            return
+
+        suggested = self._suggest_carousels(party_data, carousels)
+        _carousel_selections[pending_id] = list(suggested)
+        keyboard = self._build_carousel_keyboard(pending_id, carousels, suggested)
+
+        party_name = party_data.get("name", "party")
+        suggestion_note = f" ({len(suggested)} pre-selected based on tags)" if suggested else ""
+        await self._app.bot.send_message(
+            chat_id=self.manager_chat_id,
+            text=f"🎪 *Add to carousels*{suggestion_note}\n_{self._escape_md(party_name)}_",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
+
+    async def _cmd_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._is_manager(update):
+            return
+        chat_id = update.effective_chat.id
+        if chat_id in _edit_sessions:
+            _edit_sessions.pop(chat_id)
+            await update.message.reply_text("✅ Edit cancelled.")
+        else:
+            await update.message.reply_text("Nothing to cancel.")
 
     # ------------------------------------------------------------------
     # Helpers

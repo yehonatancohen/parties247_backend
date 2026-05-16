@@ -4,7 +4,7 @@ import logging
 import asyncio
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 
 from app import app, GOOUT_ACCOUNTS_CONFIG, _get_goout_db, telegram_mgr
 from goout_scraper import GoOutAccount, run_daily_scrape
@@ -17,6 +17,19 @@ def run_test():
             return
 
         print(f"Testing Go-Out Panel Scraper with {len(accounts)} account(s)...")
+        
+        # Try to clear any existing polling sessions to avoid Conflict errors
+        try:
+            import requests
+            token = os.environ.get("TELEGRAM_BOT_TOKEN")
+            if token:
+                requests.get(f"https://api.telegram.org/bot{token}/deleteWebhook", timeout=10)
+                # Short sleep to give the API time to process the termination
+                print("Clearing bot session...")
+                import time
+                time.sleep(10)
+        except Exception: pass
+
         print("Waiting for Telegram bot to initialize...")
         import time
         time.sleep(2)

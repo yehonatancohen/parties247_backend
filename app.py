@@ -71,6 +71,8 @@ GOOUT_SCRAPE_HOUR = int(os.environ.get("GOOUT_SCRAPE_HOUR", "6"))
 telegram_mgr = None
 goout_sessions_collection = None
 goout_pending_collection = None
+_goout_scrape_running: bool = False
+_goout_last_scrape: str | None = None
 
 CANONICAL_BASE_URL = (os.environ.get("CANONICAL_BASE_URL") or "https://parties247-website.vercel.app").rstrip("/")
 INDEXNOW_KEY = os.environ.get("INDEXNOW_KEY")
@@ -5410,18 +5412,29 @@ def _get_goout_db():
         return None
 
 
-def _trigger_goout_scrape():
-    """Run the Go-Out daily scrape in a background thread."""
+def _trigger_goout_scrape(force_send: bool = False):
+    """Run the Go-Out scrape in a background thread."""
+    global _goout_scrape_running, _goout_last_scrape
+    if _goout_scrape_running:
+        app.logger.info("[GOOUT] Scrape already running, skipping.")
+        return
+    _goout_scrape_running = True
+
     def _run():
-        with app.app_context():
-            from goout_scraper import GoOutAccount, run_daily_scrape
-            accounts = [
-                GoOutAccount(**cfg) for cfg in GOOUT_ACCOUNTS_CONFIG
-            ]
-            if not accounts:
-                app.logger.warning("[GOOUT] No accounts configured.")
-                return
-            run_daily_scrape(accounts, _get_goout_db(), telegram_mgr, app)
+        global _goout_scrape_running, _goout_last_scrape
+        try:
+            with app.app_context():
+                from goout_scraper import GoOutAccount, run_daily_scrape
+                accounts = [GoOutAccount(**cfg) for cfg in GOOUT_ACCOUNTS_CONFIG]
+                if not accounts:
+                    app.logger.warning("[GOOUT] No accounts configured.")
+                    return
+                run_daily_scrape(accounts, _get_goout_db(), telegram_mgr, app, force_send=force_send)
+        finally:
+            _goout_scrape_running = False
+            from datetime import datetime, timezone
+            _goout_last_scrape = datetime.now(timezone.utc).isoformat()
+
     t = threading.Thread(target=_run, daemon=True)
     t.start()
 
@@ -5457,6 +5470,8 @@ def goout_status():
     return jsonify({
         "pendingCount": pending_count,
         "accounts": len(GOOUT_ACCOUNTS_CONFIG),
+        "isRunning": _goout_scrape_running,
+        "lastRun": _goout_last_scrape,
         "sessions": sessions,
     }), 200
 
@@ -5467,6 +5482,14 @@ def goout_trigger_scrape():
     """Manually trigger a Go-Out scrape."""
     _trigger_goout_scrape()
     return jsonify({"message": "Scrape triggered in background."}), 202
+
+
+@app.route("/api/admin/goout/manual-scrape", methods=["POST"])
+@protect
+def goout_manual_scrape():
+    """Trigger a manual Go-Out scrape that sends ALL found parties."""
+    _trigger_goout_scrape(force_send=True)
+    return jsonify({"message": "Manual scan started. Check Telegram for updates."}), 202
 
 
 @app.route("/api/admin/goout/pending", methods=["GET"])
@@ -5555,7 +5578,7 @@ def _init_telegram_bot():
             manager_chat_id=TELEGRAM_MANAGER_CHAT_ID,
             db_getter=_get_goout_db,
         )
-        telegram_mgr.on_scrape_requested = _trigger_goout_scrape
+        telegram_mgr.on_scrape_requested = lambda: _trigger_goout_scrape(force_send=True)
         telegram_mgr.start_in_background()
         app.logger.info("[TELEGRAM] Bot started.")
     except Exception as exc:

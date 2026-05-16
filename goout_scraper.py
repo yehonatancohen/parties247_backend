@@ -146,6 +146,35 @@ class GoOutScraper:
 
         self._context = await self._browser.new_context(**ctx_kwargs)
         self._page = await self._context.new_page()
+        
+        # Dismiss cookie dialogs globally
+        await self._dismiss_cookie_dialog()
+
+    async def _dismiss_cookie_dialog(self):
+        """Try to find and click 'Allow all cookies' or similar buttons."""
+        try:
+            # Common CookieHub/UserWay/GDPR selectors
+            selectors = [
+                ".ch2-allow-all-btn",
+                "button:has-text('Allow all')",
+                "button:has-text('Allow all cookies')",
+                "button:has-text('אשר הכל')",
+                "button:has-text('אשר קוקיז')",
+                "button:has-text('Got it')",
+                "#hs-eu-confirmation-button",
+            ]
+            for sel in selectors:
+                try:
+                    btn = await self._page.query_selector(sel)
+                    if btn and await btn.is_visible():
+                        logger.info(f"[{self.account.account_id}] Dismissing cookie dialog: {sel}")
+                        await btn.click()
+                        await self._page.wait_for_timeout(1000)
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
     async def close(self):
         try:
@@ -446,18 +475,102 @@ class GoOutScraper:
         """
         logger.info(f"[{self.account.account_id}] Loading organizer panel...")
 
+        api_events_found = []
+
+        async def intercept_response(response):
+            try:
+                if response.ok and "application/json" in response.headers.get("content-type", ""):
+                    url = response.url
+                    data = await response.json()
+
+                    def find_slugs(obj):
+                        if isinstance(obj, dict):
+                            # Try to find event-like objects
+                            eid = obj.get("_id") or obj.get("id") or obj.get("Id")
+                            slug = obj.get("Url") or obj.get("url") or obj.get("slug") or obj.get("Slug")
+
+                            if eid and slug and isinstance(slug, str) and len(slug) > 3 and "eventmanagement" not in slug:
+                                if "go-out.co" not in slug:
+                                    full_url = f"https://go-out.co/event/{slug}"
+                                else:
+                                    full_url = slug
+
+                                if not any(e["go_out_id"] == str(eid) for e in api_events_found):
+                                    logger.info(f"[{self.account.account_id}] API INTERCEPT: Found slug '{slug}' for #{eid}")
+                                    api_events_found.append({
+                                        "url": full_url,
+                                        "go_out_id": str(eid),
+                                        "source": "api_intercept"
+                                    })
+                            for v in obj.values():
+                                if isinstance(v, (dict, list)):
+                                    find_slugs(v)
+                        elif isinstance(obj, list):
+                            for item in obj:
+                                find_slugs(item)
+
+                    find_slugs(data)
+            except Exception:
+                pass
+
+        self._page.on("response", intercept_response)
+
         # Navigate to panel if not already there
         current = self._page.url
         if "/businesspage" not in current:
-            await self._page.goto(GO_OUT_PANEL_URL, wait_until="domcontentloaded", timeout=30000)
+            await self._page.goto(GO_OUT_PANEL_URL, wait_until="networkidle", timeout=30000)
             await self._page.wait_for_timeout(3000)
 
+        # Ensure we are on the "Events" tab (sometimes it defaults to Promos or others)
+        try:
+            # Look for "אירועים" or "Events" tab/link
+            # The icon is /assets/MyEvents/globeGrey.svg or globeRed.svg
+            events_tab_selectors = [
+                'div[role="button"]:has(img[src*="MyEvents/globe"])',
+                'button:has(img[src*="MyEvents/globe"])',
+                'a[href="/businesspage"]',
+                'img[src*="MyEvents/globe"]',
+                'text="אירועים"',
+                'text="Events"',
+            ]
+            
+            logger.info(f"[{self.account.account_id}] Current URL: {self._page.url}")
+            
+            # If we see "Promo codes" prominently, we definitely need to switch
+            page_text = await self._page.evaluate("document.body.innerText")
+            if "Promo codes" in page_text or "קוד קופון" in page_text or "Manage promos" in page_text:
+                logger.info(f"[{self.account.account_id}] On Promos page, trying to switch to Events...")
+                
+                # Try clicking any element that looks like the events tab
+                for sel in events_tab_selectors:
+                    try:
+                        tab = await self._page.query_selector(sel)
+                        if tab and await tab.is_visible():
+                            logger.info(f"[{self.account.account_id}] Clicking Events tab: {sel}")
+                            await tab.click(force=True)
+                            await self._page.wait_for_timeout(5000)
+                            # Re-check text
+                            new_text = await self._page.evaluate("document.body.innerText")
+                            if "Promo codes" not in new_text:
+                                break
+                    except Exception: continue
+                    
+            # Wait for table or rows to appear
+            await self._page.wait_for_selector('tr, [role="row"], .MuiTableRow-root', timeout=15000)
+        except Exception as e:
+            logger.warning(f"[{self.account.account_id}] Could not ensure Events tab or table: {e}")
+
         # Scroll to load all events (in case of lazy loading)
-        for _ in range(5):
+        for _ in range(3):
             await self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await self._page.wait_for_timeout(1000)
         await self._page.evaluate("window.scrollTo(0, 0)")
         await self._page.wait_for_timeout(1000)
+        
+        # Strategy 0: Use events found via API interception
+        if api_events_found:
+            logger.info(f"[{self.account.account_id}] Got {len(api_events_found)} events from API interception")
+            return api_events_found
 
         # Strategy 1: Extract event IDs and URLs from __NEXT_DATA__
         events = await self._extract_from_next_data()
@@ -550,19 +663,39 @@ class GoOutScraper:
         # First, collect event IDs from the visible rows
         # Each row shows #XXXXX as the event ID
         try:
-            page_text = await self._page.content()
+            # Only look in the body to avoid CSS hex colors in <style>
+            body_handle = await self._page.query_selector('body')
+            body_text = await body_handle.inner_text() if body_handle else ""
+            
             # Find all event IDs like #43994, #43601, etc.
-            id_matches = re.findall(r'#(\d{4,6})', page_text)
+            # We look for # followed by 5-6 digits, ensuring it's not part of a hex color
+            id_matches = re.findall(r'#(\d{5,6})\b', body_text)
             event_ids = list(dict.fromkeys(id_matches))  # dedupe preserving order
-            logger.info(f"[{self.account.account_id}] Found event IDs: {event_ids}")
+            logger.info(f"[{self.account.account_id}] Found event IDs in body: {event_ids}")
+            
+            if not event_ids:
+                # Fallback to full content but be more strict
+                html_content = await self._page.content()
+                # Remove style and script tags before matching
+                clean_html = re.sub(r'<(style|script).*?>.*?</\1>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
+                id_matches = re.findall(r'#(\d{5,6})\b', clean_html)
+                event_ids = list(dict.fromkeys(id_matches))
+                logger.info(f"[{self.account.account_id}] Found event IDs in cleaned HTML: {event_ids}")
+
         except Exception as exc:
             logger.error(f"[{self.account.account_id}] Failed to extract event IDs: {exc}")
             return []
 
-        # For each event ID, navigate to its dashboard and extract the live URL
+        # For each event ID, try to get the URL via share button (preferred) or dashboard
         for i, eid in enumerate(event_ids):
             try:
-                event_info = await self._get_event_url_from_dashboard(eid, dump_first=(i == 0))
+                # Try share button first as suggested by user
+                event_info = await self._get_event_url_via_share(eid)
+                
+                # Fallback to dashboard if share button failed
+                if not event_info:
+                    event_info = await self._get_event_url_from_dashboard(eid, dump_first=(i == 0))
+                
                 if event_info:
                     events.append(event_info)
                 await asyncio.sleep(1)  # Rate limit
@@ -572,110 +705,265 @@ class GoOutScraper:
 
         return events
 
+    # 1. Find and click more options button using evaluate
+    clicked = await self._page.evaluate(f"""
+        (id) => {{
+            const rows = Array.from(document.querySelectorAll('tr, [role="row"], .MuiTableRow-root, div'));
+            const row = rows.find(r => r.innerText.includes(id) && r.offsetWidth > 100);
+            if (row) {{
+                row.scrollIntoView();
+                const btns = Array.from(row.querySelectorAll('button, [role="button"]'));
+                // More options button often has no text but has an aria-haspopup or svg
+                const btn = btns.find(b => b.getAttribute('aria-haspopup') === 'true' || b.innerHTML.includes('svg') || b.innerText.includes('...'));
+                if (btn) {{
+                    btn.click();
+                    return true;
+                }}
+            }}
+            return false;
+        }}
+    """, event_id)
+
+    if not clicked:
+        logger.warning(f"[{self.account.account_id}] Row or menu button for #{event_id} not found")
+        # Try clicking any button that contains the text '...' or looks like a menu
+        await self._page.evaluate(f"""
+            () => {{
+                const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+                const btn = btns.find(b => b.innerText === '...' || b.getAttribute('aria-label') === 'more');
+                if (btn) btn.click();
+            }}
+        """)
+
+    await self._page.wait_for_timeout(2000)
+
+    # 2. Find and click "Share" in the menu using evaluate
+    share_clicked = await self._page.evaluate("""
+        () => {
+            const elements = Array.from(document.querySelectorAll('li, [role="menuitem"], button, div'));
+            const share = elements.find(el => {
+                const txt = el.innerText || "";
+                return (txt.includes("שיתוף") || txt.includes("Share")) && el.offsetWidth > 0;
+            });
+            if (share) {
+                share.click();
+                return true;
+            }
+            return false;
+        }
+    """)
+
+    if not share_clicked:
+        logger.warning(f"[{self.account.account_id}] Share button not found in menu for #{event_id}")
+        await self._page.mouse.click(0, 0)
+        return None
+
+    await self._page.wait_for_timeout(3000)
+
+    # 3. Extract URL from the modal/menu
+    live_url = await self._extract_url_from_share_dialog()
+
+    # If still no URL, try to extract from window state
+    if not live_url:
+        live_url = await self._page.evaluate("""
+            () => {
+                try {
+                    if (window.__NEXT_DATA__ && window.__NEXT_DATA__.props) {
+                        // Search for slug in next data
+                        const str = JSON.stringify(window.__NEXT_DATA__);
+                        const match = str.match(/"slug":"([^"]+)"/);
+                        if (match) return match[1];
+                    }
+                } catch(e) {}
+                return null;
+            }
+        """)
+        if live_url and "/" not in live_url:
+            live_url = f"/event/{live_url}"
+
+    # 4. Close dialog
+    await self._page.keyboard.press("Escape")
+    await self._page.wait_for_timeout(500)
+            if live_url:
+                if live_url.startswith("/"):
+                    live_url = GO_OUT_BASE + live_url
+
+                logger.info(f"[{self.account.account_id}] Got URL via share for #{event_id}: {live_url}")
+
+                name = None
+                try:
+                    name_cell = await row.query_selector('td:first-child, [role="gridcell"]:first-child')
+                    if name_cell:
+                        name = (await name_cell.inner_text()).strip()
+                except Exception: pass
+
+                return {
+                    "url": live_url,
+                    "go_out_id": event_id,
+                    "name": name,
+                    "source": "share_button",
+                }
+
+        except Exception as exc:
+            logger.warning(f"[{self.account.account_id}] Share button flow failed for #{event_id}: {exc}")
+
+        return None
+
+    async def _extract_url_from_share_dialog(self) -> str | None:
+        """Helper to find a go-out.co URL in a modal or sharing menu."""
+        # We prioritize URLs with slugs (non-digits) over URLs with just IDs
+        return await self._page.evaluate("""
+            () => {
+                const results = [];
+                
+                // 1. Look in input fields
+                const inputs = Array.from(document.querySelectorAll('input'));
+                inputs.forEach(i => {
+                    if (i.value.includes('go-out.co')) results.push(i.value);
+                });
+
+                // 2. Look for links (WhatsApp, etc.)
+                const links = Array.from(document.querySelectorAll('a'));
+                for (const a of links) {
+                    const href = a.href || "";
+                    if (href.includes('wa.me') || href.includes('whatsapp.com')) {
+                        const match = href.match(/(https?:\\/\\/(?:www\\.)?go-out\\.co\\/(?:event|i)\\/[^&\\s]+)/);
+                        if (match) results.push(match[1]);
+                    }
+                    if (href.includes('go-out.co/event/') || href.includes('go-out.co/i/')) {
+                        if (!href.includes('eventmanagement') && !href.includes('businesspage')) {
+                            results.push(href);
+                        }
+                    }
+                }
+
+                // 3. Look for ANY text that looks like a URL
+                const bodyText = document.body.innerText;
+                const matches = bodyText.match(/(https?:\\/\\/(?:www\\.)?go-out\\.co\\/(?:event|i)\\/[^\\s\\n\\r]+)/g);
+                if (matches) results.push(...matches);
+
+                if (results.length === 0) return null;
+
+                // Prioritize: 
+                // 1. URLs containing /i/ (short links often have slugs)
+                // 2. URLs containing /event/ with non-digits (real slugs)
+                // 3. Any other go-out link
+                
+                const slugs = results.filter(r => {
+                    const parts = r.split('/');
+                    const last = parts[parts.length - 1].split('?')[0];
+                    return /[^0-9]/.test(last); // contains non-digits
+                });
+                
+                if (slugs.length > 0) return slugs[0];
+                return results[0];
+            }
+        """)
+
     async def _get_event_url_from_dashboard(self, event_id: str, dump_first: bool = False) -> dict | None:
         """
-        Navigate to /businesspage/<event_id> and extract the live event URL
-        from the "צפייה באירוע החי" link.
+        Navigate to /businesspage/<event_id> and extract the live event URL.
         """
-        dashboard_url = f"{GO_OUT_PANEL_URL}/{event_id}"
-        try:
-            await self._page.goto(dashboard_url, wait_until="domcontentloaded", timeout=20000)
-            await self._page.wait_for_timeout(3000)  # extra wait for JS to render
-        except Exception as exc:
-            logger.warning(f"[{self.account.account_id}] Failed to load dashboard for #{event_id}: {exc}")
+        possible_urls = [
+            f"https://www.go-out.co/eventmanagement?eventId={event_id}",
+            f"https://www.go-out.co/businesspage/{event_id}",
+        ]
+
+        dashboard_loaded = False
+        for dashboard_url in possible_urls:
+            try:
+                logger.info(f"[{self.account.account_id}] Navigating to: {dashboard_url}")
+                await self._page.goto(dashboard_url, wait_until="networkidle", timeout=30000)
+                await self._page.wait_for_timeout(8000) # Wait long for dashboard JS
+
+                page_text = await self._page.evaluate("document.body.innerText")
+                if "Manage" in page_text or "ניהול" in page_text or "Share" in page_text or "שיתוף" in page_text:
+                    dashboard_loaded = True
+                    break
+            except Exception: continue
+
+        if not dashboard_loaded:
             return None
 
-        # Dump HTML for the first event so we can inspect the DOM structure
-        if dump_first:
-            try:
-                import os
-                os.makedirs('scratch', exist_ok=True)
-                html = await self._page.content()
-                with open(f'scratch/dashboard_{event_id}.html', 'w', encoding='utf-8') as f:
-                    f.write(html)
-                await self._page.screenshot(path=f'scratch/dashboard_{event_id}.png')
-                logger.info(f"[{self.account.account_id}] Dumped dashboard HTML for #{event_id}")
-            except Exception as e:
-                logger.warning(f"Could not dump dashboard html: {e}")
-
-        # Look for the "צפייה באירוע החי" (View Live Event) link
+        # Try extracting URL using evaluate for buttons
         live_url = None
         try:
-            # Try finding the link by text
-            link = await self._page.query_selector('a:has-text("צפייה באירוע החי")')
-            if link:
-                live_url = await link.get_attribute("href")
+            # 1. Try to find and click Share on dashboard using evaluate
+            share_clicked = await self._page.evaluate("""
+                () => {
+                    const elements = Array.from(document.querySelectorAll('button, [role="button"], a'));
+                    const share = elements.find(el => {
+                        const txt = el.innerText || "";
+                        return (txt === "שיתוף" || txt === "Share" || txt.includes("Share")) && el.offsetWidth > 0;
+                    });
+                    if (share) {
+                        share.click();
+                        return true;
+                    }
+                    return false;
+                }
+            """)
 
-            # Also try English text
-            if not live_url:
-                link = await self._page.query_selector('a:has-text("View live event")')
-                if link:
-                    live_url = await link.get_attribute("href")
+            if share_clicked:
+                await self._page.wait_for_timeout(3000)
+                live_url = await self._extract_url_from_share_dialog()
+                await self._page.keyboard.press("Escape")
 
-            # Fallback: find any link containing /event/
+            # 2. Try direct links on dashboard using evaluate
             if not live_url:
-                all_links = await self._page.query_selector_all('a[href*="/event/"]')
-                for a in all_links:
-                    href = await a.get_attribute("href")
-                    if href and "/event/" in href and "/businesspage" not in href:
-                        live_url = href
-                        break
+                live_url = await self._page.evaluate("""
+                    () => {
+                        const links = Array.from(document.querySelectorAll('a'));
+                        const live = links.find(a => {
+                            const h = a.href || "";
+                            const t = a.innerText || "";
+                            return (t.includes("צפייה") || t.includes("View")) && (h.includes("/event/") || h.includes("/i/"));
+                        });
+                        if (live) return live.href;
 
-            # Also try extracting from __NEXT_DATA__ on the dashboard page
-            if not live_url:
-                try:
-                    next_data = await self._page.evaluate("""
-                        () => {
-                            const el = document.querySelector('#__NEXT_DATA__');
-                            if (el) return JSON.parse(el.textContent);
-                            return null;
-                        }
-                    """)
-                    if next_data:
-                        found = []
-                        self._walk_json_for_events(next_data, found, set())
-                        if found:
-                            live_url = found[0].get("url")
-                except Exception:
-                    pass
+                        const anyLive = links.find(a => {
+                            const h = a.href || "";
+                            return (h.includes("/event/") || h.includes("/i/")) && !h.includes("eventmanagement") && !h.includes("businesspage");
+                        });
+                        return anyLive ? anyLive.href : null;
+                    }
+                """)
 
         except Exception as exc:
-            logger.warning(f"[{self.account.account_id}] Failed to extract URL for #{event_id}: {exc}")
+            logger.warning(f"[{self.account.account_id}] Dashboard extraction failed: {exc}")
 
         if not live_url:
             logger.warning(f"[{self.account.account_id}] No live URL found for #{event_id}")
             return None
 
-        # Normalize URL
         if live_url.startswith("/"):
             live_url = GO_OUT_BASE + live_url
 
-        # Extract event name from the dashboard
         name = None
         try:
-            # The event name is usually displayed prominently on the dashboard
-            name_el = await self._page.query_selector('h1, h2, [class*="event-name"], [class*="eventName"]')
+            name_el = await self._page.query_selector('h1, h2, [class*="name"]')
             if name_el:
-                name = await name_el.text_content()
-                name = (name or "").strip()
-        except Exception:
-            pass
+                name = (await name_el.inner_text()).strip()
+        except Exception: pass
 
-        logger.info(f"[{self.account.account_id}] Event #{event_id} → {live_url}")
+        logger.info(f"[{self.account.account_id}] Got URL for #{event_id}: {live_url}")
 
         return {
             "url": live_url,
             "go_out_id": event_id,
             "name": name,
-            "source": "dashboard_click",
+            "source": "dashboard_extraction",
         }
+
+
+
 
 
 # ---------------------------------------------------------------------------
 # High-level orchestrator (called from the scheduler)
 # ---------------------------------------------------------------------------
 
-def run_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, app_context):
+def run_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, app_context, force_send: bool = False):
     """
     Synchronous entry point for the daily scrape job.
     Runs the async scraper in a new event loop.
@@ -683,7 +971,7 @@ def run_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, app_context
     loop = asyncio.new_event_loop()
     try:
         loop.run_until_complete(
-            _async_daily_scrape(accounts, db, telegram_mgr, app_context)
+            _async_daily_scrape(accounts, db, telegram_mgr, app_context, force_send=force_send)
         )
     except Exception as exc:
         logger.error(f"Daily scrape failed: {exc}")
@@ -693,7 +981,7 @@ def run_daily_scrape(accounts: list[GoOutAccount], db, telegram_mgr, app_context
         loop.close()
 
 
-async def _async_daily_scrape(accounts, db, telegram_mgr, app_context):
+async def _async_daily_scrape(accounts, db, telegram_mgr, app_context, force_send: bool = False):
     """Async daily scrape across all accounts."""
     from app import (
         scrape_party_details, normalize_url, normalized_or_none_for_dedupe,
@@ -701,7 +989,10 @@ async def _async_daily_scrape(accounts, db, telegram_mgr, app_context):
     )
 
     if telegram_mgr:
-        telegram_mgr.send_message_sync("🔄 *Daily Go-Out scrape starting...*")
+        msg = "🔄 *Daily Go-Out scrape starting...*"
+        if force_send:
+            msg += " (FORCING ALL PARTIES)"
+        telegram_mgr.send_message_sync(msg)
 
     total_new = 0
     pending_coll = db.goout_pending if db is not None else None
@@ -728,31 +1019,32 @@ async def _async_daily_scrape(accounts, db, telegram_mgr, app_context):
 
                 canonical = normalize_url(event_url)
 
-                # Skip if already in parties collection
-                if parties_coll is not None:
-                    try:
-                        existing = parties_coll.find_one({
-                            "$or": [
-                                {"canonicalUrl": canonical},
-                                {"goOutUrl": canonical},
-                            ]
-                        })
-                        if existing:
-                            continue
-                    except Exception:
-                        pass
+                if not force_send:
+                    # Skip if already in parties collection
+                    if parties_coll is not None:
+                        try:
+                            existing = parties_coll.find_one({
+                                "$or": [
+                                    {"canonicalUrl": canonical},
+                                    {"goOutUrl": canonical},
+                                ]
+                            })
+                            if existing:
+                                continue
+                        except Exception:
+                            pass
 
-                # Skip if already pending or previously rejected
-                if pending_coll is not None:
-                    try:
-                        existing_pending = pending_coll.find_one({
-                            "goOutUrl": canonical,
-                            "status": {"$in": ["pending", "approved"]},
-                        })
-                        if existing_pending:
-                            continue
-                    except Exception:
-                        pass
+                    # Skip if already pending or previously rejected
+                    if pending_coll is not None:
+                        try:
+                            existing_pending = pending_coll.find_one({
+                                "goOutUrl": canonical,
+                                "status": {"$in": ["pending", "approved"]},
+                            })
+                            if existing_pending:
+                                continue
+                        except Exception:
+                            pass
 
                 # Scrape full event details using existing scraper
                 try:
@@ -774,6 +1066,10 @@ async def _async_daily_scrape(accounts, db, telegram_mgr, app_context):
                 # Store as pending
                 if pending_coll is not None:
                     try:
+                        # For force_send, we might want to check if it's already approved/pending
+                        # but still send it. However, to avoid DB conflicts on status,
+                        # we only insert if it's not there, OR we just send it if it exists.
+                        
                         pending_doc = {
                             "party_data": party_data,
                             "account_id": account.account_id,
@@ -781,20 +1077,27 @@ async def _async_daily_scrape(accounts, db, telegram_mgr, app_context):
                             "status": "pending",
                             "goOutUrl": canonical,
                         }
-                        pending_coll.insert_one(pending_doc)
-                        new_count += 1
+                        
+                        # Only insert if not exists to avoid duplicate _id or status issues
+                        if not force_send:
+                            pending_coll.insert_one(pending_doc)
+                        else:
+                            # In force_send mode, we don't necessarily want to change DB state
+                            # but we definitely want to send to Telegram.
+                            pass
 
                         # Send to Telegram for approval
                         if telegram_mgr:
                             telegram_mgr.send_party_for_approval_sync(pending_doc)
+                        new_count += 1
                     except Exception as exc:
-                        logger.error(f"Failed to store pending party: {exc}")
+                        logger.error(f"Failed to handle party: {exc}")
 
                 # Rate limit between event page scrapes
                 await asyncio.sleep(2)
 
             total_new += new_count
-            logger.info(f"[{account.account_id}] Found {new_count} new events")
+            logger.info(f"[{account.account_id}] Processed {new_count} events")
 
         except Exception as exc:
             logger.error(f"[{account.account_id}] Scrape error: {exc}")
@@ -804,6 +1107,7 @@ async def _async_daily_scrape(accounts, db, telegram_mgr, app_context):
                 )
         finally:
             await scraper.close()
+
 
     if telegram_mgr:
         telegram_mgr.send_message_sync(

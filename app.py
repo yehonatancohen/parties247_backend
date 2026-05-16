@@ -3604,7 +3604,8 @@ def scrape_party_details(url: str):
             if og_image_url:
                 image_url = og_image_url.replace("_whatsappImage.jpg", "_coverImage.jpg")
             else:
-                raise ValueError("Could not find party image URL.")
+                app.logger.warning(f"Could not find party image URL for {url}. Using placeholder.")
+                image_url = "https://via.placeholder.com/600x400?text=No+Image+Available"
 
         description = event_data.get("Description", "")
         cleaned_desc = " ".join(list(filter(None, description.split("\n")))[:3]).strip()
@@ -3622,10 +3623,10 @@ def scrape_party_details(url: str):
         go_out = normalized_or_none_for_dedupe(url)
 
         party_details = {
-            "name": event_data.get("Title"),
+            "name": event_data.get("Title") or "Unknown Event",
             "imageUrl": image_url,
-            "date": event_data.get("StartingDate"),
-            "location": location,
+            "date": event_data.get("StartingDate") or "Unknown Date",
+            "location": location or "Unknown Location",
             "description": cleaned_desc or "No description available.",
             "region": get_region(location),
             "musicType": get_music_type(full_text),
@@ -3651,8 +3652,7 @@ def scrape_party_details(url: str):
         if go_out:
             party_details["goOutUrl"] = go_out
 
-        if not all([party_details["name"], party_details["date"], party_details["location"]]):
-            raise ValueError("Scraped data is missing critical fields.")
+        # Removed the ValueError so that even draft/invalid events are returned
         return party_details
 
     except requests.exceptions.RequestException as e:

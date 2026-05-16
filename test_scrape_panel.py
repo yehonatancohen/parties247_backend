@@ -22,7 +22,8 @@ def run_test():
         time.sleep(2)
         
         # Test the orchestrator which logs in and discovers events
-        run_daily_scrape(accounts, _get_goout_db(), telegram_mgr, app)
+        # We pass force_send=True to send ALL discovered parties to Telegram
+        run_daily_scrape(accounts, _get_goout_db(), telegram_mgr, app, force_send=True)
         
         print("Scrape test completed. Check the output logs.")
 

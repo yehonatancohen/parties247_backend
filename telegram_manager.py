@@ -138,6 +138,15 @@ class TelegramManager:
 
         await self._app.initialize()
         await self._app.start()
+
+        # Terminate any existing getUpdates session (e.g. previous Render instance
+        # still running during rolling deploy). Without this, both instances race
+        # and the newer one keeps getting Conflict errors.
+        try:
+            await self._app.bot.delete_webhook(drop_pending_updates=True)
+        except Exception as exc:
+            logger.warning(f"delete_webhook failed (non-fatal): {exc}")
+
         await self._app.updater.start_polling(drop_pending_updates=True)
 
         # Keep running until cancelled

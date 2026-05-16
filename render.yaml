@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: parties247-backend
+    runtime: python
+    buildCommand: bash build.sh
+    startCommand: gunicorn app:app
+    envVars:
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: /opt/render/.cache/ms-playwright

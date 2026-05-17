@@ -3307,6 +3307,7 @@ class PartyAnalyticsRequest(BaseModel):
 class AddPartyRequest(BaseModel):
     url: str
     carouselName: str | None = None
+    referralCode: str | None = None
 
     class Config:
         extra = "forbid"
@@ -3873,7 +3874,7 @@ def add_party():
         return jsonify({"message": "URL is not allowed."}), 400
     try:
         party_data = scrape_party_details(url)
-        referral = default_referral_code()
+        referral = req.referralCode or default_referral_code()
         apply_default_referral(party_data, referral)
         party_data.setdefault("slug", slugify_party(party_data.get("name"), party_data.get("date")))
         canonical = party_data["canonicalUrl"]

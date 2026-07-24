@@ -71,7 +71,7 @@ EVENT_SITEMAP_CHUNK = 500
 
 # --- URL canonicalization ---
 TRACKING_PREFIXES = ("utm_",)
-TRACKING_KEYS = {"fbclid", "gclid", "mc_cid", "mc_eid"}
+TRACKING_KEYS = {"fbclid", "gclid", "mc_cid", "mc_eid", "ref", "aff"}
 
 REFERRAL_KEY = "referral"
 
@@ -257,6 +257,8 @@ def normalize_url(raw: str) -> str:
     p = urlparse((raw or "").strip())
     scheme = (p.scheme or "https").lower()
     netloc = p.netloc.lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
     if netloc.endswith(":80") and scheme == "http":
         netloc = netloc[:-3]
     if netloc.endswith(":443") and scheme == "https":

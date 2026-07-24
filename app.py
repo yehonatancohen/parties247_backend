@@ -465,6 +465,10 @@ try:
     ensure_index(goout_pending_collection, [("goOutUrl", 1)], name="pending_goout_url")
     ensure_index(goout_pending_collection, [("status", 1)], name="pending_status")
 
+    # --- Admin action audit log ---
+    admin_audit_collection = db.adminAuditLog
+    ensure_index(admin_audit_collection, [("createdAt", -1)], name="audit_created_desc")
+
     app.logger.info("Connected to MongoDB and ensured indexes.")
 except Exception as e:
     app.logger.error(f"Error connecting to MongoDB Atlas: {e}")
@@ -478,6 +482,7 @@ except Exception as e:
     analytics_collection = None
     goout_sessions_collection = None
     goout_pending_collection = None
+    admin_audit_collection = None
 
 
 def record_setting_hit(key: str, extra: dict | None = None):
@@ -517,6 +522,30 @@ def extract_client_ip(flask_request) -> str | None:
         if ip:
             return ip
     return getattr(flask_request, "remote_addr", None)
+
+
+def record_admin_action(action: str, target_type: str | None = None, target_id: str | None = None, details: dict | None = None):
+    """Best-effort admin audit log write. Never raises — a logging failure must not block the mutation it describes.
+
+    Note: admin auth is a single shared password (see `protect`), so there is no
+    per-admin identity to record here — only the calling IP/User-Agent.
+    """
+    if admin_audit_collection is None:
+        return
+    try:
+        entry = {
+            "action": action,
+            "targetType": target_type,
+            "targetId": target_id,
+            "ip": extract_client_ip(request),
+            "userAgent": sanitize_analytics_text(request.headers.get("User-Agent")),
+            "createdAt": datetime.now(timezone.utc),
+        }
+        if details:
+            entry["details"] = details
+        admin_audit_collection.insert_one(entry)
+    except Exception as exc:  # pragma: no cover - best effort only
+        app.logger.warning(f"Failed to record admin audit entry for {action}: {exc}")
 
 
 def is_party_live(party: dict, now: datetime | None = None) -> bool:
@@ -1607,32 +1636,93 @@ def analytics_summary():
 @app.route("/api/analytics/recent", methods=["GET"])
 @limiter.limit("30 per minute")
 def analytics_recent():
-    """Return the most recent analytics events for the live activity feed."""
+    """Return recent analytics events for the live activity feed.
+
+    Supports optional filtering/pagination via query params:
+    - type: comma-separated subset of view,purchase,visit (default: all)
+    - device: comma-separated subset of mobile,desktop,tablet,unknown (default: all)
+    - source: comma-separated subset of direct,organic_search,social,referral,... (default: all)
+    - hours: lookback window in hours, 1-720 (default: 24)
+    - limit: page size, 1-200 (default: 50)
+    - offset: pagination offset into the merged, timestamp-sorted result (default: 0)
+    """
+    valid_types = {"view", "purchase", "visit"}
+    type_param = (request.args.get("type") or "").strip().lower()
+    requested_types = {t for t in type_param.split(",") if t} & valid_types
+    if not requested_types:
+        requested_types = set(valid_types)
+
+    device_param = (request.args.get("device") or "").strip().lower()
+    requested_devices = {d for d in device_param.split(",") if d}
+
+    source_param = (request.args.get("source") or "").strip().lower()
+    requested_sources = {s for s in source_param.split(",") if s}
+
+    try:
+        hours = int(request.args.get("hours", 24))
+    except (TypeError, ValueError):
+        hours = 24
+    hours = max(1, min(hours, 24 * 30))
+
+    try:
+        limit = int(request.args.get("limit", 50))
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, 200))
+
+    try:
+        offset = int(request.args.get("offset", 0))
+    except (TypeError, ValueError):
+        offset = 0
+    offset = max(0, offset)
+
     if analytics_collection is None and visitor_analytics_collection is None:
-        return jsonify({"events": []}), 200
+        return jsonify({"events": [], "total": 0, "hasMore": False}), 200
+
+    # Fetch one extra record so we can tell whether another page exists.
+    # Device/source filters are applied after fetch (since they may need UA
+    # parsing), so pull a larger candidate pool when those filters are active
+    # to keep pagination reasonably accurate.
+    base_fetch = offset + limit + 1
+    fetch_count = min(base_fetch * 5, 1000) if (requested_devices or requested_sources) else base_fetch
 
     events = []
     now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=24)
+    cutoff = now - timedelta(hours=hours)
+
+    want_party_events = bool(requested_types & {"view", "purchase"})
+    want_visits = "visit" in requested_types
 
     # Fetch recent party events (views + redirects)
-    if analytics_collection is not None:
+    if want_party_events and analytics_collection is not None:
         try:
             party_query = {"createdAt": {"$gte": cutoff}, "category": "party"}
+            if requested_types == {"purchase"}:
+                party_query["action"] = "redirect"
+            elif requested_types == {"view"}:
+                party_query["action"] = {"$ne": "redirect"}
+
             try:
                 party_docs = list(
-                    analytics_collection.find(party_query).sort("createdAt", -1).limit(50)
+                    analytics_collection.find(party_query).sort("createdAt", -1).limit(fetch_count)
                 )
             except TypeError:
                 party_docs = list(analytics_collection.find(party_query))
                 party_docs.sort(key=lambda d: d.get("createdAt", ""), reverse=True)
-                party_docs = party_docs[:50]
+                party_docs = party_docs[:fetch_count]
 
             for doc in party_docs:
                 action = doc.get("action", "view")
                 event_type = "purchase" if action == "redirect" else "view"
+                if event_type not in requested_types:
+                    continue
                 device_type = doc.get("deviceType") or _parse_device_type(doc.get("userAgent"))
                 source = doc.get("trafficSource") or _parse_referrer_source(doc.get("referer"), None)
+
+                if requested_devices and (device_type or "unknown").lower() not in requested_devices:
+                    continue
+                if requested_sources and (source or "unknown").lower() not in requested_sources:
+                    continue
 
                 details_parts = []
                 if device_type and device_type != "unknown":
@@ -1647,27 +1737,34 @@ def analytics_recent():
                     "partyId": doc.get("partyId") or "",
                     "timestamp": isoformat_or_none(doc.get("createdAt")) or now.isoformat(),
                     "details": " · ".join(details_parts) if details_parts else None,
+                    "device": device_type or "unknown",
+                    "source": source or "unknown",
                 })
         except Exception as exc:
             app.logger.error(f"Failed to read recent party events: {exc}")
 
     # Fetch recent visitor sessions
-    if visitor_analytics_collection is not None:
+    if want_visits and visitor_analytics_collection is not None:
         try:
             visitor_query = {"createdAt": {"$gte": cutoff}}
             try:
                 visitor_docs = list(
-                    visitor_analytics_collection.find(visitor_query).sort("createdAt", -1).limit(20)
+                    visitor_analytics_collection.find(visitor_query).sort("createdAt", -1).limit(fetch_count)
                 )
             except TypeError:
                 visitor_docs = list(visitor_analytics_collection.find(visitor_query))
                 visitor_docs.sort(key=lambda d: d.get("createdAt", ""), reverse=True)
-                visitor_docs = visitor_docs[:20]
+                visitor_docs = visitor_docs[:fetch_count]
 
             for doc in visitor_docs:
                 device_type = doc.get("deviceType") or _parse_device_type(doc.get("userAgent"))
                 source = doc.get("trafficSource") or _parse_referrer_source(doc.get("referer"), None)
                 browser = doc.get("browser") or _parse_browser(doc.get("userAgent"))
+
+                if requested_devices and (device_type or "unknown").lower() not in requested_devices:
+                    continue
+                if requested_sources and (source or "unknown").lower() not in requested_sources:
+                    continue
 
                 details_parts = []
                 if device_type and device_type != "unknown":
@@ -1686,15 +1783,76 @@ def analytics_recent():
                     "partyId": None,
                     "timestamp": isoformat_or_none(doc.get("createdAt")) or now.isoformat(),
                     "details": " · ".join(details_parts) if details_parts else None,
+                    "device": device_type or "unknown",
+                    "source": source or "unknown",
                 })
         except Exception as exc:
             app.logger.error(f"Failed to read recent visitors: {exc}")
 
-    # Sort all events by timestamp descending and limit
+    # Sort merged events by timestamp descending, then paginate
     events.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
-    events = events[:50]
+    total = len(events)
+    page = events[offset:offset + limit]
+    has_more = total > offset + limit
 
-    return jsonify({"events": events}), 200
+    return jsonify({"events": page, "total": total, "hasMore": has_more}), 200
+
+
+@app.route("/api/admin/audit-log", methods=["GET"])
+@limiter.limit("30 per minute")
+@protect
+def admin_audit_log():
+    """Return recent admin mutation actions for the audit trail view.
+
+    Query params:
+    - action: comma-separated subset of action names (default: all)
+    - limit: page size, 1-200 (default: 50)
+    - offset: pagination offset (default: 0)
+
+    Note: admin auth here is a single shared password with no per-user claims,
+    so entries are attributed by IP/User-Agent, not a distinguishable admin identity.
+    """
+    if admin_audit_collection is None:
+        return jsonify({"entries": [], "total": 0, "hasMore": False}), 200
+
+    action_param = (request.args.get("action") or "").strip()
+    requested_actions = [a for a in action_param.split(",") if a]
+
+    try:
+        limit = int(request.args.get("limit", 50))
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, 200))
+
+    try:
+        offset = int(request.args.get("offset", 0))
+    except (TypeError, ValueError):
+        offset = 0
+    offset = max(0, offset)
+
+    query = {"action": {"$in": requested_actions}} if requested_actions else {}
+
+    try:
+        total = admin_audit_collection.count_documents(query)
+        docs = list(
+            admin_audit_collection.find(query).sort("createdAt", -1).skip(offset).limit(limit)
+        )
+    except Exception as exc:
+        app.logger.error(f"Failed to read admin audit log: {exc}")
+        return jsonify({"message": "Failed to read audit log."}), 500
+
+    entries = [{
+        "id": str(doc.get("_id", "")),
+        "action": doc.get("action"),
+        "targetType": doc.get("targetType"),
+        "targetId": doc.get("targetId"),
+        "ip": doc.get("ip"),
+        "userAgent": doc.get("userAgent"),
+        "details": doc.get("details"),
+        "timestamp": isoformat_or_none(doc.get("createdAt")),
+    } for doc in docs]
+
+    return jsonify({"entries": entries, "total": total, "hasMore": offset + limit < total}), 200
 
 
 @app.route("/api/admin/analytics/visitors", methods=["GET"])
@@ -1788,7 +1946,7 @@ def analytics_visitors():
         "trafficSources": to_breakdown(source_counts),
         "languages": to_breakdown(language_counts),
         "topReferrers": to_breakdown(referrer_domains),
-        "visitors": visitors_list[:100],
+        "visitors": visitors_list[:300],
     }), 200
 
 
@@ -3744,7 +3902,8 @@ def manual_price_scan():
         # If the user has many parties, we might want to thread it.
         # But given the user said "only price so it wont be a long process", we assume it's fast enough.
         # We'll just call the function.
-        result = scheduled_price_scan() 
+        result = scheduled_price_scan()
+        record_admin_action("manual_price_scan", None, None, {"details": result if isinstance(result, (dict, list)) else str(result)})
         return jsonify({"message": "Price scan completed.", "details": result}), 200
     except Exception as e:
         return jsonify({"message": "Error running price scan", "error": str(e)}), 500
@@ -3919,6 +4078,7 @@ def add_party():
         if carousel_info:
             response_payload["carousel"] = carousel_info
             response_payload["addedToCarousel"] = added_to_carousel
+        record_admin_action("add_party", "party", str(party_data.get("_id")), {"name": party_data.get("name"), "slug": party_data.get("slug")})
         return jsonify(response_payload), 201
     except errors.DuplicateKeyError as e:
         app.logger.warning(f"[DB] DuplicateKeyError: {getattr(e, 'details', None)}")
@@ -3976,7 +4136,8 @@ def clone_party():
          event_view = normalize_event(new_party)
          notify_indexers([event_view.get("canonicalUrl")])
          trigger_revalidation(event_related_paths(event_view))
-         
+
+         record_admin_action("clone_party", "party", str(new_party.get("_id")), {"sourceSlug": req.sourceSlug, "newSlug": new_slug})
          return jsonify({
             "message": "Party cloned successfully!",
             "party": normalize_event(new_party)
@@ -3998,6 +4159,7 @@ def delete_party(party_id):
         event_view = normalize_event(existing)
         notify_indexers([event_view.get("canonicalUrl")])
         trigger_revalidation(event_related_paths(event_view))
+        record_admin_action("delete_party", "party", party_id, {"name": existing.get("name"), "slug": existing.get("slug")})
         return jsonify({"message": "Party deleted successfully!"}), 200
     except Exception as e:
         return jsonify({"message": "Error deleting party", "error": str(e)}), 500
@@ -4050,6 +4212,7 @@ def update_party(party_id):
         event_view = normalize_event(updated_doc)
         notify_indexers([event_view.get("canonicalUrl")])
         trigger_revalidation(event_related_paths(event_view))
+        record_admin_action("update_party", "party", party_id, {"fields": list(data.keys())})
         return jsonify({"message": "Party updated successfully!"}), 200
     except ValidationError as ve:
         app.logger.warning(f"[VALIDATION] {ve}")
@@ -4576,6 +4739,7 @@ def add_carousel():
         doc["order"] = last_order + 1
         result = carousels_collection.insert_one(doc)
         doc["_id"] = result.inserted_id
+        record_admin_action("add_carousel", "carousel", str(result.inserted_id), {"title": doc.get("title")})
         return jsonify(serialize_carousel(doc)), 201
     except Exception as e:
         return jsonify({"message": "Error adding carousel", "error": str(e)}), 500
@@ -4609,6 +4773,7 @@ def update_carousel(carousel_id):
         if result.matched_count == 0:
             return jsonify({"message": "Carousel not found"}), 404
         updated_doc = carousels_collection.find_one({"_id": obj_id}) or {}
+        record_admin_action("update_carousel", "carousel", carousel_id, {"fields": list(update_data.keys())})
         return (
             jsonify({"message": "Carousel updated successfully!", "carousel": serialize_carousel(updated_doc)}),
             200,
@@ -4686,6 +4851,7 @@ def update_carousel_parties(carousel_id):
         if result.matched_count == 0:
             return jsonify({"message": "Carousel not found"}), 404
         updated_doc = carousels_collection.find_one({"_id": obj_id}) or {}
+        record_admin_action("update_carousel_parties", "carousel", carousel_id, {"partyCount": len(normalized_ids)})
         return (
             jsonify({"message": "Carousel parties updated successfully!", "carousel": serialize_carousel(updated_doc)}),
             200,
@@ -4699,9 +4865,11 @@ def update_carousel_parties(carousel_id):
 def delete_carousel(carousel_id):
     try:
         obj_id = ObjectId(carousel_id)
+        existing = carousels_collection.find_one({"_id": obj_id}) or {}
         result = carousels_collection.delete_one({"_id": obj_id})
         if result.deleted_count == 0:
             return jsonify({"message": "Carousel not found."}), 404
+        record_admin_action("delete_carousel", "carousel", carousel_id, {"title": existing.get("title")})
         return jsonify({"message": "Carousel deleted successfully!"}), 200
     except Exception as e:
         return jsonify({"message": "Error deleting carousel", "error": str(e)}), 500
@@ -4737,6 +4905,7 @@ def reorder_carousels():
         return jsonify({"message": "No items to reorder"}), 400
     try:
         carousels_collection.bulk_write(ops, ordered=True)
+        record_admin_action("reorder_carousels", "carousel", None, {"orderedIds": req.orderedIds})
         return jsonify({"message": "Reordered"}), 200
     except Exception as e:
         return jsonify({"message": "Error reordering carousels", "error": str(e)}), 500
@@ -4779,6 +4948,7 @@ def reorder_tag():
         ops.append(tags_collection.update_one({"_id": d["_id"]}, {"$set": {"order": idx}}))
     try:
         tags_collection.bulk_write(ops)
+        record_admin_action("reorder_tag", "tag", req.slug, {"newIndex": new_index})
         return jsonify({"message": "Tag order updated"}), 200
     except Exception as e:
         return jsonify({"message": "Error updating tag order", "error": str(e)}), 500
@@ -4819,6 +4989,7 @@ def rename_tag():
                 {"$set": {"tags.$[elem]": new_name}},
                 array_filters=[{"elem": old_name}],
             )
+        record_admin_action("rename_tag", "tag", tag_id_raw, {"oldName": old_name, "newName": new_name})
         return jsonify({"message": "Tag renamed"}), 200
     except Exception as exc:
         return jsonify({"message": "Error renaming tag", "error": str(exc)}), 500
@@ -4856,6 +5027,7 @@ def rename_carousel():
             {"_id": carousel["_id"]},
             {"$set": {"title": new_title}}
         )
+        record_admin_action("rename_carousel", "carousel", carousel_id, {"oldTitle": old_title, "newTitle": new_title})
         return jsonify({"message": "Carousel renamed"}), 200
     except Exception as e:
         return jsonify({"message": "Error renaming carousel", "error": str(e)}), 500
@@ -4910,6 +5082,7 @@ def update_section(section_id):
         updated_doc = sections_collection.find_one({"_id": identifier})
     except Exception as exc:
         return jsonify({"message": "Error loading section", "error": str(exc)}), 500
+    record_admin_action("update_section", "section", section_id, {"fields": list(updates.keys())})
     return (
         jsonify({"message": "Section updated successfully!", "section": normalize_section_doc(updated_doc)}),
         200,
@@ -4940,6 +5113,7 @@ def reorder_sections():
             missing.append(str(raw_id))
     if missing:
         return jsonify({"message": "Some sections were not found.", "missing": missing}), 404
+    record_admin_action("reorder_sections", "section", None, {"orderedIds": req.orderedIds})
     return jsonify({"message": "Sections reordered"}), 200
 
 
@@ -5039,6 +5213,7 @@ def import_carousel_from_urls():
     if warnings:
         response_payload["warnings"] = warnings
 
+    record_admin_action("import_carousel_from_urls", "carousel", str(carousel_doc.get("_id")), {"carouselName": carousel_name, "addedCount": added_count})
     return jsonify(response_payload), 200
 
 
@@ -5084,6 +5259,7 @@ def add_section():
     payload = dict(doc)
     if payload.get("_id") is not None:
         payload["_id"] = str(payload["_id"])
+    record_admin_action("add_section", "section", payload.get("_id"), {"title": title})
     return jsonify(payload), 201
 
 
@@ -5296,6 +5472,7 @@ def set_referral():
             {"$set": {"key": REFERRAL_KEY, "value": val}},
             upsert=True
         )
+        record_admin_action("set_referral", "setting", REFERRAL_KEY, {"value": val})
         return jsonify({"message": "Referral updated"}), 200
     except Exception as e:
         return jsonify({"message": "Error updating referral", "error": str(e)}), 500
@@ -5475,6 +5652,7 @@ def goout_approve(pending_id):
         event_view = normalize_event(party_data)
         notify_indexers([event_view.get("canonicalUrl")])
         trigger_revalidation(event_related_paths(event_view))
+        record_admin_action("goout_approve", "goout_pending", pending_id, {"partyDbId": party_db_id, "name": party_data.get("name")})
         return jsonify({"message": "Party approved and added.", "party_db_id": party_db_id}), 200
     except Exception as exc:
         return jsonify({"message": str(exc)}), 500
@@ -5493,6 +5671,7 @@ def goout_reject(pending_id):
         )
         if result.modified_count == 0:
             return jsonify({"message": "Not found."}), 404
+        record_admin_action("goout_reject", "goout_pending", pending_id)
         return jsonify({"message": "Party rejected."}), 200
     except Exception as exc:
         return jsonify({"message": str(exc)}), 500
@@ -5538,6 +5717,7 @@ def goout_edit_approve(pending_id):
         event_view = normalize_event(party_data)
         notify_indexers([event_view.get("canonicalUrl")])
         trigger_revalidation(event_related_paths(event_view))
+        record_admin_action("goout_edit_approve", "goout_pending", pending_id, {"partyDbId": party_db_id, "name": party_data.get("name"), "editedFields": list(edits.keys())})
         return jsonify({"message": "Party edited and approved.", "party_db_id": party_db_id}), 200
     except Exception as exc:
         return jsonify({"message": str(exc)}), 500

@@ -4330,8 +4330,6 @@ def get_parties():
         items = []
         referral = default_referral_code()
         now = datetime.now(timezone.utc)
-        yesterday_date = (now - timedelta(days=1)).date()
-        cleanup_cutoff = now - timedelta(days=30)
         try:
             date_param = request.args.get("date")
             upcoming_param = request.args.get("upcoming")
@@ -4365,34 +4363,24 @@ def get_parties():
 
         # Iterate and apply Python-side Date logic (Cleaning/Upcoming/Date Match)
         for party in cursor:
-            # [Existing Date Logic from your code]
-            party_id = party.get("_id")
             event_date = parse_datetime(party.get("date") or party.get("startsAt"))
-            
-            # 1. Cleanup old events
+
             if event_date:
                 event_date = event_date.astimezone(timezone.utc)
-                if event_date <= cleanup_cutoff:
-                    if party_id:
-                        parties_collection.delete_one({"_id": party_id})
-                    continue
-                
-                # 2. Filter specific Date (Python side)
+
+                # Filter specific Date (Python side)
                 if date_param:
                     parsed_filter = parse_datetime(date_param)
                     if parsed_filter and event_date.date() != parsed_filter.date():
                         continue
-                        
-                # 3. Filter Upcoming (Python side)
-                # Note: your code defined yesterday_date, make sure it's defined
-                yesterday_date = (now - timedelta(days=1)).date()
+
+                # Filter Upcoming (Python side) — past events are kept in the
+                # collection (see /archive on the frontend) and only excluded
+                # here when the caller explicitly asks for upcoming=true.
                 if upcoming_param:
                      is_upcoming = str(upcoming_param).lower() in {"1", "true", "yes", "on"}
                      if is_upcoming and event_date.date() < now.date():
                          continue
-                
-                if event_date.date() == yesterday_date:
-                    continue
             else:
                 # If no date, and filtering by date/upcoming, skip
                 if date_param or upcoming_param:

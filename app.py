@@ -3471,7 +3471,7 @@ def admin_login():
     try:
         hashed_attempt = bcrypt.hashpw(password, ADMIN_HASH)
         if hmac.compare_digest(hashed_attempt, ADMIN_HASH):
-            exp = datetime.utcnow() + timedelta(minutes=15)
+            exp = datetime.utcnow() + timedelta(days=30)
             token = jwt.encode({"exp": exp}, JWT_SECRET, algorithm="HS256")
             if isinstance(token, bytes):
                 token = token.decode()

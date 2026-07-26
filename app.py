@@ -3503,7 +3503,7 @@ class PartyUpdateSchema(BaseModel):
     originalUrl: str | None = None
     canonicalUrl: str | None = None
     goOutUrl: str | None = None
-    goOutUrl: str | None = None
+    goOutEventId: str | None = None
     referralCode: str | None = None
     pixelId: str | None = None
     ticketPrice: float | None = None
@@ -3773,12 +3773,18 @@ def scrape_party_details(url: str):
         canonical = normalize_url(url)
         go_out = normalized_or_none_for_dedupe(url)
 
+        # Numeric GoOut panel ID (EventSerial) — the join key against the
+        # sales-tracker's goout_sales/goout_sales_log collections, which are
+        # keyed by this same value (see goout-scraper/scraper.py go_out_id).
+        go_out_event_id = event_data.get("EventSerial") or event_data.get("eventSerial")
+
         party_details = {
             "name": event_data.get("Title") or "Unknown Event",
             "imageUrl": image_url,
             "date": event_data.get("StartingDate") or "Unknown Date",
             "location": location or "Unknown Location",
             "description": cleaned_desc or "No description available.",
+            "goOutEventId": str(go_out_event_id) if go_out_event_id else None,
             "region": get_region(location),
             "musicType": get_music_type(full_text),
             "eventType": get_event_type(full_text),

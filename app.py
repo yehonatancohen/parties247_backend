@@ -54,6 +54,8 @@ SERVICE_TOKEN: str = os.environ.get("SERVICE_TOKEN", "")
 
 goout_sessions_collection = None
 goout_pending_collection = None
+goout_sales_collection = None
+goout_sales_log_collection = None
 
 CANONICAL_BASE_URL = (os.environ.get("CANONICAL_BASE_URL") or "https://parties247-website.vercel.app").rstrip("/")
 INDEXNOW_KEY = os.environ.get("INDEXNOW_KEY")
@@ -467,6 +469,11 @@ try:
     ensure_index(goout_pending_collection, [("goOutUrl", 1)], name="pending_goout_url")
     ensure_index(goout_pending_collection, [("status", 1)], name="pending_status")
 
+    # Sales-tracker collections (written by goout-scraper, read-only here for
+    # the admin sales-by-party join — see build_sales_by_party()).
+    goout_sales_collection = db.goout_sales
+    goout_sales_log_collection = db.goout_sales_log
+
     # --- Admin action audit log ---
     admin_audit_collection = db.adminAuditLog
     ensure_index(admin_audit_collection, [("createdAt", -1)], name="audit_created_desc")
@@ -484,6 +491,8 @@ except Exception as e:
     analytics_collection = None
     goout_sessions_collection = None
     goout_pending_collection = None
+    goout_sales_collection = None
+    goout_sales_log_collection = None
     admin_audit_collection = None
 
 
@@ -734,6 +743,58 @@ def build_analytics_summary(window_hours: int = 24) -> dict:
         "devices": to_breakdown_list(device_counts),
     }
     return summary
+
+
+def build_sales_by_party() -> list[dict]:
+    """
+    Join the sales-tracker's goout_sales / goout_sales_log (written by
+    goout-scraper, keyed by GoOut's numeric EventSerial) onto parties by
+    goOutEventId, so real ticket sales can be matched to click/view analytics
+    per party. Ticket/revenue numbers are business-sensitive, so this backs
+    an authenticated endpoint only — never the public analytics summary.
+    """
+    if goout_sales_collection is None or parties_collection is None:
+        raise RuntimeError("Sales datastore unavailable")
+
+    party_id_by_event_id: dict[str, str] = {}
+    for party in fetch_all_documents(parties_collection):
+        event_id = party.get("goOutEventId")
+        party_identifier = party.get("_id")
+        if event_id and party_identifier is not None:
+            party_id_by_event_id[str(event_id)] = str(party_identifier)
+
+    lifetime_by_event_id: dict[str, dict] = {}
+    if goout_sales_log_collection is not None:
+        pipeline = [
+            {"$group": {
+                "_id": "$go_out_id",
+                "totalRevenue": {"$sum": "$revenue_earned"},
+                "totalTicketsSold": {"$sum": "$delta_confirmed"},
+            }}
+        ]
+        for doc in goout_sales_log_collection.aggregate(pipeline):
+            lifetime_by_event_id[str(doc["_id"])] = {
+                "totalRevenue": doc.get("totalRevenue") or 0.0,
+                "totalTicketsSold": doc.get("totalTicketsSold") or 0,
+            }
+
+    results = []
+    for doc in fetch_all_documents(goout_sales_collection):
+        go_out_id = doc.get("go_out_id")
+        if not go_out_id:
+            continue
+        go_out_id = str(go_out_id)
+        lifetime = lifetime_by_event_id.get(go_out_id, {})
+        results.append({
+            "goOutEventId": go_out_id,
+            "partyId": party_id_by_event_id.get(go_out_id),
+            "eventName": sanitize_analytics_text(doc.get("event_name")),
+            "confirmedTickets": int(doc.get("confirmed_count") or 0),
+            "pendingTickets": int(doc.get("pending_count") or 0),
+            "totalRevenue": lifetime.get("totalRevenue", 0.0),
+            "totalTicketsSold": lifetime.get("totalTicketsSold", doc.get("confirmed_count") or 0),
+        })
+    return results
 
 
 def build_time_series_analytics(start: datetime, end: datetime, interval: str = "day", party_slug: str | None = None) -> list[dict]:
@@ -2007,6 +2068,26 @@ def analytics_detailed():
         "interval": interval,
         "partyId": party_slug
     }), 200
+
+
+@app.route("/api/admin/analytics/sales", methods=["GET"])
+@limiter.limit("30 per minute")
+@protect
+def analytics_sales():
+    """
+    Real per-party ticket sales (from the sales tracker), joined by
+    goOutEventId. Authenticated — this is the only place ticket/revenue
+    numbers are exposed; never add these fields to the public
+    /api/analytics/summary payload.
+    """
+    try:
+        data = build_sales_by_party()
+    except RuntimeError:
+        return jsonify({"message": "Sales datastore unavailable."}), 503
+    except Exception as exc:
+        app.logger.error(f"Failed to build sales analytics: {exc}")
+        return jsonify({"message": "Failed to build sales analytics."}), 500
+    return jsonify({"data": data}), 200
 
 
 @app.route("/analytics", methods=["GET"])

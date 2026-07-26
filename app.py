@@ -41,7 +41,15 @@ load_dotenv()
 app = Flask(__name__)
 app.config["RATELIMIT_HEADERS_ENABLED"] = True
 app.config["SCHEDULER_API_ENABLED"] = True
-CORS(app)
+# Public API reads (GET /api/parties etc.) are intentionally open to anyone,
+# but browser CORS should only be granted to our own frontends — not left
+# wide open to any origin.
+CORS(app, origins=[
+    "https://www.parties247.co.il",
+    "https://parties247.co.il",
+    "https://admin.parties247.co.il",
+    r"https://.*\.vercel\.app",  # Vercel preview deployments of either app
+])
 limiter = Limiter(get_remote_address, app=app)
 scheduler = APScheduler()
 scheduler.init_app(app)

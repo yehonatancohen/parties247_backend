@@ -3611,6 +3611,11 @@ def get_event_type(text: str) -> str:
     return "אחר"
 
 def get_age(text: str, minimum_age: int) -> str:
+    # Go-Out's MinimumAge field is sometimes "" instead of a number/absent.
+    try:
+        minimum_age = int(minimum_age)
+    except (TypeError, ValueError):
+        minimum_age = 0
     if minimum_age >= 21:
         return "21+"
     if minimum_age >= 18:

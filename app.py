@@ -392,7 +392,8 @@ def ensure_index(coll: Collection, keys, name: str, **kwargs):
         same_keys = meta.get("key") == list(keys)
         same_unique = bool(meta.get("unique", False)) == bool(kwargs.get("unique", False))
         same_pfe = meta.get("partialFilterExpression") == kwargs.get("partialFilterExpression")
-        if same_keys and same_unique and same_pfe:
+        same_expire = meta.get("expireAfterSeconds") == kwargs.get("expireAfterSeconds")
+        if same_keys and same_unique and same_pfe and same_expire:
             return
         try:
             coll.drop_index(name)
@@ -467,7 +468,11 @@ try:
         visitor_analytics_collection,
         [("createdAt", 1)],
         name="visitor_created_ttl",
-        expireAfterSeconds=172800,
+        # 35 days: covers the longest range (30d) the admin analytics dashboard
+        # requests from this collection, with a few days of buffer. Previously
+        # 172800s (48h), which silently zeroed out the "visits" column in
+        # /api/admin/analytics/detailed for any day older than 2 days.
+        expireAfterSeconds=35 * 24 * 60 * 60,
     )
 
     # --- Go-Out scraper collections ---

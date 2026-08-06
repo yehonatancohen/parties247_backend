@@ -826,6 +826,100 @@ def build_sales_by_party() -> list[dict]:
     return results
 
 
+def build_party_funnel(days: int = 30) -> dict:
+    """
+    Full conversion funnel — page views → GoOut redirect clicks → confirmed
+    GoOut purchases — both per party and site-wide.
+
+    Views/redirects are aggregated fresh from the raw `analytics` event log,
+    not the `partyAnalytics` rollup that `build_analytics_summary()` uses:
+    that rollup is *deleted* the moment a party's date passes, which would
+    silently zero out the funnel for exactly the past events real GoOut
+    sales data is richest for (sales keep arriving for days around and after
+    an event — see build_sales_by_party()'s docstring).
+    """
+    if analytics_collection is None or parties_collection is None:
+        raise RuntimeError("Analytics datastore unavailable")
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+
+    views_by_party: dict[str, int] = {}
+    redirects_by_party: dict[str, int] = {}
+    try:
+        pipeline = [
+            {"$match": {"category": "party", "createdAt": {"$gte": cutoff}}},
+            {"$group": {"_id": {"partyId": "$partyId", "action": "$action"}, "count": {"$sum": 1}}},
+        ]
+        for doc in analytics_collection.aggregate(pipeline):
+            party_id = (doc.get("_id") or {}).get("partyId")
+            if not party_id:
+                continue
+            party_id = str(party_id)
+            action = (doc.get("_id") or {}).get("action")
+            count = int(doc.get("count") or 0)
+            if action == "redirect":
+                redirects_by_party[party_id] = redirects_by_party.get(party_id, 0) + count
+            else:
+                views_by_party[party_id] = views_by_party.get(party_id, 0) + count
+    except Exception as exc:
+        app.logger.error(f"Failed to aggregate party funnel views/redirects: {exc}")
+        raise
+
+    tickets_by_party: dict[str, int] = {}
+    revenue_by_party: dict[str, float] = {}
+    for row in build_sales_by_party():
+        pid = row.get("partyId")
+        if not pid:
+            continue
+        tickets_by_party[pid] = tickets_by_party.get(pid, 0) + int(row.get("totalTicketsSold") or 0)
+        revenue_by_party[pid] = revenue_by_party.get(pid, 0.0) + float(row.get("totalRevenue") or 0.0)
+
+    parties_by_id: dict[str, dict] = {}
+    for party in fetch_all_documents(parties_collection):
+        identifier = party.get("_id")
+        if identifier is not None:
+            parties_by_id[str(identifier)] = party
+
+    party_ids = set(views_by_party) | set(redirects_by_party) | set(tickets_by_party)
+    by_party = []
+    for party_id in party_ids:
+        party_doc = parties_by_id.get(party_id)
+        views = views_by_party.get(party_id, 0)
+        redirects = redirects_by_party.get(party_id, 0)
+        purchases = tickets_by_party.get(party_id, 0)
+        by_party.append({
+            "partyId": party_id,
+            "name": sanitize_analytics_text(party_doc.get("name")) if party_doc else None,
+            "slug": sanitize_analytics_text(party_doc.get("slug")) if party_doc else None,
+            "date": isoformat_or_none(party_doc.get("date") or party_doc.get("startsAt")) if party_doc else None,
+            "views": views,
+            "redirects": redirects,
+            "purchases": purchases,
+            "revenue": revenue_by_party.get(party_id, 0.0),
+            "viewToRedirectRate": round(redirects / views * 100, 1) if views else None,
+            "redirectToPurchaseRate": round(purchases / redirects * 100, 1) if redirects else None,
+        })
+    by_party.sort(key=lambda p: (p["views"], p["redirects"], p["purchases"]), reverse=True)
+
+    total_views = sum(views_by_party.values())
+    total_redirects = sum(redirects_by_party.values())
+    total_purchases = sum(tickets_by_party.values())
+    total_revenue = sum(revenue_by_party.values())
+
+    site_wide = {
+        "views": total_views,
+        "redirects": total_redirects,
+        "purchases": total_purchases,
+        "revenue": total_revenue,
+        "viewToRedirectRate": round(total_redirects / total_views * 100, 1) if total_views else None,
+        "redirectToPurchaseRate": round(total_purchases / total_redirects * 100, 1) if total_redirects else None,
+        "windowDays": days,
+    }
+
+    return {"siteWide": site_wide, "byParty": by_party}
+
+
 def build_time_series_analytics(start: datetime, end: datetime, interval: str = "day", party_slug: str | None = None) -> list[dict]:
     """
     Build time-series analytics for visits, party views, and purchases.
@@ -1731,14 +1825,21 @@ def analytics_recent():
     """Return recent analytics events for the live activity feed.
 
     Supports optional filtering/pagination via query params:
-    - type: comma-separated subset of view,purchase,visit (default: all)
+    - type: comma-separated subset of view,redirect,goout_purchase,visit (default: all)
     - device: comma-separated subset of mobile,desktop,tablet,unknown (default: all)
     - source: comma-separated subset of direct,organic_search,social,referral,... (default: all)
     - hours: lookback window in hours, 1-720 (default: 24)
     - limit: page size, 1-200 (default: 50)
     - offset: pagination offset into the merged, timestamp-sorted result (default: 0)
+
+    NOTE: "redirect" (a click on the site's own purchase link, which sends the
+    visitor to GoOut) used to be exposed here as "purchase" — misleading,
+    since nothing is actually purchased at that point. Renamed 2026-08-07.
+    "goout_purchase" is the real thing: a confirmed ticket sale reported back
+    by the GoOut sales tracker (goout_sales_log), joined onto a party by
+    goOutEventId.
     """
-    valid_types = {"view", "purchase", "visit"}
+    valid_types = {"view", "redirect", "goout_purchase", "visit"}
     type_param = (request.args.get("type") or "").strip().lower()
     requested_types = {t for t in type_param.split(",") if t} & valid_types
     if not requested_types:
@@ -1782,14 +1883,15 @@ def analytics_recent():
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=hours)
 
-    want_party_events = bool(requested_types & {"view", "purchase"})
+    want_party_events = bool(requested_types & {"view", "redirect"})
     want_visits = "visit" in requested_types
+    want_goout_purchases = "goout_purchase" in requested_types
 
     # Fetch recent party events (views + redirects)
     if want_party_events and analytics_collection is not None:
         try:
             party_query = {"createdAt": {"$gte": cutoff}, "category": "party"}
-            if requested_types == {"purchase"}:
+            if requested_types == {"redirect"}:
                 party_query["action"] = "redirect"
             elif requested_types == {"view"}:
                 party_query["action"] = {"$ne": "redirect"}
@@ -1805,7 +1907,7 @@ def analytics_recent():
 
             for doc in party_docs:
                 action = doc.get("action", "view")
-                event_type = "purchase" if action == "redirect" else "view"
+                event_type = "redirect" if action == "redirect" else "view"
                 if event_type not in requested_types:
                     continue
                 device_type = doc.get("deviceType") or _parse_device_type(doc.get("userAgent"))
@@ -1834,6 +1936,42 @@ def analytics_recent():
                 })
         except Exception as exc:
             app.logger.error(f"Failed to read recent party events: {exc}")
+
+    # Fetch recent real GoOut purchases (confirmed ticket sales, not clicks)
+    if want_goout_purchases and goout_sales_log_collection is not None:
+        try:
+            party_by_event_id: dict[str, dict] = {}
+            for party in fetch_all_documents(parties_collection):
+                event_id = party.get("goOutEventId")
+                if event_id:
+                    party_by_event_id[str(event_id)] = party
+
+            sale_query = {"recorded_at": {"$gte": cutoff}, "delta_confirmed": {"$gt": 0}}
+            try:
+                sale_docs = list(
+                    goout_sales_log_collection.find(sale_query).sort("recorded_at", -1).limit(fetch_count)
+                )
+            except TypeError:
+                sale_docs = list(goout_sales_log_collection.find(sale_query))
+                sale_docs.sort(key=lambda d: d.get("recorded_at", ""), reverse=True)
+                sale_docs = sale_docs[:fetch_count]
+
+            for doc in sale_docs:
+                go_out_id = doc.get("go_out_id")
+                party = party_by_event_id.get(str(go_out_id)) if go_out_id else None
+                ticket_count = int(doc.get("delta_confirmed") or 0)
+                events.append({
+                    "id": str(doc.get("_id", "")),
+                    "type": "goout_purchase",
+                    "partyName": (party.get("name") if party else None) or sanitize_analytics_text(doc.get("event_name")) or "",
+                    "partyId": str(party.get("_id")) if party else "",
+                    "timestamp": isoformat_or_none(doc.get("recorded_at")) or now.isoformat(),
+                    "details": f"{ticket_count} כרטיסים" if ticket_count != 1 else "כרטיס אחד",
+                    "device": "unknown",
+                    "source": "goout",
+                })
+        except Exception as exc:
+            app.logger.error(f"Failed to read recent GoOut purchases: {exc}")
 
     # Fetch recent visitor sessions
     if want_visits and visitor_analytics_collection is not None:
@@ -2117,6 +2255,31 @@ def analytics_sales():
         app.logger.error(f"Failed to build sales analytics: {exc}")
         return jsonify({"message": "Failed to build sales analytics."}), 500
     return jsonify({"data": data}), 200
+
+
+@app.route("/api/admin/analytics/funnel", methods=["GET"])
+@limiter.limit("30 per minute")
+@protect
+def analytics_funnel():
+    """
+    Conversion funnel — views → GoOut redirect clicks → confirmed GoOut
+    purchases — site-wide and per party. Query params: days (default 30,
+    max 180). Authenticated for the same reason as /api/admin/analytics/sales.
+    """
+    try:
+        days = int(request.args.get("days", 30))
+    except (TypeError, ValueError):
+        days = 30
+    days = max(1, min(days, 180))
+
+    try:
+        data = build_party_funnel(days=days)
+    except RuntimeError:
+        return jsonify({"message": "Analytics datastore unavailable."}), 503
+    except Exception as exc:
+        app.logger.error(f"Failed to build party funnel: {exc}")
+        return jsonify({"message": "Failed to build funnel analytics."}), 500
+    return jsonify(data), 200
 
 
 @app.route("/analytics", methods=["GET"])

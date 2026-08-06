@@ -765,16 +765,28 @@ def build_sales_by_party() -> list[dict]:
     goOutEventId, so real ticket sales can be matched to click/view analytics
     per party. Ticket/revenue numbers are business-sensitive, so this backs
     an authenticated endpoint only — never the public analytics summary.
+
+    Carries the party's own name/slug/date directly (not just its id) —
+    `build_analytics_summary()`'s "live parties" list drops any party whose
+    date has passed, but ticket sales keep trickling in for days around and
+    after an event's date, so most real sales data is for parties that list
+    would already have excluded. Callers must not assume every row here also
+    appears in `/api/admin/analytics/summary`.
     """
     if goout_sales_collection is None or parties_collection is None:
         raise RuntimeError("Sales datastore unavailable")
 
-    party_id_by_event_id: dict[str, str] = {}
+    party_by_event_id: dict[str, dict] = {}
     for party in fetch_all_documents(parties_collection):
         event_id = party.get("goOutEventId")
         party_identifier = party.get("_id")
         if event_id and party_identifier is not None:
-            party_id_by_event_id[str(event_id)] = str(party_identifier)
+            party_by_event_id[str(event_id)] = {
+                "partyId": str(party_identifier),
+                "partyName": sanitize_analytics_text(party.get("name")),
+                "partySlug": sanitize_analytics_text(party.get("slug")),
+                "partyDate": isoformat_or_none(party.get("date") or party.get("startsAt")),
+            }
 
     lifetime_by_event_id: dict[str, dict] = {}
     if goout_sales_log_collection is not None:
@@ -798,9 +810,13 @@ def build_sales_by_party() -> list[dict]:
             continue
         go_out_id = str(go_out_id)
         lifetime = lifetime_by_event_id.get(go_out_id, {})
+        party = party_by_event_id.get(go_out_id, {})
         results.append({
             "goOutEventId": go_out_id,
-            "partyId": party_id_by_event_id.get(go_out_id),
+            "partyId": party.get("partyId"),
+            "partyName": party.get("partyName"),
+            "partySlug": party.get("partySlug"),
+            "partyDate": party.get("partyDate"),
             "eventName": sanitize_analytics_text(doc.get("event_name")),
             "confirmedTickets": int(doc.get("confirmed_count") or 0),
             "pendingTickets": int(doc.get("pending_count") or 0),

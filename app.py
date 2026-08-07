@@ -491,6 +491,13 @@ try:
     admin_audit_collection = db.adminAuditLog
     ensure_index(admin_audit_collection, [("createdAt", -1)], name="audit_created_desc")
 
+    # Slug redirects left behind when a duplicate party is deleted (e.g. by
+    # goout-scraper's dedupe_parties.py) — lets a dead /event/<slug> URL send
+    # visitors/search engines to the surviving canonical party instead of a
+    # dead link, preserving whatever SEO/traffic signal the old URL had.
+    party_redirects_collection = db.party_redirects
+    ensure_index(party_redirects_collection, [("fromSlug", 1)], name="unique_from_slug", unique=True)
+
     app.logger.info("Connected to MongoDB and ensured indexes.")
 except Exception as e:
     app.logger.error(f"Error connecting to MongoDB Atlas: {e}")
@@ -507,6 +514,7 @@ except Exception as e:
     goout_sales_collection = None
     goout_sales_log_collection = None
     admin_audit_collection = None
+    party_redirects_collection = None
 
 
 def record_setting_hit(key: str, extra: dict | None = None):
@@ -4573,18 +4581,54 @@ def clone_party():
 @protect
 def delete_party(party_id):
     try:
+        # Optional: when this delete is merging a duplicate party into a
+        # surviving one (e.g. goout-scraper's dedupe_parties.py), the caller
+        # passes the survivor's slug so /event/<deleted-slug> keeps working
+        # as a redirect instead of 404ing and losing any accumulated SEO
+        # signal. Accepts both a JSON body and a query param for convenience.
+        payload = request.get_json(silent=True) or {}
+        redirect_to = (payload.get("redirectTo") or request.args.get("redirectTo") or "").strip()
+
         obj_id = ObjectId(party_id)
         existing = parties_collection.find_one({"_id": obj_id}) or {}
         result = parties_collection.delete_one({"_id": obj_id})
         if result.deleted_count == 0:
             return jsonify({"message": "Party not found."}), 404
+
+        deleted_slug = existing.get("slug")
+        if redirect_to and deleted_slug and redirect_to != deleted_slug and party_redirects_collection is not None:
+            try:
+                party_redirects_collection.update_one(
+                    {"fromSlug": deleted_slug},
+                    {"$set": {"fromSlug": deleted_slug, "toSlug": redirect_to, "createdAt": datetime.utcnow()}},
+                    upsert=True,
+                )
+            except Exception as exc:
+                app.logger.warning(f"Failed to record party redirect {deleted_slug} -> {redirect_to}: {exc}")
+
         event_view = normalize_event(existing)
         notify_indexers([event_view.get("canonicalUrl")])
         trigger_revalidation(event_related_paths(event_view))
-        record_admin_action("delete_party", "party", party_id, {"name": existing.get("name"), "slug": existing.get("slug")})
+        record_admin_action("delete_party", "party", party_id, {"name": existing.get("name"), "slug": existing.get("slug"), "redirectTo": redirect_to or None})
         return jsonify({"message": "Party deleted successfully!"}), 200
     except Exception as e:
         return jsonify({"message": "Error deleting party", "error": str(e)}), 500
+
+
+@app.route("/api/redirects/<slug>", methods=["GET"])
+@limiter.limit("120 per minute")
+def get_party_redirect(slug):
+    """
+    Public, unauthenticated lookup for slugs of deleted (merged-away)
+    duplicate parties. Used by parties247-website's proxy.ts to 308-redirect
+    a dead /event/<slug> to the surviving canonical party instead of 404ing.
+    """
+    if party_redirects_collection is None:
+        return jsonify({"message": "Redirects datastore unavailable."}), 503
+    doc = party_redirects_collection.find_one({"fromSlug": slug})
+    if not doc:
+        return jsonify({"message": "No redirect found."}), 404
+    return jsonify({"fromSlug": doc["fromSlug"], "toSlug": doc["toSlug"]}), 200
 
 @app.route("/api/admin/update-party/<party_id>", methods=["PUT"])
 @limiter.limit("100 per minute")

@@ -839,6 +839,7 @@ def build_sales_by_party() -> list[dict]:
 
         results.append({
             "goOutEventId": go_out_id,
+            "accountId": doc.get("account_id"),
             "partyId": party.get("partyId"),
             "partyName": party.get("partyName"),
             "partySlug": party.get("partySlug"),
@@ -846,6 +847,10 @@ def build_sales_by_party() -> list[dict]:
             "eventName": sanitize_analytics_text(doc.get("event_name")),
             "confirmedTickets": int(doc.get("confirmed_count") or 0),
             "pendingTickets": int(doc.get("pending_count") or 0),
+            # totalRevenue is OUR calculated revenue (account1: flat ₪25/ticket,
+            # account2: 6% of gross event revenue) via sales_tracker.py's
+            # _calc_revenue — not GoOut's own revenue figures. See realOwnRevenue
+            # below for GoOut's raw (informational) gross numbers.
             "totalRevenue": lifetime.get("totalRevenue", 0.0),
             "totalTicketsSold": lifetime.get("totalTicketsSold", doc.get("confirmed_count") or 0),
             "realViews": doc.get("views"),
@@ -923,6 +928,7 @@ def build_party_funnel(days: int = 30) -> dict:
     # frontend adds.
     real_views_by_party: dict[str, int] = {}
     real_revenue_by_party: dict[str, float] = {}
+    account_by_party: dict[str, str] = {}
     if goout_sales_collection is not None:
         for doc in fetch_all_documents(goout_sales_collection):
             go_out_id = doc.get("go_out_id")
@@ -932,6 +938,8 @@ def build_party_funnel(days: int = 30) -> dict:
             if not party:
                 continue
             pid = party["partyId"]
+            if doc.get("account_id"):
+                account_by_party[pid] = doc["account_id"]
             endone = doc.get("endone_stats") or {}
             views = doc.get("views")
             if views is None:
@@ -964,6 +972,7 @@ def build_party_funnel(days: int = 30) -> dict:
         purchases = tickets_by_party.get(party_id, 0)
         by_party.append({
             "partyId": party_id,
+            "accountId": account_by_party.get(party_id),
             "name": sanitize_analytics_text(party_doc.get("name")) if party_doc else None,
             "slug": sanitize_analytics_text(party_doc.get("slug")) if party_doc else None,
             "date": isoformat_or_none(party_doc.get("date") or party_doc.get("startsAt")) if party_doc else None,

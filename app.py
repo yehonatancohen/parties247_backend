@@ -987,6 +987,14 @@ def build_party_funnel(days: int = 30, real_month: str | None = None) -> dict:
     by_party = []
     for party_id in party_ids:
         party_doc = parties_by_id.get(party_id)
+        if party_doc is None:
+            # Analytics/sales data referencing a party that no longer exists in the
+            # catalog (deleted party, stale partyId) -- can't have a name/slug/link,
+            # since there's no real party behind it. Confirmed 2026-08-07: showing
+            # these as rows with blank name/slug/account produced "data with no
+            # name" holes in the dashboard/CSV export that looked like a bug in the
+            # merge itself rather than orphaned analytics for a deleted party.
+            continue
         views = views_by_party.get(party_id, 0)
         redirects = redirects_by_party.get(party_id, 0)
         purchases = tickets_by_party.get(party_id, 0)

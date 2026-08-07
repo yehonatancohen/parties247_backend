@@ -938,7 +938,11 @@ def build_party_funnel(days: int = 30) -> dict:
                 views = (endone.get("views") or {}).get("Views")
             if views is not None:
                 real_views_by_party[pid] = real_views_by_party.get(pid, 0) + int(views)
-            revenue = doc.get("real_total_revenue")
+            # GoOut's `total_revenue` field is always 0 for these accounts (confirmed
+            # against live data — likely requires an organizer-level role we don't have).
+            # `own_revenue` is the real, non-zero figure and lines up with confirmed
+            # ticket counts (e.g. 8 tickets -> ₪910), so that's what we use.
+            revenue = doc.get("real_own_revenue")
             if revenue is not None:
                 real_revenue_by_party[pid] = real_revenue_by_party.get(pid, 0.0) + float(revenue)
 

@@ -758,6 +758,46 @@ def build_analytics_summary(window_hours: int = 24) -> dict:
     return summary
 
 
+def _party_by_goout_event_id() -> dict[str, dict]:
+    party_by_event_id: dict[str, dict] = {}
+    for party in fetch_all_documents(parties_collection):
+        event_id = party.get("goOutEventId")
+        party_identifier = party.get("_id")
+        if event_id and party_identifier is not None:
+            party_by_event_id[str(event_id)] = {
+                "partyId": str(party_identifier),
+                "partyName": sanitize_analytics_text(party.get("name")),
+                "partySlug": sanitize_analytics_text(party.get("slug")),
+                "partyDate": isoformat_or_none(party.get("date") or party.get("startsAt")),
+            }
+    return party_by_event_id
+
+
+def _sales_totals_by_event_id(cutoff: datetime | None = None) -> dict[str, dict]:
+    """
+    Sum goout_sales_log revenue/tickets per go_out_id, optionally restricted to
+    entries recorded on/after `cutoff`. Pass cutoff=None for lifetime totals.
+    """
+    totals: dict[str, dict] = {}
+    if goout_sales_log_collection is None:
+        return totals
+    match_stage = {"recorded_at": {"$gte": cutoff}} if cutoff is not None else {}
+    pipeline = []
+    if match_stage:
+        pipeline.append({"$match": match_stage})
+    pipeline.append({"$group": {
+        "_id": "$go_out_id",
+        "totalRevenue": {"$sum": "$revenue_earned"},
+        "totalTicketsSold": {"$sum": "$delta_confirmed"},
+    }})
+    for doc in goout_sales_log_collection.aggregate(pipeline):
+        totals[str(doc["_id"])] = {
+            "totalRevenue": doc.get("totalRevenue") or 0.0,
+            "totalTicketsSold": doc.get("totalTicketsSold") or 0,
+        }
+    return totals
+
+
 def build_sales_by_party() -> list[dict]:
     """
     Join the sales-tracker's goout_sales / goout_sales_log (written by
@@ -776,32 +816,8 @@ def build_sales_by_party() -> list[dict]:
     if goout_sales_collection is None or parties_collection is None:
         raise RuntimeError("Sales datastore unavailable")
 
-    party_by_event_id: dict[str, dict] = {}
-    for party in fetch_all_documents(parties_collection):
-        event_id = party.get("goOutEventId")
-        party_identifier = party.get("_id")
-        if event_id and party_identifier is not None:
-            party_by_event_id[str(event_id)] = {
-                "partyId": str(party_identifier),
-                "partyName": sanitize_analytics_text(party.get("name")),
-                "partySlug": sanitize_analytics_text(party.get("slug")),
-                "partyDate": isoformat_or_none(party.get("date") or party.get("startsAt")),
-            }
-
-    lifetime_by_event_id: dict[str, dict] = {}
-    if goout_sales_log_collection is not None:
-        pipeline = [
-            {"$group": {
-                "_id": "$go_out_id",
-                "totalRevenue": {"$sum": "$revenue_earned"},
-                "totalTicketsSold": {"$sum": "$delta_confirmed"},
-            }}
-        ]
-        for doc in goout_sales_log_collection.aggregate(pipeline):
-            lifetime_by_event_id[str(doc["_id"])] = {
-                "totalRevenue": doc.get("totalRevenue") or 0.0,
-                "totalTicketsSold": doc.get("totalTicketsSold") or 0,
-            }
+    party_by_event_id = _party_by_goout_event_id()
+    lifetime_by_event_id = _sales_totals_by_event_id(cutoff=None)
 
     results = []
     for doc in fetch_all_documents(goout_sales_collection):
@@ -866,14 +882,20 @@ def build_party_funnel(days: int = 30) -> dict:
         app.logger.error(f"Failed to aggregate party funnel views/redirects: {exc}")
         raise
 
+    # Windowed (not lifetime) sales — `days`-scoped, same as views/redirects above.
+    # build_sales_by_party() returns all-time totals; using it here would mislabel
+    # every event's entire history as having happened "in the last N days".
     tickets_by_party: dict[str, int] = {}
     revenue_by_party: dict[str, float] = {}
-    for row in build_sales_by_party():
-        pid = row.get("partyId")
-        if not pid:
+    party_by_event_id = _party_by_goout_event_id()
+    windowed_by_event_id = _sales_totals_by_event_id(cutoff=cutoff)
+    for go_out_id, totals in windowed_by_event_id.items():
+        party = party_by_event_id.get(go_out_id)
+        if not party:
             continue
-        tickets_by_party[pid] = tickets_by_party.get(pid, 0) + int(row.get("totalTicketsSold") or 0)
-        revenue_by_party[pid] = revenue_by_party.get(pid, 0.0) + float(row.get("totalRevenue") or 0.0)
+        pid = party["partyId"]
+        tickets_by_party[pid] = tickets_by_party.get(pid, 0) + int(totals.get("totalTicketsSold") or 0)
+        revenue_by_party[pid] = revenue_by_party.get(pid, 0.0) + float(totals.get("totalRevenue") or 0.0)
 
     parties_by_id: dict[str, dict] = {}
     for party in fetch_all_documents(parties_collection):

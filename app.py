@@ -912,13 +912,46 @@ def build_party_funnel(days: int = 30) -> dict:
         tickets_by_party[pid] = tickets_by_party.get(pid, 0) + int(totals.get("totalTicketsSold") or 0)
         revenue_by_party[pid] = revenue_by_party.get(pid, 0.0) + float(totals.get("totalRevenue") or 0.0)
 
+    # Real GoOut per-event stats (views/revenue via cf-relay's endOne scraping —
+    # see goout-scraper/cf-relay/README.md). This is a *current snapshot* per event
+    # (GoOut's own lifetime view/revenue counter), not something that can be
+    # windowed by `days` the way our own analytics/ticket deltas are — so it's
+    # joined in separately rather than folded into the windowed dicts above.
+    # Critically, party_ids below must include partyIds that ONLY have real GoOut
+    # data (zero site-side views/redirects/ticket-deltas in this window) — otherwise
+    # those rows never appear in `by_party` at all, no matter what columns the
+    # frontend adds.
+    real_views_by_party: dict[str, int] = {}
+    real_revenue_by_party: dict[str, float] = {}
+    if goout_sales_collection is not None:
+        for doc in fetch_all_documents(goout_sales_collection):
+            go_out_id = doc.get("go_out_id")
+            if not go_out_id:
+                continue
+            party = party_by_event_id.get(str(go_out_id))
+            if not party:
+                continue
+            pid = party["partyId"]
+            endone = doc.get("endone_stats") or {}
+            views = doc.get("views")
+            if views is None:
+                views = (endone.get("views") or {}).get("Views")
+            if views is not None:
+                real_views_by_party[pid] = real_views_by_party.get(pid, 0) + int(views)
+            revenue = doc.get("real_total_revenue")
+            if revenue is not None:
+                real_revenue_by_party[pid] = real_revenue_by_party.get(pid, 0.0) + float(revenue)
+
     parties_by_id: dict[str, dict] = {}
     for party in fetch_all_documents(parties_collection):
         identifier = party.get("_id")
         if identifier is not None:
             parties_by_id[str(identifier)] = party
 
-    party_ids = set(views_by_party) | set(redirects_by_party) | set(tickets_by_party)
+    party_ids = (
+        set(views_by_party) | set(redirects_by_party) | set(tickets_by_party)
+        | set(real_views_by_party) | set(real_revenue_by_party)
+    )
     by_party = []
     for party_id in party_ids:
         party_doc = parties_by_id.get(party_id)
@@ -936,6 +969,8 @@ def build_party_funnel(days: int = 30) -> dict:
             "revenue": revenue_by_party.get(party_id, 0.0),
             "viewToRedirectRate": round(redirects / views * 100, 1) if views else None,
             "redirectToPurchaseRate": round(purchases / redirects * 100, 1) if redirects else None,
+            "realGoOutViews": real_views_by_party.get(party_id),
+            "realGoOutRevenue": real_revenue_by_party.get(party_id),
         })
     by_party.sort(key=lambda p: (p["views"], p["redirects"], p["purchases"]), reverse=True)
 
@@ -943,6 +978,8 @@ def build_party_funnel(days: int = 30) -> dict:
     total_redirects = sum(redirects_by_party.values())
     total_purchases = sum(tickets_by_party.values())
     total_revenue = sum(revenue_by_party.values())
+    total_real_goout_views = sum(real_views_by_party.values())
+    total_real_goout_revenue = sum(real_revenue_by_party.values())
 
     site_wide = {
         "views": total_views,
@@ -952,6 +989,9 @@ def build_party_funnel(days: int = 30) -> dict:
         "viewToRedirectRate": round(total_redirects / total_views * 100, 1) if total_views else None,
         "redirectToPurchaseRate": round(total_purchases / total_redirects * 100, 1) if total_redirects else None,
         "windowDays": days,
+        # Lifetime snapshot, not windowed by `days` — see comment above.
+        "realGoOutViews": total_real_goout_views,
+        "realGoOutRevenue": total_real_goout_revenue,
     }
 
     return {"siteWide": site_wide, "byParty": by_party}

@@ -827,6 +827,16 @@ def build_sales_by_party() -> list[dict]:
         go_out_id = str(go_out_id)
         lifetime = lifetime_by_event_id.get(go_out_id, {})
         party = party_by_event_id.get(go_out_id, {})
+
+        # Real per-event data from www.go-out.co/endOne/* (via cf-relay), written by
+        # scraper.py::_fetch_endone_stats — separate from confirmed_count/totalRevenue
+        # above, which come from the myEvents API + our own sale-delta bookkeeping.
+        # See goout-scraper/cf-relay/README.md. Optional: None/[] when a given event
+        # hasn't had a successful endOne scrape yet.
+        endone = doc.get("endone_stats") or {}
+        sales_per_date = ((endone.get("sales_per_date") or {}).get("dates")) or {}
+        last_accepted = (endone.get("last_accepted") or {}).get("users") or []
+
         results.append({
             "goOutEventId": go_out_id,
             "partyId": party.get("partyId"),
@@ -838,6 +848,11 @@ def build_sales_by_party() -> list[dict]:
             "pendingTickets": int(doc.get("pending_count") or 0),
             "totalRevenue": lifetime.get("totalRevenue", 0.0),
             "totalTicketsSold": lifetime.get("totalTicketsSold", doc.get("confirmed_count") or 0),
+            "realViews": doc.get("views"),
+            "realTotalRevenue": doc.get("real_total_revenue"),
+            "realOwnRevenue": doc.get("real_own_revenue"),
+            "realSalesPerDate": sales_per_date,
+            "realBuyerCount": len(last_accepted),
         })
     return results
 

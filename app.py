@@ -862,7 +862,7 @@ def build_sales_by_party() -> list[dict]:
     return results
 
 
-def build_party_funnel(days: int = 30) -> dict:
+def build_party_funnel(days: int = 30, real_month: str | None = None) -> dict:
     """
     Full conversion funnel — page views → GoOut redirect clicks → confirmed
     GoOut purchases — both per party and site-wide.
@@ -936,6 +936,13 @@ def build_party_funnel(days: int = 30) -> dict:
     # See goout-scraper's sales_tracker.py _reconcile_dual_account_referrals for
     # the companion fix that keeps the *site's* referral on account1 in this case.
     accounts_by_party: dict[str, set[str]] = {}
+    # GoOut's views/revenue counters are a *current cumulative snapshot* per event,
+    # not a windowed delta -- there is no way to ask "how many views did this event
+    # get in July" the way we can for our own site analytics. What we CAN do is
+    # filter *which events* contribute, by the event's own date (party.date), so
+    # "real revenue in August" means "real revenue from parties that happened in
+    # August" -- not a trailing N-day window from now like `days` above.
+    real_months_available: set[str] = set()
     if goout_sales_collection is not None:
         for doc in fetch_all_documents(goout_sales_collection):
             go_out_id = doc.get("go_out_id")
@@ -947,6 +954,12 @@ def build_party_funnel(days: int = 30) -> dict:
             pid = party["partyId"]
             if doc.get("account_id"):
                 accounts_by_party.setdefault(pid, set()).add(doc["account_id"])
+            party_date = party.get("partyDate")
+            party_month = party_date[:7] if party_date else None
+            if party_month:
+                real_months_available.add(party_month)
+            if real_month and real_month != "all" and party_month != real_month:
+                continue
             endone = doc.get("endone_stats") or {}
             views = doc.get("views")
             if views is None:
@@ -1014,12 +1027,18 @@ def build_party_funnel(days: int = 30) -> dict:
         "viewToRedirectRate": round(total_redirects / total_views * 100, 1) if total_views else None,
         "redirectToPurchaseRate": round(total_purchases / total_redirects * 100, 1) if total_redirects else None,
         "windowDays": days,
-        # Lifetime snapshot, not windowed by `days` — see comment above.
+        # Filtered by the event's own date (party.date), not windowed by `days`
+        # like the fields above — see comment where real_month is applied.
         "realGoOutViews": total_real_goout_views,
         "realGoOutRevenue": total_real_goout_revenue,
+        "realMonth": real_month if real_month else "all",
     }
 
-    return {"siteWide": site_wide, "byParty": by_party}
+    return {
+        "siteWide": site_wide,
+        "byParty": by_party,
+        "realMonthsAvailable": sorted(real_months_available),
+    }
 
 
 def build_time_series_analytics(start: datetime, end: datetime, interval: str = "day", party_slug: str | None = None) -> list[dict]:
@@ -2366,7 +2385,10 @@ def analytics_funnel():
     """
     Conversion funnel — views → GoOut redirect clicks → confirmed GoOut
     purchases — site-wide and per party. Query params: days (default 30,
-    max 180). Authenticated for the same reason as /api/admin/analytics/sales.
+    max 180), realMonth (YYYY-MM, or "all" — filters real GoOut views/revenue
+    by the event's own date, since that data is a lifetime snapshot per event
+    with no windowed-delta equivalent). Authenticated for the same reason as
+    /api/admin/analytics/sales.
     """
     try:
         days = int(request.args.get("days", 30))
@@ -2374,8 +2396,12 @@ def analytics_funnel():
         days = 30
     days = max(1, min(days, 180))
 
+    real_month = (request.args.get("realMonth") or "").strip()
+    if real_month and not re.fullmatch(r"\d{4}-\d{2}", real_month):
+        real_month = ""
+
     try:
-        data = build_party_funnel(days=days)
+        data = build_party_funnel(days=days, real_month=real_month or None)
     except RuntimeError:
         return jsonify({"message": "Analytics datastore unavailable."}), 503
     except Exception as exc:

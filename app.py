@@ -928,7 +928,14 @@ def build_party_funnel(days: int = 30) -> dict:
     # frontend adds.
     real_views_by_party: dict[str, int] = {}
     real_revenue_by_party: dict[str, float] = {}
-    account_by_party: dict[str, str] = {}
+    # Every account that has a goout_sales doc for this party — a plain single
+    # accountId here would have to arbitrarily pick one when the same event is
+    # tracked by both accounts (confirmed to happen: ~50 events tracked by both
+    # account1 and account2), which previously caused a party to show account1's
+    # badge while its actual revenue came entirely from account2's ticket sales.
+    # See goout-scraper's sales_tracker.py _reconcile_dual_account_referrals for
+    # the companion fix that keeps the *site's* referral on account1 in this case.
+    accounts_by_party: dict[str, set[str]] = {}
     if goout_sales_collection is not None:
         for doc in fetch_all_documents(goout_sales_collection):
             go_out_id = doc.get("go_out_id")
@@ -939,7 +946,7 @@ def build_party_funnel(days: int = 30) -> dict:
                 continue
             pid = party["partyId"]
             if doc.get("account_id"):
-                account_by_party[pid] = doc["account_id"]
+                accounts_by_party.setdefault(pid, set()).add(doc["account_id"])
             endone = doc.get("endone_stats") or {}
             views = doc.get("views")
             if views is None:
@@ -970,9 +977,14 @@ def build_party_funnel(days: int = 30) -> dict:
         views = views_by_party.get(party_id, 0)
         redirects = redirects_by_party.get(party_id, 0)
         purchases = tickets_by_party.get(party_id, 0)
+        party_accounts = sorted(accounts_by_party.get(party_id, set()))
         by_party.append({
             "partyId": party_id,
-            "accountId": account_by_party.get(party_id),
+            "accountIds": party_accounts,
+            # Back-compat single-value field for existing consumers (SEO routine,
+            # older frontend builds) -- None when tracked by more than one account,
+            # since picking one there would silently hide the ambiguity again.
+            "accountId": party_accounts[0] if len(party_accounts) == 1 else None,
             "name": sanitize_analytics_text(party_doc.get("name")) if party_doc else None,
             "slug": sanitize_analytics_text(party_doc.get("slug")) if party_doc else None,
             "date": isoformat_or_none(party_doc.get("date") or party_doc.get("startsAt")) if party_doc else None,

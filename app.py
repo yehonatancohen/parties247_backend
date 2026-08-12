@@ -4050,6 +4050,9 @@ def get_tags(text: str, location: str) -> list:
         "בחוץ": ["open air", "בחוץ", "טבע", "חוף", "יער", "rooftop", "גג"],
         "אילת": ["אילת", "eilat"],
         "תל אביב": ["תל אביב", "tel aviv", "tlv"],
+        "סוכות": ["סוכות", "sukkot", "sukkos"],
+        "פורים": ["פורים", "purim"],
+        "ראש השנה": ["ראש השנה", "ראש-השנה", "rosh hashana", "rosh hashanah"],
     }
     combined_text = f"{text or ''} {location or ''}".lower()
     for tag, keywords in tag_map.items():

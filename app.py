@@ -3988,11 +3988,35 @@ class SectionReorderSchema(BaseModel):
         extra = "forbid"
 
 # --- Classification helpers ---
+
+def _norm_geo_text(s: str) -> str:
+    """Lowercase + fold punctuation that splits city names in GoOut addresses
+    ("Tel-Aviv", "Be'er Sheva", "Rishon LeZion,Israel") down to plain spaces,
+    so keyword matching isn't defeated by a hyphen or apostrophe."""
+    s = (s or "").lower()
+    # apostrophes/geresh join letters ("Be'er" -> "beer") — drop, don't split
+    for ch in ("'", "’", "`", "׳", "״", '"'):
+        s = s.replace(ch, "")
+    for ch in ("-", ".", ",", "/", "\\", "|", "(", ")", "[", "]", ":", ";"):
+        s = s.replace(ch, " ")
+    return re.sub(r"\s+", " ", s).strip()
+
 def get_region(location: str) -> str:
-    south_keywords = ["באר שבע", "אילת", "אשדוד", "אשקלון", "דרום"]
-    north_keywords = ["חיפה", "טבריה", "צפון", "קריות", "כרמיאל", "עכו"]
-    center_keywords = ["תל אביב", "ירושלים", "ראשון לציון", "הרצליה", "נתניה", "מרכז", "י-ם", "tlv"]
-    loc = (location or "").lower()
+    # NB: no "שדרות" — it's the everyday word for "boulevard" (street type),
+    # not just the city Sderot; matches "שדרות רוטשילד" etc. Use "sderot" only.
+    south_keywords = ["באר שבע", "beer sheva", "beersheba", "אילת", "eilat", "אשדוד", "ashdod",
+                      "אשקלון", "ashkelon", "דרום", "south", "sderot", "נתיבות", "אופקים",
+                      "דימונה", "מצפה רמון", "ערבה", "arava", "מדבר", "desert"]
+    north_keywords = ["חיפה", "haifa", "טבריה", "tiberias", "צפון", "north", "קריות", "krayot",
+                      "כרמיאל", "עכו", "acre", "נהריה", "קצרין", "גליל", "galil", "galilee",
+                      "כנרת", "kinneret", "עמק", "dalton", "מגידו", "יקנעם", "זכרון יעקב"]
+    center_keywords = ["תל אביב", "tel aviv", "tlv", "ירושלים", "jerusalem", "י ם",
+                       "ראשון לציון", "rishon", "הרצליה", "herzliya", "herzeliya", "נתניה", "netanya",
+                       "מרכז", "center", "חולון", "holon", "בת ים", "bat yam", "רמת גן", "ramat gan",
+                       "גבעתיים", "givatayim", "בני ברק", "bnei brak", "פתח תקווה", "petah tikva",
+                       "petach tikva", "ראש העין", "כפר סבא", "kfar saba", "רעננה", "raanana",
+                       "מודיעין", "לוד", "רמלה", "רחובות", "rehovot", "נס ציונה", "יבנה", "ראשל צ"]
+    loc = _norm_geo_text(location)
     if any(k in loc for k in south_keywords):
         return "דרום"
     if any(k in loc for k in north_keywords):
@@ -4313,6 +4337,25 @@ def scheduled_price_scan():
                     changes["ticketPrice"] = info["price"]
                 if info["soldOut"] != party.get("soldOut", False):
                     changes["soldOut"] = info["soldOut"]
+
+                # Reconcile derived geo classification from the stored text.
+                # Most ingest paths use $setOnInsert, so existing events never
+                # pick up improvements to get_region / classify_party_data —
+                # this loop (already iterating every upcoming party every 30m)
+                # is where that backfill happens. Location is stored verbatim,
+                # so region/areas recompute cleanly; only write on real change.
+                loc = party.get("location") or ""
+                new_region = get_region(loc)
+                if new_region != "לא ידוע" and new_region != party.get("region"):
+                    changes["region"] = new_region
+                try:
+                    new_areas = classify_party_data(
+                        party.get("name") or "", party.get("description") or "", loc
+                    ).get("areas", [])
+                    if sorted(new_areas) != sorted(party.get("areas") or []) and new_areas:
+                        changes["areas"] = new_areas
+                except Exception:
+                    pass
 
                 if changes:
                     parties_collection.update_one({"_id": party["_id"]}, {"$set": changes})
@@ -5317,6 +5360,47 @@ def update_carousel_parties(carousel_id):
         return jsonify({"message": "Error updating carousel parties", "error": str(e)}), 500
 
 
+@app.route("/api/admin/reclassify-geo", methods=["POST"])
+@protect
+def reclassify_geo():
+    """Recompute `region` + `areas` for every stored party from its saved text.
+    The scheduled price scan does this incrementally, but this gives an
+    immediate full pass (e.g. right after deploying a classifier change).
+    Only writes when a value actually changes; never clears an existing value."""
+    if parties_collection is None:
+        return jsonify({"message": "DB unavailable"}), 503
+    checked = updated = 0
+    changed_ids = []
+    try:
+        for party in parties_collection.find({}, {"name": 1, "description": 1, "location": 1,
+                                                  "region": 1, "areas": 1}):
+            checked += 1
+            loc = party.get("location") or ""
+            changes = {}
+            new_region = get_region(loc)
+            if new_region != "לא ידוע" and new_region != party.get("region"):
+                changes["region"] = new_region
+            try:
+                new_areas = classify_party_data(
+                    party.get("name") or "", party.get("description") or "", loc
+                ).get("areas", [])
+            except Exception:
+                new_areas = []
+            if new_areas and sorted(new_areas) != sorted(party.get("areas") or []):
+                changes["areas"] = new_areas
+            if changes:
+                parties_collection.update_one({"_id": party["_id"]}, {"$set": changes})
+                updated += 1
+                if len(changed_ids) < 50:
+                    changed_ids.append({"id": str(party["_id"]), **changes})
+        record_admin_action("reclassify_geo", "party", None, {"checked": checked, "updated": updated})
+        return jsonify({"message": "Reclassified", "checked": checked, "updated": updated,
+                        "sample": changed_ids}), 200
+    except Exception as e:
+        return jsonify({"message": "Error during reclassify", "error": str(e),
+                        "checked": checked, "updated": updated}), 500
+
+
 @app.route("/api/admin/carousels/<carousel_id>", methods=["DELETE"])
 @protect
 def delete_carousel(carousel_id):
@@ -5981,32 +6065,63 @@ def classify_party_data(title: str, description: str, location: str) -> dict:
         genres.add("mainstream")
 
     # 3. Area Analysis
+    #
+    # Match against the normalized venue/address FIRST (most reliable), then fall
+    # back to the whole normalized text for the coarse regional buckets only.
+    # Punctuation is folded so "Tel-Aviv", "Be'er Sheva", "Rishon LeZion,Israel"
+    # all match. Gush-Dan inner-ring cities + Herzliya fold into "tel aviv"
+    # (greater-TLV nightlife catchment); Jerusalem is its own area.
     areas = set()
-    
-    # Tel Aviv
-    if any(w in full_text for w in ["tel aviv", "tlv", "תל אביב", "מרכז", "center"]):
-        areas.add("tel aviv")
-    
-    # Haifa (Specific check before general North)
-    if any(w in full_text for w in ["haifa", "חיפה", "krayot", "קריות"]):
-        areas.add("haifa")
-    
-    # Eilat
-    if any(w in full_text for w in ["eilat", "אילת"]):
-        areas.add("eilat")
-    
-    # North (General)
-    if "haifa" not in areas and any(w in full_text for w in ["north", "צפון", "tiberias", "kinneret", "galil"]):
-        areas.add("north")
-    elif "haifa" in areas: 
-        # Optional: You can decide if Haifa also counts as North. 
-        # For now, we keep them distinct as per your request list, or add both:
-        areas.add("north") 
+    geo_text = _norm_geo_text(f"{location or ''} {title or ''}")
+    full_norm = _norm_geo_text(full_text)
 
-    # South (General)
-    if "eilat" not in areas and any(w in full_text for w in ["south", "דרום", "beer sheva", "b7", "ashdod", "ashkelon"]):
+    tel_aviv_kw = [
+        "tel aviv", "tlv", "תל אביב", "florentin", "פלורנטין",
+        "rothschild", "רוטשילד", "dizengoff", "דיזנגוף", "allenby", "אלנבי",
+        "hatachana", "התחנה המרכזית",
+        # greater Tel Aviv / Gush Dan
+        "ramat gan", "רמת גן", "givatayim", "גבעתיים", "holon", "חולון",
+        "bat yam", "בת ים", "bnei brak", "בני ברק", "petah tikva", "petach tikva",
+        "פתח תקווה", "herzliya", "herzeliya", "הרצליה", "rishon", "ראשון לציון",
+        "ראשלצ", "or yehuda", "אור יהודה", "kiryat ono", "קרית אונו",
+    ]
+    jerusalem_kw = ["jerusalem", "ירושלים", "yerushalayim", "מבשרת ציון", "עין כרם", "מלחה"]
+    haifa_kw = ["haifa", "חיפה", "krayot", "קריות", "kiryat", "קרית ים",
+                "קרית מוצקין", "קרית ביאליק", "קרית חיים", "נשר", "טירת כרמל"]
+    eilat_kw = ["eilat", "אילת", "חוות הגמלים", "camel ranch", "ערבה", "arava",
+                "טימנע", "timna", "be desert", "מדבר"]
+    north_kw = ["north", "צפון", "tiberias", "טבריה", "kinneret", "כנרת", "galil",
+                "galilee", "גליל", "עמק יזרעאל", "עמק חפר", "עכו", "נהריה", "כרמיאל",
+                "dalton", "דלתון", "קצרין", "רמת הגולן", "golan", "זכרון יעקב",
+                "פרדס חנה", "חדרה", "hadera", "בנימינה", "netanya", "נתניה"]
+    # no bare "שדרות" (means "boulevard"); no "פלמחים" (central-coast beach, not south)
+    south_kw = ["south", "דרום", "beer sheva", "beersheba", "באר שבע", "b7",
+                "ashdod", "אשדוד", "ashkelon", "אשקלון", "sderot",
+                "נתיבות", "אופקים", "דימונה", "מצפה רמון", "ניצנה", "מכתש"]
+
+    # Specific-city tags: match on venue/address + title only. Descriptions are
+    # full of marketing phrases ("the best party in Tel Aviv") that would
+    # mislabel an event held elsewhere.
+    def _geo(kws):
+        return any(k in geo_text for k in kws)
+    # Coarse regional buckets: fall back to the whole text — lower stakes, and
+    # region words rarely appear as marketing filler.
+    def _any(kws):
+        return any(k in geo_text for k in kws) or any(k in full_norm for k in kws)
+
+    if _geo(tel_aviv_kw):
+        areas.add("tel aviv")
+    if _geo(jerusalem_kw):
+        areas.add("jerusalem")
+    if _geo(haifa_kw):
+        areas.add("haifa")
+        areas.add("north")
+    if _geo(eilat_kw):
+        areas.add("eilat")
         areas.add("south")
-    elif "eilat" in areas:
+    if "haifa" not in areas and _any(north_kw):
+        areas.add("north")
+    if "eilat" not in areas and _any(south_kw):
         areas.add("south")
 
     return {

@@ -61,7 +61,8 @@ def test_normalize_event_builds_bilingual_fields():
     assert normalized["title"]["en"] == "Mega Party"
     assert normalized["status"] == "scheduled"
     assert normalized["city"]["slug"] == "tel-aviv"
-    assert normalized["canonicalUrl"].endswith("/event/mega-party")
+    # slugs are derived from the Hebrew name (transliterated), not the stored `slug`
+    assert normalized["canonicalUrl"].endswith("/event/msybh")
 
 
 def test_events_api_returns_expected_structure(monkeypatch):
@@ -98,7 +99,7 @@ def test_sitemap_and_feeds(monkeypatch):
 
 def test_ics_and_robots(monkeypatch):
     configure_collections(monkeypatch)
-    ics_body, ics_status, ics_headers = app.ics_event("mega-party")
+    ics_body, ics_status, ics_headers = app.ics_event("msybh")
     assert ics_status == 200
     assert ics_body.startswith("BEGIN:VCALENDAR")
     robots_body, robots_status, _ = app.robots_txt()
@@ -110,5 +111,5 @@ def test_event_related_paths(monkeypatch):
     configure_collections(monkeypatch)
     event = app.serialize_events(include_past=False)[0]
     paths = app.event_related_paths(event)
-    assert "/event/mega-party" in paths
+    assert "/event/msybh" in paths
     assert any(path.startswith("/city/") for path in paths)

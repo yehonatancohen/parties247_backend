@@ -35,7 +35,7 @@ class _Flask:
         def decorator(f):
             return f
         return decorator
-Flask_request = types.SimpleNamespace(headers={}, get_json=lambda silent=True: {})
+Flask_request = types.SimpleNamespace(headers={}, args={}, get_json=lambda silent=True: {})
 def jsonify(obj):
     return obj
 def url_for(endpoint, _external=False, **values):
@@ -49,7 +49,7 @@ def url_for(endpoint, _external=False, **values):
 sys.modules['flask'] = types.SimpleNamespace(Flask=_Flask, request=Flask_request, jsonify=jsonify, url_for=url_for)
 
 # stub flask_cors
-sys.modules['flask_cors'] = types.SimpleNamespace(CORS=lambda app: None)
+sys.modules['flask_cors'] = types.SimpleNamespace(CORS=lambda app, **kwargs: None)
 
 # stub flask_limiter
 class _Limiter:
@@ -61,6 +61,19 @@ class _Limiter:
         return decorator
 sys.modules['flask_limiter'] = types.SimpleNamespace(Limiter=_Limiter)
 sys.modules['flask_limiter.util'] = types.SimpleNamespace(get_remote_address=lambda: '0.0.0.0')
+
+# stub flask_apscheduler (the real package imports flask.make_response, which the
+# flask stub above deliberately doesn't provide)
+class _APScheduler:
+    def init_app(self, app):
+        pass
+    def start(self):
+        pass
+    def task(self, *args, **kwargs):
+        def decorator(f):
+            return f
+        return decorator
+sys.modules['flask_apscheduler'] = types.SimpleNamespace(APScheduler=_APScheduler)
 
 # stub pymongo and related
 class _Collection(dict):

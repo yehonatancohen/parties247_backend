@@ -40,7 +40,7 @@ def test_get_region_music_event_age_tags():
     assert app.get_region('באר שבע') == 'דרום'
     assert app.get_region('חיפה') == 'צפון'
     assert app.get_region('תל אביב') == 'מרכז'
-    assert app.get_region('לוד') == 'לא ידוע'
+    assert app.get_region('לוד') == 'מרכז'  # Gush Dan ring folded into center (2026-09-02 geo rewrite)
 
     assert app.get_music_type('this is Techno music') == 'טכנו'
     assert app.get_music_type('great trance vibes') == 'טראנס'
@@ -90,7 +90,7 @@ def test_get_parties_appends_default_ref(monkeypatch):
             return iter(self._items)
 
     class DummyCollection:
-        def find(self):
+        def find(self, query=None):
             return DummyCursor(list(docs))
 
     class DummySettings:
@@ -139,7 +139,7 @@ def test_get_parties_filters_by_date(monkeypatch):
             return iter(self._items)
 
     class DummyCollection:
-        def find(self):
+        def find(self, query=None):
             return DummyCursor(list(docs))
 
     class DummySettings:
@@ -170,7 +170,7 @@ def test_get_parties_validates_date_filter(monkeypatch):
             return iter(self._items)
 
     class DummyCollection:
-        def find(self):
+        def find(self, query=None):
             return DummyCursor([])
 
     class DummySettings:
@@ -206,7 +206,7 @@ def test_get_parties_filters_upcoming(monkeypatch):
             return iter(self._items)
 
     class DummyCollection:
-        def find(self):
+        def find(self, query=None):
             return DummyCursor([
                 {'_id': '1', 'date': two_days_ago},
                 {'_id': '2', 'date': today},

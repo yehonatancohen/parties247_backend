@@ -36,6 +36,8 @@ from pydantic import BaseModel, ValidationError
 from flask_apscheduler import APScheduler
 import threading
 
+import promo
+
 # --- App setup ---
 load_dotenv()
 app = Flask(__name__)
@@ -464,6 +466,9 @@ try:
     ensure_index(party_analytics_collection, [("partyId", 1)], name="unique_party", unique=True)
     ensure_index(visitor_analytics_collection, [("sessionId", 1)], name="unique_session", unique=True)
     ensure_index(analytics_collection, [("category", 1), ("action", 1)], name="category_action")
+    # The funnel / time-series builders always filter this event log by category
+    # + a createdAt window; without this the "last N days" match was a full scan.
+    ensure_index(analytics_collection, [("category", 1), ("createdAt", -1)], name="category_created_desc")
     ensure_index(
         visitor_analytics_collection,
         [("createdAt", 1)],
@@ -486,6 +491,12 @@ try:
     # the admin sales-by-party join — see build_sales_by_party()).
     goout_sales_collection = db.goout_sales
     goout_sales_log_collection = db.goout_sales_log
+    # Written by goout-scraper, but the admin analytics joins are the heavy
+    # readers: windowed revenue sums filter the log by recorded_at, and both
+    # collections are joined by go_out_id.
+    ensure_index(goout_sales_log_collection, [("recorded_at", -1)], name="sales_log_recorded_desc")
+    ensure_index(goout_sales_log_collection, [("go_out_id", 1)], name="sales_log_go_out_id")
+    ensure_index(goout_sales_collection, [("go_out_id", 1)], name="sales_go_out_id")
 
     # --- Admin action audit log ---
     admin_audit_collection = db.adminAuditLog
@@ -592,11 +603,18 @@ def is_party_live(party: dict, now: datetime | None = None) -> bool:
     return True
 
 
-def fetch_all_documents(coll: Collection | None) -> list[dict]:
+def fetch_all_documents(coll: Collection | None, projection: dict | None = None) -> list[dict]:
+    """
+    Read a whole collection. Pass `projection` whenever only a few fields are
+    needed — the admin analytics endpoints used to pull every party (description,
+    images, tags...) and every goout_sales doc (full endOne blobs incl. buyer
+    lists) two or three times per request, which is where most of their multi-
+    second latency came from.
+    """
     if coll is None:
         return []
     try:
-        cursor = coll.find({})
+        cursor = coll.find({}, projection) if projection else coll.find({})
     except TypeError:  # pragma: no cover - compatibility with simple stubs
         cursor = coll.find()
     except Exception as exc:  # pragma: no cover - defensive; surfaced to caller
@@ -766,19 +784,50 @@ def build_analytics_summary(window_hours: int = 24) -> dict:
     return summary
 
 
-def _party_by_goout_event_id() -> dict[str, dict]:
+# The only party fields the analytics joins ever read. Keeping this a projection
+# (instead of full documents) is the single biggest win for /api/admin/analytics/*.
+_PARTY_INDEX_PROJECTION = {"name": 1, "slug": 1, "date": 1, "startsAt": 1, "goOutEventId": 1}
+
+# goout_sales fields the funnel / sales-by-party joins read. `endone_stats` holds
+# the raw endOne responses (incl. full buyer lists) — never load it whole here.
+_SALES_FUNNEL_PROJECTION = {
+    "go_out_id": 1, "account_id": 1, "views": 1, "real_own_revenue": 1,
+    "endone_stats.views.Views": 1,
+}
+_SALES_BY_PARTY_PROJECTION = {
+    "go_out_id": 1, "account_id": 1, "event_name": 1, "confirmed_count": 1,
+    "pending_count": 1, "views": 1, "real_total_revenue": 1, "real_own_revenue": 1,
+    "endone_stats.sales_per_date.dates": 1, "endone_stats.last_accepted.users": 1,
+}
+
+
+def _load_party_index() -> tuple[dict[str, dict], dict[str, dict]]:
+    """
+    One projected pass over `parties` -> (parties_by_id, party_by_goout_event_id).
+    Both analytics builders need both views; loading once instead of twice halves
+    the Atlas round-trips for the funnel endpoint.
+    """
+    parties_by_id: dict[str, dict] = {}
     party_by_event_id: dict[str, dict] = {}
-    for party in fetch_all_documents(parties_collection):
-        event_id = party.get("goOutEventId")
+    for party in fetch_all_documents(parties_collection, projection=_PARTY_INDEX_PROJECTION):
         party_identifier = party.get("_id")
-        if event_id and party_identifier is not None:
+        if party_identifier is None:
+            continue
+        pid = str(party_identifier)
+        parties_by_id[pid] = party
+        event_id = party.get("goOutEventId")
+        if event_id:
             party_by_event_id[str(event_id)] = {
-                "partyId": str(party_identifier),
+                "partyId": pid,
                 "partyName": sanitize_analytics_text(party.get("name")),
                 "partySlug": sanitize_analytics_text(party.get("slug")),
                 "partyDate": isoformat_or_none(party.get("date") or party.get("startsAt")),
             }
-    return party_by_event_id
+    return parties_by_id, party_by_event_id
+
+
+def _party_by_goout_event_id() -> dict[str, dict]:
+    return _load_party_index()[1]
 
 
 def _sales_totals_by_event_id(cutoff: datetime | None = None) -> dict[str, dict]:
@@ -828,7 +877,7 @@ def build_sales_by_party() -> list[dict]:
     lifetime_by_event_id = _sales_totals_by_event_id(cutoff=None)
 
     results = []
-    for doc in fetch_all_documents(goout_sales_collection):
+    for doc in fetch_all_documents(goout_sales_collection, projection=_SALES_BY_PARTY_PROJECTION):
         go_out_id = doc.get("go_out_id")
         if not go_out_id:
             continue
@@ -915,7 +964,7 @@ def build_party_funnel(days: int = 30, real_month: str | None = None) -> dict:
     # every event's entire history as having happened "in the last N days".
     tickets_by_party: dict[str, int] = {}
     revenue_by_party: dict[str, float] = {}
-    party_by_event_id = _party_by_goout_event_id()
+    parties_by_id, party_by_event_id = _load_party_index()
     windowed_by_event_id = _sales_totals_by_event_id(cutoff=cutoff)
     for go_out_id, totals in windowed_by_event_id.items():
         party = party_by_event_id.get(go_out_id)
@@ -952,7 +1001,7 @@ def build_party_funnel(days: int = 30, real_month: str | None = None) -> dict:
     # August" -- not a trailing N-day window from now like `days` above.
     real_months_available: set[str] = set()
     if goout_sales_collection is not None:
-        for doc in fetch_all_documents(goout_sales_collection):
+        for doc in fetch_all_documents(goout_sales_collection, projection=_SALES_FUNNEL_PROJECTION):
             go_out_id = doc.get("go_out_id")
             if not go_out_id:
                 continue
@@ -981,12 +1030,6 @@ def build_party_funnel(days: int = 30, real_month: str | None = None) -> dict:
             revenue = doc.get("real_own_revenue")
             if revenue is not None:
                 real_revenue_by_party[pid] = real_revenue_by_party.get(pid, 0.0) + float(revenue)
-
-    parties_by_id: dict[str, dict] = {}
-    for party in fetch_all_documents(parties_collection):
-        identifier = party.get("_id")
-        if identifier is not None:
-            parties_by_id[str(identifier)] = party
 
     party_ids = (
         set(views_by_party) | set(redirects_by_party) | set(tickets_by_party)
@@ -2426,6 +2469,83 @@ def analytics_funnel():
     return jsonify(data), 200
 
 
+_PROMO_PARTY_PROJECTION = {
+    "name": 1, "slug": 1, "date": 1, "startsAt": 1, "goOutEventId": 1,
+    "goOutUrl": 1, "originalUrl": 1, "canonicalUrl": 1, "location": 1,
+    "musicType": 1, "age": 1, "ticketPrice": 1, "referralCode": 1,
+    "hidden": 1, "isPromotion": 1,
+}
+
+
+def _int_arg(name: str, default: int, lo: int, hi: int) -> int:
+    args = getattr(request, "args", None) or {}
+    try:
+        value = int(args.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(lo, min(value, hi))
+
+
+def build_whatsapp_promo(days: int = 7, limit: int = 12) -> dict:
+    """
+    Rank upcoming parties by expected commission and draft WhatsApp messages
+    for them (see promo.py). Ticket/revenue-derived, so admin-only.
+    """
+    if parties_collection is None:
+        raise RuntimeError("Parties datastore unavailable")
+    now = datetime.now(timezone.utc)
+    referral = default_referral_code()
+    parties: list[dict] = []
+    for party in fetch_all_documents(parties_collection, projection=_PROMO_PARTY_PROJECTION):
+        party = dict(party)
+        party["_id"] = str(party.get("_id"))
+        apply_default_referral(party, referral)
+        parties.append(party)
+
+    sales_by_event_id = _sales_totals_by_event_id(cutoff=now - timedelta(days=30))
+    accounts_by_event_id: dict[str, set[str]] = {}
+    for doc in fetch_all_documents(goout_sales_collection, projection={"go_out_id": 1, "account_id": 1}):
+        if doc.get("go_out_id") and doc.get("account_id"):
+            accounts_by_event_id.setdefault(str(doc["go_out_id"]), set()).add(str(doc["account_id"]))
+
+    candidates = promo.rank_promo_candidates(
+        parties,
+        sales_by_event_id=sales_by_event_id,
+        accounts_by_event_id=accounts_by_event_id,
+        now=now,
+        days=days,
+        limit=limit,
+    )
+    return {
+        "days": days,
+        "limit": limit,
+        "generatedAt": now.isoformat(),
+        "candidates": candidates,
+        "digest": promo.format_digest_message(candidates, days=days),
+    }
+
+
+@app.route("/api/admin/promo/whatsapp", methods=["GET"])
+@limiter.limit("30 per minute")
+@protect
+def promo_whatsapp():
+    """
+    Ready-to-paste WhatsApp promo drafts for the parties most worth pushing in
+    the next `days` days (1-30, default 7), best first, plus a single roundup
+    ("digest") message. `limit` caps candidates (1-50, default 12).
+    """
+    days = _int_arg("days", 7, 1, 30)
+    limit = _int_arg("limit", 12, 1, 50)
+    try:
+        data = build_whatsapp_promo(days=days, limit=limit)
+    except RuntimeError:
+        return jsonify({"message": "Parties datastore unavailable."}), 503
+    except Exception as exc:
+        app.logger.error(f"Failed to build WhatsApp promo drafts: {exc}")
+        return jsonify({"message": "Failed to build promo drafts."}), 500
+    return jsonify(data), 200
+
+
 @app.route("/analytics", methods=["GET"])
 def analytics_page():
     """Render a lightweight HTML dashboard summarizing analytics events."""
@@ -3062,6 +3182,83 @@ OPENAPI_TEMPLATE = {
                             }
                         },
                     }
+                },
+            }
+        },
+        "/api/admin/refresh-token": {
+            "post": {
+                "summary": "Refresh admin token",
+                "description": "Exchange a valid, or recently expired (up to 14 days), admin JWT for a fresh 30-day token without re-sending the password. Intended for unattended jobs that only hold a token.",
+                "security": [{"bearerAuth": []}],
+                "responses": {
+                    "200": {
+                        "description": "New JWT issued.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "token": {"type": "string"},
+                                        "expiresAt": {"type": "string", "format": "date-time"},
+                                    },
+                                }
+                            }
+                        },
+                    },
+                    "401": {"description": "Missing, invalid, or too-old token."},
+                },
+            }
+        },
+        "/api/admin/promo/whatsapp": {
+            "get": {
+                "summary": "WhatsApp promo drafts",
+                "description": "Upcoming parties ranked by expected commission (account1 flat fee first, then account2 percentage), each with a ready-to-paste Hebrew WhatsApp message, plus one roundup digest message.",
+                "security": [{"bearerAuth": []}],
+                "parameters": [
+                    {"name": "days", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 30, "default": 7}},
+                    {"name": "limit", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 50, "default": 12}},
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Ranked candidates and digest.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "days": {"type": "integer"},
+                                        "limit": {"type": "integer"},
+                                        "generatedAt": {"type": "string", "format": "date-time"},
+                                        "digest": {"type": "string"},
+                                        "candidates": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "partyId": {"type": "string"},
+                                                    "slug": {"type": "string"},
+                                                    "name": {"type": "string"},
+                                                    "date": {"type": "string"},
+                                                    "dateLabel": {"type": "string"},
+                                                    "location": {"type": "string"},
+                                                    "tier": {"type": "string", "enum": ["account1", "account2"]},
+                                                    "expectedPerTicket": {"type": "number"},
+                                                    "ticketsLast30d": {"type": "integer"},
+                                                    "revenueLast30d": {"type": "number"},
+                                                    "daysUntil": {"type": "number"},
+                                                    "score": {"type": "number"},
+                                                    "url": {"type": "string"},
+                                                    "siteUrl": {"type": "string", "nullable": True},
+                                                    "message": {"type": "string"},
+                                                },
+                                            },
+                                        },
+                                    },
+                                }
+                            }
+                        },
+                    },
+                    "401": {"description": "Unauthorized."},
                 },
             }
         },
@@ -3807,14 +4004,63 @@ def admin_login():
     try:
         hashed_attempt = bcrypt.hashpw(password, ADMIN_HASH)
         if hmac.compare_digest(hashed_attempt, ADMIN_HASH):
-            exp = datetime.utcnow() + timedelta(days=30)
-            token = jwt.encode({"exp": exp}, JWT_SECRET, algorithm="HS256")
-            if isinstance(token, bytes):
-                token = token.decode()
-            return jsonify({"token": token}), 200
+            token, exp = issue_admin_token()
+            return jsonify({"token": token, "expiresAt": exp.replace(tzinfo=timezone.utc).isoformat()}), 200
     except ValueError:
         pass
     return jsonify({"message": "Invalid credentials."}), 401
+
+
+ADMIN_TOKEN_LIFETIME = timedelta(days=30)
+# How long after expiry a token may still be exchanged for a fresh one. The
+# unattended /seo-update run only ever holds a token (never the password) and
+# runs every ~3 days, so a two-week grace survives a few missed runs; anything
+# older has to go through /api/admin/login with the password again.
+REFRESH_TOKEN_GRACE = timedelta(days=14)
+
+
+def issue_admin_token(now: datetime | None = None) -> tuple[str, datetime]:
+    now = now or datetime.utcnow()
+    exp = now + ADMIN_TOKEN_LIFETIME
+    token = jwt.encode({"exp": exp}, JWT_SECRET, algorithm="HS256")
+    if isinstance(token, bytes):
+        token = token.decode()
+    return token, exp
+
+
+@app.route("/api/admin/refresh-token", methods=["POST"])
+@limiter.limit("10 per minute")
+def refresh_admin_token():
+    """
+    Exchange a valid — or recently expired (see REFRESH_TOKEN_GRACE) — admin JWT
+    for a fresh 30-day one, without the admin password. Exists so unattended
+    jobs that hold only a token (the /seo-update routine's `.admin-token`) can
+    keep themselves alive instead of going dark every 30 days.
+    """
+    if not JWT_SECRET:
+        app.logger.error("JWT secret not configured; rejecting refresh request.")
+        return jsonify({"message": "Server misconfigured."}), 500
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return jsonify({"message": "Unauthorized."}), 401
+    token = auth_header.split(" ", 1)[1].strip()
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"], options={"verify_exp": False})
+    except jwt.InvalidTokenError:
+        return jsonify({"message": "Invalid token."}), 401
+    exp_raw = payload.get("exp") if isinstance(payload, dict) else None
+    if exp_raw is None:
+        return jsonify({"message": "Invalid token."}), 401
+    exp_dt = datetime.fromtimestamp(float(exp_raw), tz=timezone.utc)
+    now = datetime.now(timezone.utc)
+    if exp_dt < now - REFRESH_TOKEN_GRACE:
+        return jsonify({"message": "Token expired beyond the refresh window. Log in again."}), 401
+    new_token, new_exp = issue_admin_token()
+    record_admin_action("refresh_token", None, None, {
+        "previousExpiry": exp_dt.isoformat(),
+        "wasExpired": exp_dt < now,
+    })
+    return jsonify({"token": new_token, "expiresAt": new_exp.replace(tzinfo=timezone.utc).isoformat()}), 200
 
 # --- Tag helpers + schemas ---
 def slugify_tag(name: str) -> str:
@@ -4753,6 +4999,11 @@ def get_parties():
             audience_filter = None
             genre_filter = None
             area_filter = None
+        # README-documented contract: an unparseable ?date= is a 400, not a
+        # silently ignored filter (regressed at some point; test pins it now).
+        if date_param and parse_datetime(date_param) is None:
+            return jsonify({"message": "Invalid date filter."}), 400
+
         filter_date = None
         upcoming_only = False
         query = {}

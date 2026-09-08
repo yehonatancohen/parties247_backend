@@ -7,6 +7,7 @@ import copy
 import html
 import hashlib
 import secrets
+import itertools
 from typing import Iterable
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -7281,6 +7282,63 @@ def wa_overview():
         "dailyCap": settings.get("dailyCap"),
         "targetGroupCount": group_count,
         "memberCount": member_count,
+    }), 200
+
+
+@app.route("/api/admin/wa/members/overlap", methods=["GET"])
+@protect
+def wa_members_overlap():
+    """Counts only — never a raw identifier (memberHash is itself a salted
+    hash of a WhatsApp @lid, not a phone number; see whatsapp-engine's
+    sync.js). Top group-pairs by shared members, computed in-process rather
+    than as a Mongo aggregation: with a projection down to {groups: 1}, this
+    is a few thousand small documents (each member is in a handful of
+    groups at most), well within the same "don't fetch_all_documents
+    without a projection" rule that governs the parties/goout_sales scans
+    elsewhere in this file — the aggregation pipeline equivalent (a
+    self-$lookup fanning out per pair) would move far more data for the
+    same answer.
+    """
+    if wa_members_collection is None or wa_groups_collection is None:
+        return jsonify({"message": "Datastore unavailable."}), 503
+
+    try:
+        limit = int(request.args.get("limit", 20))
+    except (TypeError, ValueError):
+        limit = 20
+    limit = max(1, min(limit, 100))
+
+    names = {g["chatId"]: g.get("name", g["chatId"]) for g in wa_groups_collection.find({}, {"chatId": 1, "name": 1})}
+
+    pair_counts: dict[tuple[str, str], int] = {}
+    per_group_counts: dict[str, int] = {}
+    total_members = 0
+    for doc in wa_members_collection.find({}, {"groups": 1}):
+        groups = sorted(set(doc.get("groups") or []))
+        if not groups:
+            continue
+        total_members += 1
+        for g in groups:
+            per_group_counts[g] = per_group_counts.get(g, 0) + 1
+        for a, b in itertools.combinations(groups, 2):
+            pair_counts[(a, b)] = pair_counts.get((a, b), 0) + 1
+
+    top_pairs = sorted(pair_counts.items(), key=lambda kv: kv[1], reverse=True)[:limit]
+
+    return jsonify({
+        "totalMembers": total_members,
+        "perGroup": [
+            {"chatId": chat_id, "name": names.get(chat_id, chat_id), "memberCount": count}
+            for chat_id, count in sorted(per_group_counts.items(), key=lambda kv: kv[1], reverse=True)
+        ],
+        "topPairs": [
+            {
+                "chatIdA": a, "nameA": names.get(a, a),
+                "chatIdB": b, "nameB": names.get(b, b),
+                "sharedMembers": count,
+            }
+            for (a, b), count in top_pairs
+        ],
     }), 200
 
 

@@ -7154,6 +7154,38 @@ def cancel_wa_campaign(campaign_id):
     return jsonify({"message": "Cancelled."}), 200
 
 
+@app.route("/api/admin/wa/campaigns/<campaign_id>/resume", methods=["POST"])
+@protect
+def resume_wa_campaign(campaign_id):
+    """Re-queue an aborted campaign. Only 'failed' targets are reset to
+    'pending' — 'sent' targets are left untouched, so the engine's own
+    resume logic (skip anything already sent) never re-sends. Only
+    'aborted' is resumable: 'done' has nothing left to do, 'cancelled' was
+    a deliberate stop, 'queued'/'running' are already live."""
+    if wa_campaigns_collection is None:
+        return jsonify({"message": "Datastore unavailable."}), 503
+    try:
+        oid = ObjectId(campaign_id)
+    except Exception:
+        return jsonify({"message": "Invalid id."}), 400
+    result = wa_campaigns_collection.update_one(
+        {"_id": oid, "status": "aborted"},
+        {
+            "$set": {
+                "status": "queued",
+                "scheduledFor": datetime.now(timezone.utc),
+                "targets.$[failed].status": "pending",
+                "targets.$[failed].error": None,
+            }
+        },
+        array_filters=[{"failed.status": "failed"}],
+    )
+    if result.matched_count == 0:
+        return jsonify({"message": "Not found or not resumable (only aborted campaigns can be resumed)."}), 409
+    record_admin_action("wa.campaign.resume", target_type="waCampaign", target_id=campaign_id)
+    return jsonify({"message": "Re-queued — will resume from the first unsent target."}), 200
+
+
 @app.route("/api/admin/wa/funnel", methods=["GET"])
 @protect
 def wa_funnel():

@@ -5,8 +5,11 @@ import hmac
 import re
 import copy
 import html
+import hashlib
+import secrets
 from typing import Iterable
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from email.utils import format_datetime
 from functools import wraps
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode, quote_plus, urljoin, ParseResult
@@ -59,6 +62,15 @@ logging.basicConfig(level=logging.INFO)
 # --- Go-Out / VM scraper config ---
 # The scraper VM calls back with this token; backend verifies it.
 SERVICE_TOKEN: str = os.environ.get("SERVICE_TOKEN", "")
+
+# --- WhatsApp engine config ---
+# Shared with the whatsapp-engine (writes waGroups/waMembers/waSettings and
+# campaign outcomes directly to Mongo — see WHATSAPP-PROMO-PLAN.md). Used here
+# only to hash click-tracking IPs the same way the engine hashes member ids;
+# the engine never sends this API a request, so there's no service-token
+# check for it.
+WA_HASH_SALT: str = os.environ.get("WA_HASH_SALT", "")
+JERUSALEM_TZ = ZoneInfo("Asia/Jerusalem")
 
 goout_sessions_collection = None
 goout_pending_collection = None
@@ -498,6 +510,30 @@ try:
     party_redirects_collection = db.party_redirects
     ensure_index(party_redirects_collection, [("fromSlug", 1)], name="unique_from_slug", unique=True)
 
+    # --- WhatsApp engine collections ---
+    # Written directly by the whatsapp-engine (VPS, Mongo access, not through
+    # this API — see WHATSAPP-PROMO-PLAN.md) for waGroups/waMembers/waSettings
+    # and campaign *outcome* fields on waCampaigns. This API owns campaign
+    # *intent* (admin-created fields) and everything click/link related.
+    wa_groups_collection = db.waGroups
+    wa_members_collection = db.waMembers
+    wa_templates_collection = db.waTemplates
+    wa_campaigns_collection = db.waCampaigns
+    wa_links_collection = db.waLinks
+    wa_clicks_collection = db.waClicks
+    wa_settings_collection = db.waSettings
+
+    ensure_index(wa_groups_collection, [("chatId", 1)], name="unique_chat_id", unique=True)
+    ensure_index(wa_members_collection, [("memberHash", 1)], name="unique_member_hash", unique=True)
+    ensure_index(wa_members_collection, [("groups", 1)], name="member_groups")
+    ensure_index(wa_templates_collection, [("name", 1)], name="template_name")
+    ensure_index(wa_campaigns_collection, [("status", 1), ("scheduledFor", 1)], name="campaign_status_scheduled")
+    ensure_index(wa_campaigns_collection, [("partyId", 1)], name="campaign_party")
+    ensure_index(wa_links_collection, [("code", 1)], name="unique_link_code", unique=True)
+    ensure_index(wa_clicks_collection, [("code", 1), ("at", 1)], name="click_code_at")
+    ensure_index(wa_clicks_collection, [("campaignId", 1)], name="click_campaign")
+    ensure_index(wa_settings_collection, [("key", 1)], name="unique_setting_key", unique=True)
+
     app.logger.info("Connected to MongoDB and ensured indexes.")
 except Exception as e:
     app.logger.error(f"Error connecting to MongoDB Atlas: {e}")
@@ -515,6 +551,13 @@ except Exception as e:
     goout_sales_log_collection = None
     admin_audit_collection = None
     party_redirects_collection = None
+    wa_groups_collection = None
+    wa_members_collection = None
+    wa_templates_collection = None
+    wa_campaigns_collection = None
+    wa_links_collection = None
+    wa_clicks_collection = None
+    wa_settings_collection = None
 
 
 def record_setting_hit(key: str, extra: dict | None = None):
@@ -1911,6 +1954,9 @@ def record_party_interaction(metric: str):
                 if referer:
                     record["referer"] = referer
                     record["trafficSource"] = _parse_referrer_source(referer, None)
+                wa_code = sanitize_analytics_text(getattr(body, "waCode", None))
+                if wa_code:
+                    record["waCode"] = wa_code
 
                 analytics_collection.insert_one(record)
             except Exception as e:
@@ -1940,6 +1986,79 @@ def record_party_view():
 def record_party_redirect():
     """Increment the redirect counter for a party analytics record."""
     return record_party_interaction("redirects")
+
+
+def _is_wa_click_bot(user_agent_str: str | None) -> bool:
+    """True for hits that never reached a real reader: generic bots, and the
+    link-preview fetchers WhatsApp/Facebook/Telegram run against a URL the
+    instant it's typed into the composer — before any group member has seen
+    it. Those would otherwise inflate every campaign's click count by one
+    per group the moment it's sent, which is exactly the kind of fake
+    precision the funnel design explicitly avoids elsewhere."""
+    if not user_agent_str:
+        return False
+    ua = user_agent_str.lower()
+    if _parse_device_type(user_agent_str) == "bot":
+        return True
+    return any(k in ua for k in ("whatsapp", "facebookexternalhit", "telegrambot", "preview"))
+
+
+@app.route("/api/wa/click", methods=["POST"])
+@limiter.limit("240 per minute")
+def record_wa_click():
+    """Public click-ingest endpoint for WhatsApp campaign links
+    (parties247.co.il/event/<slug>?w=<code>). Called server-side from the
+    website's edge middleware (proxy.ts), not the browser directly — see
+    WHATSAPP-PROMO-PLAN.md. Never blocks the page render it's called from,
+    so it fails soft: an unknown/expired code is a 404 the caller ignores."""
+    if wa_links_collection is None or wa_clicks_collection is None:
+        return jsonify({"message": "Datastore unavailable."}), 503
+
+    payload = request.get_json(silent=True) or {}
+    try:
+        body = WaClickRequest(**payload)
+    except ValidationError as exc:
+        errors = exc.errors() if hasattr(exc, "errors") else []
+        return jsonify({"message": "Invalid click event.", "errors": errors}), 400
+
+    code = sanitize_analytics_text(body.code)
+    if not code:
+        return jsonify({"message": "Invalid click event."}), 400
+
+    link = wa_links_collection.find_one({"code": code})
+    if not link:
+        return jsonify({"message": "Unknown code."}), 404
+
+    user_agent = sanitize_analytics_text(request.headers.get("User-Agent"))
+    is_bot = _is_wa_click_bot(user_agent)
+    client_ip = extract_client_ip(request)
+    ip_hash = None
+    if client_ip and WA_HASH_SALT:
+        ip_hash = hashlib.sha256(f"{WA_HASH_SALT}{client_ip}".encode("utf-8")).hexdigest()
+
+    now = datetime.now(timezone.utc)
+    try:
+        wa_clicks_collection.insert_one({
+            "code": code,
+            "campaignId": link.get("campaignId"),
+            "chatId": link.get("chatId"),
+            "partyId": link.get("partyId"),
+            "at": now,
+            "deviceType": sanitize_analytics_text(body.deviceType) or _parse_device_type(user_agent),
+            "ipHash": ip_hash,
+            "ua": user_agent,
+            "isBot": is_bot,
+        })
+        if not is_bot:
+            wa_links_collection.update_one(
+                {"code": code},
+                {"$inc": {"clicks": 1}, "$set": {"lastClickAt": now}},
+            )
+    except Exception as exc:  # pragma: no cover - best effort persistence
+        app.logger.error(f"Failed to record wa click: {exc}")
+        return jsonify({"message": "Failed to record click."}), 500
+
+    return jsonify({"message": "Recorded"}), 202
 
 
 @app.route("/api/analytics/summary", methods=["GET"])
@@ -3876,6 +3995,18 @@ class PartyAnalyticsRequest(BaseModel):
     partySlug: str | None = None
     sessionId: str | None = None
     referrer: str | None = None
+    # Set by the website when the visit carries a WhatsApp click code
+    # (?w=<code> on /event/<slug>, read from sessionStorage) — lets a buy
+    # click be joined back to the WhatsApp campaign/group that drove it.
+    waCode: str | None = None
+
+    class Config:
+        extra = "forbid"
+
+
+class WaClickRequest(BaseModel):
+    code: str
+    deviceType: str | None = None
 
     class Config:
         extra = "forbid"
@@ -6293,6 +6424,581 @@ def goout_edit_approve(pending_id):
         return jsonify({"message": "Party edited and approved.", "party_db_id": party_db_id}), 200
     except Exception as exc:
         return jsonify({"message": str(exc)}), 500
+
+
+# --- WhatsApp engine: admin endpoints ---
+#
+# Ownership split (see WHATSAPP-PROMO-PLAN.md): the whatsapp-engine on the VPS
+# writes waGroups/waMembers/waSettings and campaign *outcome* fields
+# (status running|done|aborted, targets[].sentAt/waMsgId/error) directly to
+# Mongo. This API is the admin's read/write surface and owns campaign
+# *intent* (text, scheduledFor, targets[].chatId, status queued|cancelled).
+# Both writers touch waCampaigns but never the same fields, so there's no
+# read-modify-write race between them.
+
+class WaTemplateRequest(BaseModel):
+    name: str
+    body: str
+    active: bool = True
+
+    class Config:
+        extra = "forbid"
+
+
+class WaCampaignCreateRequest(BaseModel):
+    partyId: str | None = None
+    partySlug: str | None = None
+    templateId: str | None = None
+    text: str
+    scheduledFor: str | None = None  # ISO string; omitted = now
+    targetChatIds: list[str]
+    override: bool = False
+
+    class Config:
+        extra = "forbid"
+
+
+class WaGroupPatchRequest(BaseModel):
+    isTarget: bool
+
+    class Config:
+        extra = "forbid"
+
+
+class WaSettingsPatchRequest(BaseModel):
+    quietHoursStart: str | None = None  # "HH:MM", Asia/Jerusalem
+    quietHoursEnd: str | None = None
+    dailyCap: int | None = None
+    pacingMinSec: int | None = None
+    pacingMaxSec: int | None = None
+    sendingEnabled: bool | None = None
+
+    class Config:
+        extra = "forbid"
+
+
+WA_SETTINGS_DEFAULTS = {
+    "quietHoursStart": "23:00",
+    "quietHoursEnd": "09:00",
+    "dailyCap": 3,
+    "pacingMinSec": 30,
+    "pacingMaxSec": 90,
+    "sendingEnabled": True,
+}
+
+
+def _wa_settings() -> dict:
+    """Current settings, defaults filled in for anything never set."""
+    settings = dict(WA_SETTINGS_DEFAULTS)
+    if wa_settings_collection is None:
+        return settings
+    try:
+        for doc in wa_settings_collection.find({}):
+            if doc.get("key") in settings:
+                settings[doc["key"]] = doc.get("value")
+    except Exception as exc:  # pragma: no cover - defensive
+        app.logger.warning(f"Failed to read wa settings: {exc}")
+    return settings
+
+
+def _wa_serialize(doc: dict) -> dict:
+    """Stringify _id and datetime fields for JSON — the same ad-hoc pattern
+    used throughout this file (no generic Mongo-doc serializer exists)."""
+    out = dict(doc)
+    if "_id" in out:
+        out["_id"] = str(out["_id"])
+    for key, value in list(out.items()):
+        if isinstance(value, datetime):
+            out[key] = isoformat_or_none(value)
+    return out
+
+
+def _hhmm_to_minutes(text: str) -> int | None:
+    try:
+        h, m = text.split(":")
+        return int(h) * 60 + int(m)
+    except Exception:
+        return None
+
+
+def _apply_quiet_hours(scheduled_for: datetime, settings: dict) -> tuple[datetime, bool]:
+    """If scheduled_for falls inside quiet hours (Asia/Jerusalem), push it to
+    the next quietHoursEnd. Returns (possibly-adjusted time, was_deferred)."""
+    start_min = _hhmm_to_minutes(settings.get("quietHoursStart") or "")
+    end_min = _hhmm_to_minutes(settings.get("quietHoursEnd") or "")
+    if start_min is None or end_min is None:
+        return scheduled_for, False
+
+    local = scheduled_for.astimezone(JERUSALEM_TZ)
+    minute_of_day = local.hour * 60 + local.minute
+
+    # Quiet hours span midnight (e.g. 23:00-09:00): "inside" means
+    # >= start OR < end. A same-day window (start < end) would mean between
+    # the two — not our default, but handled correctly either way.
+    if start_min > end_min:
+        inside = minute_of_day >= start_min or minute_of_day < end_min
+    else:
+        inside = start_min <= minute_of_day < end_min
+    if not inside:
+        return scheduled_for, False
+
+    end_hour, end_minute = end_min // 60, end_min % 60
+    deferred_local = local.replace(hour=end_hour, minute=end_minute, second=0, microsecond=0)
+    if deferred_local <= local:
+        deferred_local += timedelta(days=1)
+    return deferred_local.astimezone(timezone.utc), True
+
+
+def _generate_wa_code() -> str:
+    """8-char base32 code, unique against waLinks. Collisions are astronomically
+    unlikely (40 bits) but the retry loop costs nothing and removes the theoretical gap."""
+    import base64
+    for _ in range(5):
+        code = base64.b32encode(secrets.token_bytes(5)).decode("ascii").rstrip("=").lower()
+        if wa_links_collection is None or not wa_links_collection.find_one({"code": code}):
+            return code
+    raise RuntimeError("Could not generate a unique wa link code")
+
+
+@app.route("/api/admin/wa/settings", methods=["GET"])
+@protect
+def get_wa_settings():
+    return jsonify(_wa_settings()), 200
+
+
+@app.route("/api/admin/wa/settings", methods=["PATCH"])
+@protect
+def patch_wa_settings():
+    if wa_settings_collection is None:
+        return jsonify({"message": "Datastore unavailable."}), 503
+    payload = request.get_json(silent=True) or {}
+    try:
+        body = WaSettingsPatchRequest(**payload)
+    except ValidationError as exc:
+        return jsonify({"message": "Invalid settings.", "errors": exc.errors()}), 400
+
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not updates:
+        return jsonify({"message": "No fields to update."}), 400
+    for key, value in updates.items():
+        wa_settings_collection.update_one({"key": key}, {"$set": {"key": key, "value": value}}, upsert=True)
+    record_admin_action("wa.settings.update", details=updates)
+    return jsonify(_wa_settings()), 200
+
+
+@app.route("/api/admin/wa/groups", methods=["GET"])
+@protect
+def list_wa_groups():
+    if wa_groups_collection is None:
+        return jsonify({"groups": []}), 200
+    docs = list(wa_groups_collection.find({}).sort("name", 1))
+    return jsonify({"groups": [_wa_serialize(d) for d in docs]}), 200
+
+
+@app.route("/api/admin/wa/groups/<chat_id>", methods=["PATCH"])
+@protect
+def patch_wa_group(chat_id):
+    if wa_groups_collection is None:
+        return jsonify({"message": "Datastore unavailable."}), 503
+    payload = request.get_json(silent=True) or {}
+    try:
+        body = WaGroupPatchRequest(**payload)
+    except ValidationError as exc:
+        return jsonify({"message": "Invalid request.", "errors": exc.errors()}), 400
+    result = wa_groups_collection.update_one({"chatId": chat_id}, {"$set": {"isTarget": body.isTarget}})
+    if result.matched_count == 0:
+        return jsonify({"message": "Group not found."}), 404
+    record_admin_action("wa.group.patch", target_type="waGroup", target_id=chat_id, details={"isTarget": body.isTarget})
+    return jsonify({"message": "Updated."}), 200
+
+
+@app.route("/api/admin/wa/templates", methods=["GET"])
+@protect
+def list_wa_templates():
+    if wa_templates_collection is None:
+        return jsonify({"templates": []}), 200
+    docs = list(wa_templates_collection.find({}).sort("name", 1))
+    return jsonify({"templates": [_wa_serialize(d) for d in docs]}), 200
+
+
+@app.route("/api/admin/wa/templates", methods=["POST"])
+@protect
+def create_wa_template():
+    if wa_templates_collection is None:
+        return jsonify({"message": "Datastore unavailable."}), 503
+    payload = request.get_json(silent=True) or {}
+    try:
+        body = WaTemplateRequest(**payload)
+    except ValidationError as exc:
+        return jsonify({"message": "Invalid template.", "errors": exc.errors()}), 400
+    now = datetime.now(timezone.utc)
+    doc = {
+        "name": sanitize_analytics_text(body.name),
+        "body": body.body,
+        "placeholders": sorted(set(re.findall(r"\{(\w+)\}", body.body))),
+        "active": body.active,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    result = wa_templates_collection.insert_one(doc)
+    record_admin_action("wa.template.create", target_type="waTemplate", target_id=str(result.inserted_id))
+    doc["_id"] = result.inserted_id
+    return jsonify(_wa_serialize(doc)), 201
+
+
+@app.route("/api/admin/wa/templates/<template_id>", methods=["PATCH"])
+@protect
+def patch_wa_template(template_id):
+    if wa_templates_collection is None:
+        return jsonify({"message": "Datastore unavailable."}), 503
+    payload = request.get_json(silent=True) or {}
+    try:
+        body = WaTemplateRequest(**payload)
+    except ValidationError as exc:
+        return jsonify({"message": "Invalid template.", "errors": exc.errors()}), 400
+    try:
+        oid = ObjectId(template_id)
+    except Exception:
+        return jsonify({"message": "Invalid id."}), 400
+    update = {
+        "name": sanitize_analytics_text(body.name),
+        "body": body.body,
+        "placeholders": sorted(set(re.findall(r"\{(\w+)\}", body.body))),
+        "active": body.active,
+        "updatedAt": datetime.now(timezone.utc),
+    }
+    result = wa_templates_collection.update_one({"_id": oid}, {"$set": update})
+    if result.matched_count == 0:
+        return jsonify({"message": "Not found."}), 404
+    record_admin_action("wa.template.update", target_type="waTemplate", target_id=template_id)
+    return jsonify({"message": "Updated."}), 200
+
+
+@app.route("/api/admin/wa/templates/<template_id>", methods=["DELETE"])
+@protect
+def delete_wa_template(template_id):
+    if wa_templates_collection is None:
+        return jsonify({"message": "Datastore unavailable."}), 503
+    try:
+        oid = ObjectId(template_id)
+    except Exception:
+        return jsonify({"message": "Invalid id."}), 400
+    result = wa_templates_collection.delete_one({"_id": oid})
+    if result.deleted_count == 0:
+        return jsonify({"message": "Not found."}), 404
+    record_admin_action("wa.template.delete", target_type="waTemplate", target_id=template_id)
+    return jsonify({"message": "Deleted."}), 200
+
+
+def _render_wa_preview(text: str, party: dict) -> str:
+    """Pure string substitution — the only server-side text step, and
+    deliberately dumb: no AI, no rephrasing, per the user's explicit choice.
+    {link} and {code} are per-target (one per group) and stay literal here;
+    the engine fills them in at send time."""
+    price = party.get("ticketPrice")
+    values = {
+        "party": party.get("name") or "",
+        "date": (isoformat_or_none(party.get("date")) or "")[:10],
+        "time": party.get("time") or "",
+        "venue": party.get("location") or party.get("venue") or "",
+        "city": party.get("city") or "",
+        "price": f"₪{price}" if price is not None else "",
+    }
+    rendered = text
+    for key, value in values.items():
+        rendered = rendered.replace("{" + key + "}", str(value))
+    return rendered
+
+
+@app.route("/api/admin/wa/preview", methods=["POST"])
+@protect
+def preview_wa_template():
+    payload = request.get_json(silent=True) or {}
+    text = payload.get("text")
+    party_id = payload.get("partyId")
+    party_slug = payload.get("partySlug")
+    if not text:
+        return jsonify({"message": "Missing text."}), 400
+    party = find_party_for_analytics(party_id, party_slug) if (party_id or party_slug) else None
+    if (party_id or party_slug) and not party:
+        return jsonify({"message": "Party not found."}), 404
+    rendered = _render_wa_preview(text, party) if party else text
+    return jsonify({"preview": rendered}), 200
+
+
+def _wa_campaign_is_stale_party(party: dict) -> bool:
+    """A party whose calendar day (Asia/Jerusalem) has already passed —
+    mirrors the relay's parties.js staleness rule, ported here since the
+    admin is now a second place a campaign can be created from."""
+    dt = parse_datetime(party.get("date") or party.get("startsAt"))
+    if not dt:
+        return False
+    today_local = datetime.now(JERUSALEM_TZ).date()
+    party_local_date = dt.astimezone(JERUSALEM_TZ).date()
+    return party_local_date < today_local
+
+
+@app.route("/api/admin/wa/campaigns", methods=["GET"])
+@protect
+def list_wa_campaigns():
+    if wa_campaigns_collection is None:
+        return jsonify({"campaigns": []}), 200
+    status_param = (request.args.get("status") or "").strip()
+    query = {"status": status_param} if status_param else {}
+    docs = list(wa_campaigns_collection.find(query).sort("createdAt", -1).limit(200))
+    return jsonify({"campaigns": [_wa_serialize(d) for d in docs]}), 200
+
+
+@app.route("/api/admin/wa/campaigns", methods=["POST"])
+@protect
+def create_wa_campaign():
+    if wa_campaigns_collection is None or parties_collection is None:
+        return jsonify({"message": "Datastore unavailable."}), 503
+    payload = request.get_json(silent=True) or {}
+    try:
+        body = WaCampaignCreateRequest(**payload)
+    except ValidationError as exc:
+        return jsonify({"message": "Invalid campaign.", "errors": exc.errors()}), 400
+
+    if not body.partyId and not body.partySlug:
+        return jsonify({"message": "Provide partyId or partySlug."}), 400
+    party = find_party_for_analytics(body.partyId, body.partySlug)
+    if not party:
+        return jsonify({"message": "Party not found."}), 404
+    if _wa_campaign_is_stale_party(party) and not body.override:
+        return jsonify({"message": "That party's date has already passed. Pass override to send anyway."}), 409
+
+    if not body.targetChatIds:
+        return jsonify({"message": "At least one target group is required."}), 400
+    if "{link}" not in body.text:
+        return jsonify({"message": "Message text must include a {link} placeholder."}), 400
+
+    now = datetime.now(timezone.utc)
+    scheduled_for = parse_datetime(body.scheduledFor) or now
+    if scheduled_for < now - timedelta(minutes=1):
+        return jsonify({"message": "scheduledFor cannot be in the past."}), 400
+
+    settings = _wa_settings()
+
+    if not body.override:
+        day_start_local = datetime.now(JERUSALEM_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+        day_start_utc = day_start_local.astimezone(timezone.utc)
+        today_count = wa_campaigns_collection.count_documents({
+            "createdAt": {"$gte": day_start_utc},
+            "status": {"$in": ["queued", "running", "done"]},
+        })
+        if today_count >= int(settings.get("dailyCap", 3)):
+            return jsonify({"message": f"Daily campaign cap ({settings.get('dailyCap')}) reached. Pass override to send anyway."}), 409
+
+    scheduled_for, deferred = _apply_quiet_hours(scheduled_for, settings)
+
+    # Resolve target names from waGroups where known, so the campaign doc is
+    # self-describing without a join at read time.
+    group_names = {}
+    if wa_groups_collection is not None:
+        for g in wa_groups_collection.find({"chatId": {"$in": body.targetChatIds}}):
+            group_names[g["chatId"]] = g.get("name")
+
+    targets = []
+    for chat_id in body.targetChatIds:
+        code = _generate_wa_code()
+        targets.append({
+            "chatId": chat_id,
+            "name": group_names.get(chat_id, chat_id),
+            "code": code,
+            "status": "pending",
+        })
+
+    party_id_str = str(party["_id"])
+    campaign_doc = {
+        "partyId": party_id_str,
+        "partySlug": party.get("slug"),
+        "templateId": body.templateId,
+        "text": body.text,
+        "scheduledFor": scheduled_for,
+        "deferredForQuietHours": deferred,
+        "status": "queued",
+        "createdAt": now,
+        "createdBy": "admin",
+        "override": body.override,
+        "targets": targets,
+    }
+    result = wa_campaigns_collection.insert_one(campaign_doc)
+    campaign_id = str(result.inserted_id)
+
+    if wa_links_collection is not None:
+        link_docs = [
+            {
+                "code": t["code"],
+                "campaignId": campaign_id,
+                "chatId": t["chatId"],
+                "partyId": party_id_str,
+                "partySlug": party.get("slug"),
+                "createdAt": now,
+                "clicks": 0,
+                "lastClickAt": None,
+            }
+            for t in targets
+        ]
+        if link_docs:
+            wa_links_collection.insert_many(link_docs)
+
+    record_admin_action(
+        "wa.campaign.create",
+        target_type="waCampaign",
+        target_id=campaign_id,
+        details={"partyId": party_id_str, "targets": len(targets), "override": body.override},
+    )
+    campaign_doc["_id"] = result.inserted_id
+    return jsonify(_wa_serialize(campaign_doc)), 201
+
+
+@app.route("/api/admin/wa/campaigns/<campaign_id>", methods=["GET"])
+@protect
+def get_wa_campaign(campaign_id):
+    if wa_campaigns_collection is None:
+        return jsonify({"message": "Datastore unavailable."}), 503
+    try:
+        oid = ObjectId(campaign_id)
+    except Exception:
+        return jsonify({"message": "Invalid id."}), 400
+    doc = wa_campaigns_collection.find_one({"_id": oid})
+    if not doc:
+        return jsonify({"message": "Not found."}), 404
+
+    clicks_by_chat = {}
+    if wa_clicks_collection is not None:
+        try:
+            pipeline = [
+                {"$match": {"campaignId": campaign_id, "isBot": {"$ne": True}}},
+                {"$group": {"_id": "$chatId", "count": {"$sum": 1}}},
+            ]
+            for row in wa_clicks_collection.aggregate(pipeline):
+                clicks_by_chat[row["_id"]] = row["count"]
+        except Exception as exc:  # pragma: no cover - defensive
+            app.logger.warning(f"Failed to aggregate wa clicks for campaign {campaign_id}: {exc}")
+
+    serialized = _wa_serialize(doc)
+    for target in serialized.get("targets", []):
+        target["clicks"] = clicks_by_chat.get(target.get("chatId"), 0)
+    return jsonify(serialized), 200
+
+
+@app.route("/api/admin/wa/campaigns/<campaign_id>/cancel", methods=["POST"])
+@protect
+def cancel_wa_campaign(campaign_id):
+    if wa_campaigns_collection is None:
+        return jsonify({"message": "Datastore unavailable."}), 503
+    try:
+        oid = ObjectId(campaign_id)
+    except Exception:
+        return jsonify({"message": "Invalid id."}), 400
+    result = wa_campaigns_collection.update_one(
+        {"_id": oid, "status": "queued"},
+        {"$set": {"status": "cancelled", "cancelledAt": datetime.now(timezone.utc)}},
+    )
+    if result.matched_count == 0:
+        return jsonify({"message": "Not found or not cancellable (already running/done)."}), 409
+    record_admin_action("wa.campaign.cancel", target_type="waCampaign", target_id=campaign_id)
+    return jsonify({"message": "Cancelled."}), 200
+
+
+@app.route("/api/admin/wa/funnel", methods=["GET"])
+@protect
+def wa_funnel():
+    """Reads -> clicks -> buy-clicks -> sales, each explicitly labelled with
+    its confidence. Reads are cut until receipts are solved (see plan);
+    sales are party+day level only — GoOut exposes no per-link attribution,
+    so a WhatsApp campaign's sales figure is a time-correlation, not a
+    verified attribution. Never presented as more precise than that."""
+    if wa_campaigns_collection is None:
+        return jsonify({"message": "Datastore unavailable."}), 503
+
+    party_id = request.args.get("partyId")
+    try:
+        days = int(request.args.get("days", 30))
+    except (TypeError, ValueError):
+        days = 30
+    days = max(1, min(days, 180))
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    query = {"createdAt": {"$gte": cutoff}}
+    if party_id:
+        query["partyId"] = party_id
+    campaigns = list(wa_campaigns_collection.find(query))
+
+    total_targets = sum(len(c.get("targets", [])) for c in campaigns)
+    total_sent = sum(1 for c in campaigns for t in c.get("targets", []) if t.get("status") == "sent")
+
+    total_clicks = 0
+    buy_clicks = 0
+    if wa_clicks_collection is not None:
+        campaign_ids = [str(c["_id"]) for c in campaigns]
+        if campaign_ids:
+            total_clicks = wa_clicks_collection.count_documents({
+                "campaignId": {"$in": campaign_ids}, "isBot": {"$ne": True},
+            })
+    if analytics_collection is not None:
+        codes = [t.get("code") for c in campaigns for t in c.get("targets", []) if t.get("code")]
+        if codes:
+            buy_clicks = analytics_collection.count_documents({
+                "category": "party", "action": "redirect", "waCode": {"$in": codes},
+            })
+
+    sales_note = "Sales are party+day level only — GoOut exposes no per-link attribution, so this is a time correlation, not a verified attribution."
+    sales = None
+    if party_id and goout_sales_collection is not None:
+        try:
+            party = parties_collection.find_one({"_id": ObjectId(party_id)}) if parties_collection is not None else None
+        except Exception:
+            party = None
+        go_out_event_id = str(party.get("goOutEventId")) if party and party.get("goOutEventId") else None
+        if go_out_event_id:
+            totals = _sales_totals_by_event_id(cutoff=cutoff)
+            sales = totals.get(go_out_event_id, {}).get("totalTicketsSold")
+
+    return jsonify({
+        "days": days,
+        "partyId": party_id,
+        "campaigns": len(campaigns),
+        "funnel": {
+            "sent": {"count": total_sent, "of": total_targets, "confidence": "exact"},
+            "reads": {"count": None, "confidence": "not available — see plan (receipts deferred)"},
+            "clicks": {"count": total_clicks, "confidence": "exact"},
+            "buyClicks": {"count": buy_clicks, "confidence": "exact (client-beacon based)"},
+            "sales": {"count": sales, "confidence": "correlational", "note": sales_note},
+        },
+    }), 200
+
+
+@app.route("/api/admin/wa/overview", methods=["GET"])
+@protect
+def wa_overview():
+    settings = _wa_settings()
+    heartbeat = None
+    if wa_settings_collection is not None:
+        doc = wa_settings_collection.find_one({"key": "engineHeartbeat"})
+        heartbeat = isoformat_or_none(doc.get("value")) if doc else None
+
+    today_campaigns = 0
+    if wa_campaigns_collection is not None:
+        day_start_local = datetime.now(JERUSALEM_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+        today_campaigns = wa_campaigns_collection.count_documents({
+            "createdAt": {"$gte": day_start_local.astimezone(timezone.utc)},
+            "status": {"$in": ["queued", "running", "done"]},
+        })
+
+    group_count = wa_groups_collection.count_documents({"isTarget": True}) if wa_groups_collection is not None else 0
+    member_count = wa_members_collection.estimated_document_count() if wa_members_collection is not None else 0
+
+    return jsonify({
+        "settings": settings,
+        "engineHeartbeat": heartbeat,
+        "todayCampaigns": today_campaigns,
+        "dailyCap": settings.get("dailyCap"),
+        "targetGroupCount": group_count,
+        "memberCount": member_count,
+    }), 200
 
 
 # --- Internal service-to-service endpoints (called by goout-scraper VM) ---

@@ -7085,6 +7085,35 @@ def _wa_campaign_is_stale_party(party: dict) -> bool:
     return party_local_date < today_local
 
 
+def _wa_blocked_reason(doc: dict) -> str | None:
+    """Why a 'queued' campaign hasn't sent yet, for admin visibility. Was
+    previously invisible: relay#21 campaigns default override=False and the
+    scheduler's cap check just silently does nothing tick after tick, with
+    no record anywhere that it's stuck rather than merely not-due-yet.
+    Read-only — mirrors scheduler.js's own check, doesn't affect it."""
+    if doc.get("status") != "queued" or wa_campaigns_collection is None:
+        return None
+
+    scheduled_for = parse_datetime(doc.get("scheduledFor"))
+    now = datetime.now(timezone.utc)
+    if scheduled_for and scheduled_for > now:
+        local = scheduled_for.astimezone(JERUSALEM_TZ)
+        return f"מתוזמן ל-{local.strftime('%H:%M')} ({'שעות שקט' if doc.get('deferredForQuietHours') else 'מועד עתידי'})"
+
+    if not doc.get("override"):
+        settings = _wa_settings()
+        day_start_local = datetime.now(JERUSALEM_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+        today_count = wa_campaigns_collection.count_documents({
+            "createdAt": {"$gte": day_start_local.astimezone(timezone.utc)},
+            "status": {"$in": ["queued", "running", "done"]},
+        })
+        cap = int(settings.get("dailyCap", 3))
+        if today_count >= cap:
+            return f"תקרת קמפיינים יומית הגיעה ({today_count}/{cap}) — עקוף כדי לשלוח בכל זאת"
+
+    return None
+
+
 @app.route("/api/admin/wa/campaigns", methods=["GET"])
 @protect
 def list_wa_campaigns():
@@ -7093,7 +7122,12 @@ def list_wa_campaigns():
     status_param = (request.args.get("status") or "").strip()
     query = {"status": status_param} if status_param else {}
     docs = list(wa_campaigns_collection.find(query).sort("createdAt", -1).limit(200))
-    return jsonify({"campaigns": [_wa_serialize(d) for d in docs]}), 200
+    serialized = []
+    for d in docs:
+        row = _wa_serialize(d)
+        row["blockedReason"] = _wa_blocked_reason(d)
+        serialized.append(row)
+    return jsonify({"campaigns": serialized}), 200
 
 
 @app.route("/api/admin/wa/campaigns", methods=["POST"])
@@ -7232,9 +7266,35 @@ def get_wa_campaign(campaign_id):
             app.logger.warning(f"Failed to aggregate wa clicks for campaign {campaign_id}: {exc}")
 
     serialized = _wa_serialize(doc)
+    serialized["blockedReason"] = _wa_blocked_reason(doc)
     for target in serialized.get("targets", []):
         target["clicks"] = clicks_by_chat.get(target.get("chatId"), 0)
     return jsonify(serialized), 200
+
+
+@app.route("/api/admin/wa/campaigns/<campaign_id>/override", methods=["POST"])
+@protect
+def override_wa_campaign(campaign_id):
+    """Sets override=true on an existing 'queued' campaign so the
+    scheduler's daily-cap check stops blocking it (quiet-hours is only
+    applied once at creation time, so nothing further to skip there once
+    scheduledFor has already been set). The bypass the user asked for,
+    directly: relay#21 campaigns are created with override=False and there
+    was previously no way to change that short of editing the database."""
+    if wa_campaigns_collection is None:
+        return jsonify({"message": "Datastore unavailable."}), 503
+    try:
+        oid = ObjectId(campaign_id)
+    except Exception:
+        return jsonify({"message": "Invalid id."}), 400
+    result = wa_campaigns_collection.update_one(
+        {"_id": oid, "status": "queued"},
+        {"$set": {"override": True}},
+    )
+    if result.matched_count == 0:
+        return jsonify({"message": "Not found or not queued."}), 409
+    record_admin_action("wa.campaign.override", target_type="waCampaign", target_id=campaign_id)
+    return jsonify({"message": "Override set — will send on the next tick."}), 200
 
 
 @app.route("/api/admin/wa/campaigns/<campaign_id>/cancel", methods=["POST"])

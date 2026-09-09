@@ -534,11 +534,15 @@ try:
     wa_links_collection = db.waLinks
     wa_clicks_collection = db.waClicks
     wa_settings_collection = db.waSettings
+    # Named, reusable sets of target chatIds ("Techno groups", "Youth groups") — pure
+    # admin convenience, the engine never reads this collection.
+    wa_group_bundles_collection = db.waGroupBundles
 
     ensure_index(wa_groups_collection, [("chatId", 1)], name="unique_chat_id", unique=True)
     ensure_index(wa_members_collection, [("memberHash", 1)], name="unique_member_hash", unique=True)
     ensure_index(wa_members_collection, [("groups", 1)], name="member_groups")
     ensure_index(wa_templates_collection, [("name", 1)], name="template_name")
+    ensure_index(wa_group_bundles_collection, [("name", 1)], name="bundle_name")
     ensure_index(wa_campaigns_collection, [("status", 1), ("scheduledFor", 1)], name="campaign_status_scheduled")
     ensure_index(wa_campaigns_collection, [("partyId", 1)], name="campaign_party")
     ensure_index(wa_links_collection, [("code", 1)], name="unique_link_code", unique=True)
@@ -570,6 +574,7 @@ except Exception as e:
     wa_links_collection = None
     wa_clicks_collection = None
     wa_settings_collection = None
+    wa_group_bundles_collection = None
 
 
 def record_setting_hit(key: str, extra: dict | None = None):
@@ -6697,6 +6702,14 @@ class WaTemplateRequest(BaseModel):
         extra = "forbid"
 
 
+class WaGroupBundleRequest(BaseModel):
+    name: str
+    chatIds: list[str]
+
+    class Config:
+        extra = "forbid"
+
+
 class WaCampaignCreateRequest(BaseModel):
     partyId: str | None = None
     partySlug: str | None = None
@@ -6942,6 +6955,88 @@ def delete_wa_template(template_id):
     return jsonify({"message": "Deleted."}), 200
 
 
+@app.route("/api/admin/wa/bundles", methods=["GET"])
+@protect
+def list_wa_bundles():
+    """Named, reusable group selections ("Techno groups", "Youth groups") for
+    the New Send tab's group picker — pure admin convenience, nothing else
+    reads this collection."""
+    if wa_group_bundles_collection is None:
+        return jsonify({"bundles": []}), 200
+    docs = list(wa_group_bundles_collection.find({}).sort("name", 1))
+    return jsonify({"bundles": [_wa_serialize(d) for d in docs]}), 200
+
+
+@app.route("/api/admin/wa/bundles", methods=["POST"])
+@protect
+def create_wa_bundle():
+    if wa_group_bundles_collection is None:
+        return jsonify({"message": "Datastore unavailable."}), 503
+    payload = request.get_json(silent=True) or {}
+    try:
+        body = WaGroupBundleRequest(**payload)
+    except ValidationError as exc:
+        return jsonify({"message": "Invalid bundle.", "errors": exc.errors()}), 400
+    name = sanitize_analytics_text(body.name)
+    if not name:
+        return jsonify({"message": "Invalid bundle.", "errors": [{"loc": ["name"], "msg": "name is required."}]}), 400
+    if not body.chatIds:
+        return jsonify({"message": "Invalid bundle.", "errors": [{"loc": ["chatIds"], "msg": "At least one group is required."}]}), 400
+    now = datetime.now(timezone.utc)
+    doc = {
+        "name": name,
+        "chatIds": body.chatIds,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    result = wa_group_bundles_collection.insert_one(doc)
+    record_admin_action("wa.bundle.create", target_type="waGroupBundle", target_id=str(result.inserted_id), details={"groups": len(body.chatIds)})
+    doc["_id"] = result.inserted_id
+    return jsonify(_wa_serialize(doc)), 201
+
+
+@app.route("/api/admin/wa/bundles/<bundle_id>", methods=["PATCH"])
+@protect
+def patch_wa_bundle(bundle_id):
+    if wa_group_bundles_collection is None:
+        return jsonify({"message": "Datastore unavailable."}), 503
+    payload = request.get_json(silent=True) or {}
+    try:
+        body = WaGroupBundleRequest(**payload)
+    except ValidationError as exc:
+        return jsonify({"message": "Invalid bundle.", "errors": exc.errors()}), 400
+    try:
+        oid = ObjectId(bundle_id)
+    except Exception:
+        return jsonify({"message": "Invalid id."}), 400
+    update = {
+        "name": sanitize_analytics_text(body.name),
+        "chatIds": body.chatIds,
+        "updatedAt": datetime.now(timezone.utc),
+    }
+    result = wa_group_bundles_collection.update_one({"_id": oid}, {"$set": update})
+    if result.matched_count == 0:
+        return jsonify({"message": "Not found."}), 404
+    record_admin_action("wa.bundle.update", target_type="waGroupBundle", target_id=bundle_id)
+    return jsonify({"message": "Updated."}), 200
+
+
+@app.route("/api/admin/wa/bundles/<bundle_id>", methods=["DELETE"])
+@protect
+def delete_wa_bundle(bundle_id):
+    if wa_group_bundles_collection is None:
+        return jsonify({"message": "Datastore unavailable."}), 503
+    try:
+        oid = ObjectId(bundle_id)
+    except Exception:
+        return jsonify({"message": "Invalid id."}), 400
+    result = wa_group_bundles_collection.delete_one({"_id": oid})
+    if result.deleted_count == 0:
+        return jsonify({"message": "Not found."}), 404
+    record_admin_action("wa.bundle.delete", target_type="waGroupBundle", target_id=bundle_id)
+    return jsonify({"message": "Deleted."}), 200
+
+
 def _render_wa_preview(text: str, party: dict) -> str:
     """Pure string substitution — the only server-side text step, and
     deliberately dumb: no AI, no rephrasing, per the user's explicit choice.
@@ -7042,7 +7137,13 @@ def create_wa_campaign():
         if today_count >= int(settings.get("dailyCap", 3)):
             return jsonify({"message": f"Daily campaign cap ({settings.get('dailyCap')}) reached. Pass override to send anyway."}), 409
 
-    scheduled_for, deferred = _apply_quiet_hours(scheduled_for, settings)
+    # override was only wired to skip the daily-cap check above — quiet hours
+    # were applied unconditionally, so checking "override" and asking for
+    # scheduledFor=now still silently deferred to quietHoursEnd. Fixed: both
+    # guards override skips are the same flag.
+    deferred = False
+    if not body.override:
+        scheduled_for, deferred = _apply_quiet_hours(scheduled_for, settings)
 
     # Resolve target names from waGroups where known, so the campaign doc is
     # self-describing without a join at read time.

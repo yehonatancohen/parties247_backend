@@ -7664,7 +7664,11 @@ def list_wa_send_facts():
         return jsonify({"facts": []}), 200
     days = _int_arg("days", 14, 1, 180)
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    docs = list(wa_send_facts_collection.find({"sentAt": {"$gte": cutoff}}).sort("sentAt", -1).limit(1000))
+    try:
+        docs = list(wa_send_facts_collection.find({"sentAt": {"$gte": cutoff}}).sort("sentAt", -1).limit(1000))
+    except Exception as exc:  # pragma: no cover - defensive against Atlas hiccups
+        app.logger.error(f"Failed to read wa send facts: {exc}")
+        return jsonify({"message": "Failed to read send facts."}), 500
     return jsonify({"days": days, "facts": [_wa_serialize(d) for d in docs]}), 200
 
 
@@ -7688,47 +7692,51 @@ def rebuild_wa_send_facts():
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=days)
 
-    campaigns = list(wa_campaigns_collection.find({"createdAt": {"$gte": cutoff}}))
-    campaign_ids = [str(c["_id"]) for c in campaigns]
-    for c in campaigns:
-        c["_id"] = str(c["_id"])
+    try:
+        campaigns = list(wa_campaigns_collection.find({"createdAt": {"$gte": cutoff}}))
+        campaign_ids = [str(c["_id"]) for c in campaigns]
+        for c in campaigns:
+            c["_id"] = str(c["_id"])
 
-    clicks = list(wa_clicks_collection.find({"campaignId": {"$in": campaign_ids}})) if wa_clicks_collection is not None and campaign_ids else []
+        clicks = list(wa_clicks_collection.find({"campaignId": {"$in": campaign_ids}})) if wa_clicks_collection is not None and campaign_ids else []
 
-    codes = [t.get("code") for c in campaigns for t in (c.get("targets") or []) if t.get("code")]
-    analytics_rows = list(analytics_collection.find(
-        {"category": "party", "waCode": {"$in": codes}},
-        {"waCode": 1, "action": 1, "createdAt": 1, "partyId": 1},
-    )) if analytics_collection is not None and codes else []
+        codes = [t.get("code") for c in campaigns for t in (c.get("targets") or []) if t.get("code")]
+        analytics_rows = list(analytics_collection.find(
+            {"category": "party", "waCode": {"$in": codes}},
+            {"waCode": 1, "action": 1, "createdAt": 1, "partyId": 1},
+        )) if analytics_collection is not None and codes else []
 
-    event_ids = sorted({eid for c in campaigns if (eid := _wa_goout_event_id_for_campaign(c))})
-    snapshots = list(goout_sales_snapshots_collection.find(
-        {"go_out_id": {"$in": event_ids}},
-    )) if goout_sales_snapshots_collection is not None and event_ids else []
+        event_ids = sorted({eid for c in campaigns if (eid := _wa_goout_event_id_for_campaign(c))})
+        snapshots = list(goout_sales_snapshots_collection.find(
+            {"go_out_id": {"$in": event_ids}},
+        )) if goout_sales_snapshots_collection is not None and event_ids else []
 
-    msg_ids = [t.get("waMsgId") for c in campaigns for t in (c.get("targets") or []) if t.get("waMsgId")]
-    msg_events = list(wa_message_events_collection.find(
-        {"waMsgId": {"$in": msg_ids}},
-    )) if wa_message_events_collection is not None and msg_ids else []
+        msg_ids = [t.get("waMsgId") for c in campaigns for t in (c.get("targets") or []) if t.get("waMsgId")]
+        msg_events = list(wa_message_events_collection.find(
+            {"waMsgId": {"$in": msg_ids}},
+        )) if wa_message_events_collection is not None and msg_ids else []
 
-    # goOutEventId isn't always on `features` for older campaigns — patch it
-    # in-memory so build_send_facts's sales join works without touching the
-    # stored campaign doc (feature snapshots are otherwise never rewritten).
-    for c in campaigns:
-        features = dict(c.get("features") or {})
-        if not features.get("goOutEventId"):
-            resolved = _wa_goout_event_id_for_campaign(c)
-            if resolved:
-                features["goOutEventId"] = resolved
-        c["features"] = features
+        # goOutEventId isn't always on `features` for older campaigns — patch it
+        # in-memory so build_send_facts's sales join works without touching the
+        # stored campaign doc (feature snapshots are otherwise never rewritten).
+        for c in campaigns:
+            features = dict(c.get("features") or {})
+            if not features.get("goOutEventId"):
+                resolved = _wa_goout_event_id_for_campaign(c)
+                if resolved:
+                    features["goOutEventId"] = resolved
+            c["features"] = features
 
-    facts = wa_facts.build_send_facts(
-        campaigns, clicks=clicks, analytics_rows=analytics_rows,
-        snapshots=snapshots, msg_events=msg_events, now=now,
-    )
-    for fact in facts:
-        key = {"campaignId": fact["campaignId"], "chatId": fact["chatId"]}
-        wa_send_facts_collection.update_one(key, {"$set": fact}, upsert=True)
+        facts = wa_facts.build_send_facts(
+            campaigns, clicks=clicks, analytics_rows=analytics_rows,
+            snapshots=snapshots, msg_events=msg_events, now=now,
+        )
+        for fact in facts:
+            key = {"campaignId": fact["campaignId"], "chatId": fact["chatId"]}
+            wa_send_facts_collection.update_one(key, {"$set": fact}, upsert=True)
+    except Exception as exc:  # pragma: no cover - defensive against Atlas hiccups
+        app.logger.error(f"Failed to rebuild wa send facts: {exc}")
+        return jsonify({"message": "Failed to rebuild send facts."}), 500
 
     return jsonify({"message": "Rebuilt.", "campaigns": len(campaigns), "facts": len(facts)}), 200
 
@@ -7746,23 +7754,27 @@ def wa_sales_watchlist():
 
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=24)
-    docs = wa_campaigns_collection.find({
-        "$or": [
-            {"status": {"$in": ["queued", "running"]}},
-            {"targets.sentAt": {"$gte": cutoff}},
-        ],
-    })
+    try:
+        docs = wa_campaigns_collection.find({
+            "$or": [
+                {"status": {"$in": ["queued", "running"]}},
+                {"targets.sentAt": {"$gte": cutoff}},
+            ],
+        })
 
-    watchlist: dict[str, dict] = {}
-    for c in docs:
-        event_id = _wa_goout_event_id_for_campaign(c)
-        if not event_id:
-            continue
-        entry = watchlist.setdefault(event_id, {"goOutEventId": event_id, "partyId": c.get("partyId"), "reasons": set()})
-        if c.get("status") in ("queued", "running"):
-            entry["reasons"].add("queued")
-        if any(isinstance(t.get("sentAt"), datetime) and t["sentAt"] >= cutoff for t in (c.get("targets") or [])):
-            entry["reasons"].add("recentlySent")
+        watchlist: dict[str, dict] = {}
+        for c in docs:
+            event_id = _wa_goout_event_id_for_campaign(c)
+            if not event_id:
+                continue
+            entry = watchlist.setdefault(event_id, {"goOutEventId": event_id, "partyId": c.get("partyId"), "reasons": set()})
+            if c.get("status") in ("queued", "running"):
+                entry["reasons"].add("queued")
+            if any(isinstance(t.get("sentAt"), datetime) and t["sentAt"] >= cutoff for t in (c.get("targets") or [])):
+                entry["reasons"].add("recentlySent")
+    except Exception as exc:  # pragma: no cover - defensive against Atlas hiccups
+        app.logger.error(f"Failed to build wa sales watchlist: {exc}")
+        return jsonify({"message": "Failed to build watchlist."}), 500
 
     return jsonify({"watchlist": [
         {**v, "reasons": sorted(v["reasons"])} for v in watchlist.values()

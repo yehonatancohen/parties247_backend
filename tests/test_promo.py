@@ -108,11 +108,18 @@ def test_message_formats():
     assert "📍 Moon Child, תל אביב" in msg
     assert "🎶 מיינסטרים · 18+" in msg
     assert "💸 החל מ-₪80" in msg
-    assert msg.endswith("https://www.go-out.co/event/moon?ref=acc2")
+    # links point at our own event page, not straight to GoOut, so promo
+    # traffic stays inside our funnel
+    assert msg.endswith("https://www.parties247.co.il/event/thursday-moon")
+
+    template = ranked[0]["campaignTemplate"]
+    assert template.endswith("{link}")
+    assert "🎉 *THURSDAY MOON | MAINSTREAM*" in template
 
     digest = promo.format_digest_message(ranked, days=7)
     assert digest.startswith("🔥 *המסיבות הכי חמות לשבוע הקרוב* 🔥")
     assert "1️⃣ *THURSDAY MOON | MAINSTREAM* — יום חמישי 10.09 · 23:00, Moon Child, תל אביב" in digest
+    assert "https://www.parties247.co.il/event/thursday-moon" in digest
     assert digest.endswith("כל המסיבות: https://www.parties247.co.il")
     assert promo.format_digest_message([], days=7) == ""
 
@@ -153,6 +160,9 @@ def test_build_whatsapp_promo_joins_collections(monkeypatch):
     assert c["tier"] == "account1"
     assert c["ticketsLast30d"] == 1
     assert c["url"].endswith("ref=myref")  # default referral applied to the link
-    assert "ref=myref" in data["digest"]
+    # digest/message link to our own event page (referral is preserved once
+    # the visitor reaches the site's buy button, via the same referral-tagged url)
+    assert "parties247.co.il/event/s1" in data["digest"]
+    assert "parties247.co.il/event/s1" in c["message"]
     # the party read must be projected, never a full-document load
     assert parties.projections and "description" not in parties.projections[0]

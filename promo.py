@@ -205,6 +205,7 @@ def rank_promo_candidates(parties, *, sales_by_event_id: dict, accounts_by_event
             "siteUrl": f"{SITE_BASE_URL}/event/{slug}" if slug else None,
         }
         candidate["message"] = format_party_message(candidate)
+        candidate["campaignTemplate"] = format_party_template(candidate)
         candidates.append(candidate)
 
     candidates.sort(key=lambda c: (-c["score"], c["tier"] != "account1", c["date"]))
@@ -214,6 +215,14 @@ def rank_promo_candidates(parties, *, sales_by_event_id: dict, accounts_by_event
 # ---------------------------------------------------------------------------
 # Message templates (WhatsApp markdown: *bold*, _italic_)
 # ---------------------------------------------------------------------------
+
+def _promo_link(c: dict) -> str:
+    """Prefer our own site page over the raw GoOut link: keeps the visitor
+    inside our funnel (site analytics, archive/upcoming redirects) instead of
+    sending them straight to GoOut. The site's buy button already carries the
+    party's referral-tagged GoOut URL, so nothing is lost."""
+    return c.get("siteUrl") or c["url"]
+
 
 def format_party_message(c: dict) -> str:
     lines = [f"🎉 *{c['name']}*", f"📅 {c['dateLabel']}"]
@@ -225,7 +234,26 @@ def format_party_message(c: dict) -> str:
     if c.get("ticketPrice"):
         lines.append(f"💸 החל מ-₪{int(c['ticketPrice'])}")
     lines.append("🎟️ כרטיסים בקישור 👇")
-    lines.append(c["url"])
+    lines.append(_promo_link(c))
+    return "\n".join(lines)
+
+
+def format_party_template(c: dict) -> str:
+    """Same message, but for the real WhatsApp-campaign engine: ends in the
+    literal {link} placeholder (per-target referral link, filled in by the
+    engine at send time) instead of a resolved URL. Feeds the WhatsApp tab's
+    'New Send' form so a suggestion becomes a queued campaign in one click,
+    rather than a manual copy-paste."""
+    lines = [f"🎉 *{c['name']}*", f"📅 {c['dateLabel']}"]
+    if c.get("location"):
+        lines.append(f"📍 {c['location']}")
+    details = " · ".join(x for x in (c.get("musicType"), c.get("age")) if x and x != "אחר")
+    if details:
+        lines.append(f"🎶 {details}")
+    if c.get("ticketPrice"):
+        lines.append(f"💸 החל מ-₪{int(c['ticketPrice'])}")
+    lines.append("🎟️ כרטיסים בקישור 👇")
+    lines.append("{link}")
     return "\n".join(lines)
 
 
@@ -242,7 +270,7 @@ def format_digest_message(candidates: list[dict], *, days: int = 7, max_items: i
         bullet = _DIGIT_EMOJI[idx] if idx < len(_DIGIT_EMOJI) else "•"
         where = f", {c['location']}" if c.get("location") else ""
         lines.append(f"{bullet} *{c['name']}* — {c['dateLabel']}{where}")
-        lines.append(f"🎟️ {c['url']}")
+        lines.append(f"🎟️ {_promo_link(c)}")
         lines.append("")
     lines.append(f"כל המסיבות: {SITE_BASE_URL}")
     return "\n".join(lines).rstrip()

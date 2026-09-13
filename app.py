@@ -3405,6 +3405,7 @@ OPENAPI_TEMPLATE = {
                                                     "url": {"type": "string"},
                                                     "siteUrl": {"type": "string", "nullable": True},
                                                     "message": {"type": "string"},
+                                                    "campaignTemplate": {"type": "string", "description": "Same message with a literal {link} placeholder, for creating a WhatsApp campaign directly."},
                                                 },
                                             },
                                         },

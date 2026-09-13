@@ -75,6 +75,19 @@ def test_count_recent_sends_per_group_only_counts_window_and_group():
     assert wa_facts.count_recent_sends_per_group(campaigns, chat_id="c1", before=before) == 1
 
 
+def test_count_recent_sends_per_group_handles_naive_mongo_datetimes():
+    # pymongo hands back naive UTC datetimes on read (no tz_aware=True on
+    # this client) while `before` here is Python-side aware — mixing them
+    # raised "can't compare offset-naive and offset-aware datetimes" in
+    # production the first time a campaign was created with a real recent
+    # campaign already in waCampaigns (2026-09-13).
+    before = datetime(2026, 9, 10, tzinfo=timezone.utc)
+    campaigns = [
+        {"createdAt": before.replace(tzinfo=None) - timedelta(days=1), "targets": [{"chatId": "c1"}]},
+    ]
+    assert wa_facts.count_recent_sends_per_group(campaigns, chat_id="c1", before=before) == 1
+
+
 def test_count_unique_members_reached_dedupes_across_groups():
     members = [
         {"memberHash": "m1", "groups": ["c1"]},

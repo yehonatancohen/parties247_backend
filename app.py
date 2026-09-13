@@ -7278,14 +7278,6 @@ def create_wa_campaign():
         body = WaCampaignCreateRequest(**payload)
     except ValidationError as exc:
         return jsonify({"message": "Invalid campaign.", "errors": exc.errors()}), 400
-    try:
-        return _create_wa_campaign_impl(body)
-    except Exception as exc:
-        app.logger.exception("create_wa_campaign failed")
-        return jsonify({"message": f"DIAGNOSTIC: {type(exc).__name__}: {exc}"}), 500
-
-
-def _create_wa_campaign_impl(body):
 
     if not body.partyId and not body.partySlug:
         return jsonify({"message": "Provide partyId or partySlug."}), 400

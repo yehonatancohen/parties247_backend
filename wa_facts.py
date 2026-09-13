@@ -110,15 +110,31 @@ def build_group_snapshot(group: dict | None, *, chat_id: str, sends_last_7d: int
     }
 
 
+def _as_aware_utc(value) -> datetime | None:
+    """pymongo hands back naive UTC datetimes on read by default (no
+    tz_aware=True on this client), while `before`/`cutoff` here originate
+    from Python-side datetime.now(timezone.utc) — aware. Comparing them
+    directly raises "can't compare offset-naive and offset-aware datetimes"
+    (same bug class already hit and fixed in app.py's wa_sales_watchlist and
+    the fetcher's wa_sales_watch.py). Normalize both sides instead of hoping
+    the caller already did."""
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def count_recent_sends_per_group(campaigns, *, chat_id: str, before: datetime, window_days: int = 7) -> int:
     """How many campaigns already targeted this group in the trailing window —
     the fatigue signal. `campaigns` is any iterable of campaign docs with
     `createdAt` and `targets[].chatId`."""
+    before = _as_aware_utc(before) or before
     cutoff = before - timedelta(days=window_days)
     count = 0
     for c in campaigns:
-        created = c.get("createdAt")
-        if not isinstance(created, datetime) or created < cutoff or created >= before:
+        created = _as_aware_utc(c.get("createdAt"))
+        if created is None or created < cutoff or created >= before:
             continue
         if any(t.get("chatId") == chat_id for t in (c.get("targets") or [])):
             count += 1

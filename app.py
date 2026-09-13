@@ -41,6 +41,7 @@ from flask_apscheduler import APScheduler
 import threading
 
 import promo
+import wa_facts
 
 # --- App setup ---
 load_dotenv()
@@ -482,6 +483,10 @@ try:
     # The funnel / time-series builders always filter this event log by category
     # + a createdAt window; without this the "last N days" match was a full scan.
     ensure_index(analytics_collection, [("category", 1), ("createdAt", -1)], name="category_created_desc")
+    # POST /api/internal/wa/rebuild-facts joins this log by waCode every 20
+    # minutes (parties247_fetcher/wa_sales_watch.py) — without an index that
+    # $in query would be a full collection scan on every tick.
+    ensure_index(analytics_collection, [("waCode", 1)], name="wa_code", sparse=True)
     ensure_index(
         visitor_analytics_collection,
         [("createdAt", 1)],
@@ -537,6 +542,16 @@ try:
     # Named, reusable sets of target chatIds ("Techno groups", "Youth groups") — pure
     # admin convenience, the engine never reads this collection.
     wa_group_bundles_collection = db.waGroupBundles
+    # Written by the whatsapp-engine: per-group hourly activity counts and
+    # reaction/reply/deletion events on our own sent messages (counts/types
+    # only, never content or other members' identities — see wa_facts.py).
+    wa_group_activity_collection = db.waGroupActivity
+    wa_message_events_collection = db.waMessageEvents
+    wa_group_events_collection = db.waGroupEvents
+    # The dataset this API builds by joining the above with goout_sales_snapshots
+    # (written by the fetcher — see parties247_fetcher/wa_sales_watch.py).
+    wa_send_facts_collection = db.waSendFacts
+    goout_sales_snapshots_collection = db.goout_sales_snapshots
 
     ensure_index(wa_groups_collection, [("chatId", 1)], name="unique_chat_id", unique=True)
     ensure_index(wa_members_collection, [("memberHash", 1)], name="unique_member_hash", unique=True)
@@ -549,6 +564,10 @@ try:
     ensure_index(wa_clicks_collection, [("code", 1), ("at", 1)], name="click_code_at")
     ensure_index(wa_clicks_collection, [("campaignId", 1)], name="click_campaign")
     ensure_index(wa_settings_collection, [("key", 1)], name="unique_setting_key", unique=True)
+    ensure_index(wa_group_activity_collection, [("chatId", 1), ("hourStart", 1)], name="activity_chat_hour")
+    ensure_index(wa_message_events_collection, [("waMsgId", 1), ("chatId", 1)], name="msgevent_msg_chat")
+    ensure_index(wa_send_facts_collection, [("campaignId", 1), ("chatId", 1)], name="unique_send_fact", unique=True)
+    ensure_index(goout_sales_snapshots_collection, [("go_out_id", 1), ("at", 1)], name="snapshot_event_at")
 
     app.logger.info("Connected to MongoDB and ensured indexes.")
 except Exception as e:
@@ -575,6 +594,11 @@ except Exception as e:
     wa_clicks_collection = None
     wa_settings_collection = None
     wa_group_bundles_collection = None
+    wa_group_activity_collection = None
+    wa_message_events_collection = None
+    wa_group_events_collection = None
+    wa_send_facts_collection = None
+    goout_sales_snapshots_collection = None
 
 
 def record_setting_hit(key: str, extra: dict | None = None):
@@ -2006,6 +2030,9 @@ def record_party_interaction(metric: str):
                 wa_code = sanitize_analytics_text(getattr(body, "waCode", None))
                 if wa_code:
                     record["waCode"] = wa_code
+                    wa_first_seen = parse_datetime(getattr(body, "waFirstSeenAt", None))
+                    if wa_first_seen:
+                        record["waFirstSeenAt"] = wa_first_seen
 
                 analytics_collection.insert_one(record)
             except Exception as e:
@@ -2086,6 +2113,7 @@ def record_wa_click():
         ip_hash = hashlib.sha256(f"{WA_HASH_SALT}{client_ip}".encode("utf-8")).hexdigest()
 
     now = datetime.now(timezone.utc)
+    local_now = now.astimezone(JERUSALEM_TZ)
     try:
         wa_clicks_collection.insert_one({
             "code": code,
@@ -2093,6 +2121,8 @@ def record_wa_click():
             "chatId": link.get("chatId"),
             "partyId": link.get("partyId"),
             "at": now,
+            "localHour": local_now.hour,
+            "localDow": local_now.weekday(),
             "deviceType": sanitize_analytics_text(body.deviceType) or _parse_device_type(user_agent),
             "ipHash": ip_hash,
             "ua": user_agent,
@@ -3387,6 +3417,33 @@ OPENAPI_TEMPLATE = {
                 },
             }
         },
+        "/api/admin/wa/facts": {
+            "get": {
+                "summary": "WhatsApp send facts",
+                "description": "One row per (campaign, group): frozen party/message/group context at send time, joined with click/buy-click/reaction/sales outcomes over 1h/6h/24h/72h windows. The dataset behind the future send-time/group recommender. Sales figures are time-window correlations, not verified per-link attribution — GoOut exposes none.",
+                "security": [{"bearerAuth": []}],
+                "parameters": [
+                    {"name": "days", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 180, "default": 14}},
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Send facts, most recent first.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "days": {"type": "integer"},
+                                        "facts": {"type": "array", "items": {"type": "object"}},
+                                    },
+                                }
+                            }
+                        },
+                    },
+                    "401": {"description": "Unauthorized."},
+                },
+            }
+        },
         "/api/admin/login": {
             "post": {
                 "summary": "Obtain admin token",
@@ -4248,9 +4305,14 @@ class PartyAnalyticsRequest(BaseModel):
     sessionId: str | None = None
     referrer: str | None = None
     # Set by the website when the visit carries a WhatsApp click code
-    # (?w=<code> on /event/<slug>, read from sessionStorage) — lets a buy
-    # click be joined back to the WhatsApp campaign/group that drove it.
+    # (?w=<code> on /event/<slug>, read from localStorage with a 72h expiry
+    # — see waAttribution.ts) — lets a view/buy click be joined back to the
+    # WhatsApp campaign/group that drove it, even after navigating away.
     waCode: str | None = None
+    # When that code was first captured (ISO string) — how long ago the
+    # WhatsApp touch happened relative to this view/click, for recency
+    # weighting later; not required, since older clients won't send it.
+    waFirstSeenAt: str | None = None
 
     class Config:
         extra = "forbid"
@@ -7130,6 +7192,81 @@ def list_wa_campaigns():
     return jsonify({"campaigns": serialized}), 200
 
 
+def _wa_account_context(go_out_event_id: str | None) -> tuple[set[str], dict]:
+    """account_ids + the latest goout_sales doc for one event — same source
+    build_whatsapp_promo already reads, reused here so a campaign's frozen
+    `tier` always agrees with the promo drafter's."""
+    if not go_out_event_id or goout_sales_collection is None:
+        return set(), {}
+    account_ids: set[str] = set()
+    ticket_totals: dict = {}
+    try:
+        for doc in goout_sales_collection.find(
+            {"go_out_id": go_out_event_id}, {"account_id": 1, "confirmed_count": 1},
+        ):
+            if doc.get("account_id"):
+                account_ids.add(str(doc["account_id"]))
+            if doc.get("confirmed_count") is not None:
+                ticket_totals["confirmed_count"] = max(
+                    ticket_totals.get("confirmed_count", 0), doc["confirmed_count"],
+                )
+    except Exception as exc:  # pragma: no cover - defensive
+        app.logger.warning(f"Failed to read goout_sales for {go_out_event_id}: {exc}")
+    return account_ids, ticket_totals
+
+
+def _wa_freeze_campaign_features(party: dict, target_chat_ids: list[str], text: str, now: datetime) -> dict:
+    """Everything build_send_facts will later need that is only true *right
+    now*: the party's tier/price/timing, the message shape, and each target
+    group's current size and recent-send fatigue. See wa_facts.py."""
+    account_ids, ticket_totals = _wa_account_context(str(party.get("goOutEventId") or "") or None)
+    features = wa_facts.build_party_features(
+        party, account_ids=account_ids, account1_referral=None,
+        ticket_totals=ticket_totals, now=now,
+    )
+    message_features = wa_facts.build_message_features(text)
+
+    groups_by_chat_id: dict[str, dict] = {}
+    if wa_groups_collection is not None:
+        try:
+            for g in wa_groups_collection.find({"chatId": {"$in": target_chat_ids}}, {"chatId": 1, "memberCount": 1, "kind": 1}):
+                groups_by_chat_id[g["chatId"]] = g
+        except Exception as exc:  # pragma: no cover - defensive
+            app.logger.warning(f"Failed to read waGroups for feature snapshot: {exc}")
+
+    recent_campaigns: list[dict] = []
+    if wa_campaigns_collection is not None:
+        try:
+            recent_campaigns = list(wa_campaigns_collection.find(
+                {"createdAt": {"$gte": now - timedelta(days=7)}}, {"createdAt": 1, "targets.chatId": 1},
+            ))
+        except Exception as exc:  # pragma: no cover - defensive
+            app.logger.warning(f"Failed to read recent waCampaigns for fatigue signal: {exc}")
+
+    group_snapshots = [
+        wa_facts.build_group_snapshot(
+            groups_by_chat_id.get(chat_id), chat_id=chat_id,
+            sends_last_7d=wa_facts.count_recent_sends_per_group(recent_campaigns, chat_id=chat_id, before=now),
+        )
+        for chat_id in target_chat_ids
+    ]
+
+    unique_members_reached = None
+    if wa_members_collection is not None:
+        try:
+            members = wa_members_collection.find({"groups": {"$in": target_chat_ids}}, {"memberHash": 1, "groups": 1})
+            unique_members_reached = wa_facts.count_unique_members_reached(members, chat_ids=set(target_chat_ids))
+        except Exception as exc:  # pragma: no cover - defensive
+            app.logger.warning(f"Failed to compute unique members reached: {exc}")
+
+    return {
+        "features": features,
+        "messageFeatures": message_features,
+        "groupSnapshots": group_snapshots,
+        "uniqueMembersReached": unique_members_reached,
+    }
+
+
 @app.route("/api/admin/wa/campaigns", methods=["POST"])
 @protect
 def create_wa_campaign():
@@ -7197,6 +7334,7 @@ def create_wa_campaign():
         })
 
     party_id_str = str(party["_id"])
+    frozen = _wa_freeze_campaign_features(party, body.targetChatIds, body.text, now)
     campaign_doc = {
         "partyId": party_id_str,
         "partySlug": party.get("slug"),
@@ -7209,6 +7347,7 @@ def create_wa_campaign():
         "createdBy": "admin",
         "override": body.override,
         "targets": targets,
+        **frozen,
     }
     result = wa_campaigns_collection.insert_one(campaign_doc)
     campaign_id = str(result.inserted_id)
@@ -7501,6 +7640,133 @@ def wa_members_overlap():
             for (a, b), count in top_pairs
         ],
     }), 200
+
+
+def _wa_goout_event_id_for_campaign(campaign: dict) -> str | None:
+    """Prefer the frozen feature snapshot; fall back to a live party lookup
+    for older/relay#21-created campaigns that predate feature-freezing."""
+    event_id = (campaign.get("features") or {}).get("goOutEventId")
+    if event_id:
+        return str(event_id)
+    party = find_party_for_analytics(campaign.get("partyId"), campaign.get("partySlug"))
+    if party and party.get("goOutEventId"):
+        return str(party["goOutEventId"])
+    return None
+
+
+@app.route("/api/admin/wa/facts", methods=["GET"])
+@protect
+def list_wa_send_facts():
+    """The dataset behind the future send-time/group recommender: one row
+    per (campaign, group) with frozen context and windowed outcomes. See
+    wa_facts.py. Read-only — POST /api/internal/wa/rebuild-facts writes it."""
+    if wa_send_facts_collection is None:
+        return jsonify({"facts": []}), 200
+    days = _int_arg("days", 14, 1, 180)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    docs = list(wa_send_facts_collection.find({"sentAt": {"$gte": cutoff}}).sort("sentAt", -1).limit(1000))
+    return jsonify({"days": days, "facts": [_wa_serialize(d) for d in docs]}), 200
+
+
+@app.route("/api/internal/wa/rebuild-facts", methods=["POST"])
+def rebuild_wa_send_facts():
+    """Recomputes waSendFacts for campaigns sent in the last `days` (default
+    14). Called by the fetcher after every sales snapshot/update so the
+    dataset stays current without this API needing to poll GoOut itself.
+    Idempotent: each (campaignId, chatId) row is fully replaced, never
+    accumulated, so re-running after a late click or sales snapshot is safe."""
+    if not _check_service_token():
+        return jsonify({"message": "Unauthorized."}), 401
+    if wa_send_facts_collection is None or wa_campaigns_collection is None:
+        return jsonify({"message": "Datastore unavailable."}), 503
+
+    payload = request.get_json(silent=True) or {}
+    try:
+        days = max(1, min(int(payload.get("days", 14)), 180))
+    except (TypeError, ValueError):
+        days = 14
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+
+    campaigns = list(wa_campaigns_collection.find({"createdAt": {"$gte": cutoff}}))
+    campaign_ids = [str(c["_id"]) for c in campaigns]
+    for c in campaigns:
+        c["_id"] = str(c["_id"])
+
+    clicks = list(wa_clicks_collection.find({"campaignId": {"$in": campaign_ids}})) if wa_clicks_collection is not None and campaign_ids else []
+
+    codes = [t.get("code") for c in campaigns for t in (c.get("targets") or []) if t.get("code")]
+    analytics_rows = list(analytics_collection.find(
+        {"category": "party", "waCode": {"$in": codes}},
+        {"waCode": 1, "action": 1, "createdAt": 1, "partyId": 1},
+    )) if analytics_collection is not None and codes else []
+
+    event_ids = sorted({eid for c in campaigns if (eid := _wa_goout_event_id_for_campaign(c))})
+    snapshots = list(goout_sales_snapshots_collection.find(
+        {"go_out_id": {"$in": event_ids}},
+    )) if goout_sales_snapshots_collection is not None and event_ids else []
+
+    msg_ids = [t.get("waMsgId") for c in campaigns for t in (c.get("targets") or []) if t.get("waMsgId")]
+    msg_events = list(wa_message_events_collection.find(
+        {"waMsgId": {"$in": msg_ids}},
+    )) if wa_message_events_collection is not None and msg_ids else []
+
+    # goOutEventId isn't always on `features` for older campaigns — patch it
+    # in-memory so build_send_facts's sales join works without touching the
+    # stored campaign doc (feature snapshots are otherwise never rewritten).
+    for c in campaigns:
+        features = dict(c.get("features") or {})
+        if not features.get("goOutEventId"):
+            resolved = _wa_goout_event_id_for_campaign(c)
+            if resolved:
+                features["goOutEventId"] = resolved
+        c["features"] = features
+
+    facts = wa_facts.build_send_facts(
+        campaigns, clicks=clicks, analytics_rows=analytics_rows,
+        snapshots=snapshots, msg_events=msg_events, now=now,
+    )
+    for fact in facts:
+        key = {"campaignId": fact["campaignId"], "chatId": fact["chatId"]}
+        wa_send_facts_collection.update_one(key, {"$set": fact}, upsert=True)
+
+    return jsonify({"message": "Rebuilt.", "campaigns": len(campaigns), "facts": len(facts)}), 200
+
+
+@app.route("/api/internal/wa/watchlist", methods=["GET"])
+def wa_sales_watchlist():
+    """GoOut event ids worth polling for ticket sales more often than the
+    fetcher's normal 4h cycle: a campaign that's queued (need a pre-send
+    baseline) or was sent within the last 24h (need the post-send curve).
+    Called by parties247_fetcher's wa_sales_watch.py."""
+    if not _check_service_token():
+        return jsonify({"message": "Unauthorized."}), 401
+    if wa_campaigns_collection is None:
+        return jsonify({"watchlist": []}), 200
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=24)
+    docs = wa_campaigns_collection.find({
+        "$or": [
+            {"status": {"$in": ["queued", "running"]}},
+            {"targets.sentAt": {"$gte": cutoff}},
+        ],
+    })
+
+    watchlist: dict[str, dict] = {}
+    for c in docs:
+        event_id = _wa_goout_event_id_for_campaign(c)
+        if not event_id:
+            continue
+        entry = watchlist.setdefault(event_id, {"goOutEventId": event_id, "partyId": c.get("partyId"), "reasons": set()})
+        if c.get("status") in ("queued", "running"):
+            entry["reasons"].add("queued")
+        if any(isinstance(t.get("sentAt"), datetime) and t["sentAt"] >= cutoff for t in (c.get("targets") or [])):
+            entry["reasons"].add("recentlySent")
+
+    return jsonify({"watchlist": [
+        {**v, "reasons": sorted(v["reasons"])} for v in watchlist.values()
+    ]}), 200
 
 
 # --- Internal service-to-service endpoints (called by goout-scraper VM) ---

@@ -7770,7 +7770,14 @@ def wa_sales_watchlist():
             entry = watchlist.setdefault(event_id, {"goOutEventId": event_id, "partyId": c.get("partyId"), "reasons": set()})
             if c.get("status") in ("queued", "running"):
                 entry["reasons"].add("queued")
-            if any(isinstance(t.get("sentAt"), datetime) and t["sentAt"] >= cutoff for t in (c.get("targets") or [])):
+            # parse_datetime, not a raw comparison: pymongo hands back naive
+            # UTC datetimes on read by default (no tz_aware=True on this
+            # client — see _wa_blocked_reason above for the same pattern),
+            # while `cutoff` is aware. Comparing them directly raised
+            # "can't compare offset-naive and offset-aware datetimes" for
+            # every real campaign with a sent target — confirmed live via
+            # the fetcher's wa_sales_watch.py, 2026-09-13.
+            if any((sent_at := parse_datetime(t.get("sentAt"))) and sent_at >= cutoff for t in (c.get("targets") or [])):
                 entry["reasons"].add("recentlySent")
     except Exception as exc:  # pragma: no cover - defensive against Atlas hiccups
         app.logger.error(f"Failed to build wa sales watchlist: {exc}")

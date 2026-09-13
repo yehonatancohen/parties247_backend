@@ -272,3 +272,29 @@ def test_build_send_facts_multiple_targets_get_own_rows():
     )
     assert {f["chatId"] for f in facts} == {"c1", "c2"}
     assert {f["group"]["memberCount"] for f in facts} == {200, 50}
+
+
+def test_build_send_facts_handles_naive_datetimes_like_real_pymongo_reads():
+    """pymongo hands back naive UTC datetimes by default (no tz_aware=True
+    on this app's MongoClient) -- every other test in this file uses aware
+    datetimes for convenience, which doesn't match what campaigns/clicks/
+    snapshots actually look like once round-tripped through Mongo in
+    production. A sibling app.py route (wa_sales_watchlist) shipped with a
+    naive-vs-aware comparison bug that this module's own internal logic
+    does NOT have (every comparison here is naive-vs-naive or defensively
+    normalized, see _local_hour_dow/build_party_features) -- this test
+    pins that down against a real regression, not just code inspection."""
+    sent_at = datetime(2026, 9, 10, 18, 0)  # naive
+    campaign = _campaign(targets=[{"chatId": "c1", "code": "abc123", "waMsgId": "wm1", "sentAt": sent_at}])
+    clicks = [{"campaignId": "camp1", "chatId": "c1", "at": sent_at + timedelta(minutes=30), "isBot": False, "ipHash": "h1"}]
+    snapshots = [
+        {"go_out_id": "111", "at": sent_at - timedelta(hours=24), "accepted": 10},
+        {"go_out_id": "111", "at": sent_at + timedelta(hours=6), "accepted": 15},
+    ]
+    facts = wa_facts.build_send_facts(
+        [campaign], clicks=clicks, analytics_rows=[], snapshots=snapshots, msg_events=[],
+        now=datetime.now(timezone.utc),  # aware `now`, as every real caller passes
+    )
+    assert facts[0]["outcomes"]["clicks_1h"] == 1
+    assert facts[0]["sales"]["acceptedDelta6h"] == 5
+    assert facts[0]["localHour"] == 21  # 18:00 UTC -> 21:00 Israel (IDT, +3)

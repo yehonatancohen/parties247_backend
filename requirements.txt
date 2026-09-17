@@ -2,6 +2,7 @@ Flask
 pymongo
 python-dotenv
 Flask-Cors
+Flask-Compress
 gunicorn
 requests
 beautifulsoup4

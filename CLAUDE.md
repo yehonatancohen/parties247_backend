@@ -64,6 +64,23 @@ Performance rule: never `fetch_all_documents(coll)` without a `projection` on `p
 or `goout_sales` — the Render↔Atlas link moves ~140 KB/s, so full-document scans are
 where the admin dashboard's multi-second waits came from (see root doc).
 
+`/api/parties` (`get_parties`) and `default_referral_code()` share a 20s in-process
+cache (`_parties_cache` / `_referral_cache` in app.py) — added 2026-09-17 after a real
+outage where concurrent requests (a Vercel deploy's static generation plus normal
+traffic) each ran their own full collection scan over that same slow link, queued up
+behind gunicorn's small thread pool, and started timing out until Render force-restarted
+the instance. The cache is single-flight (a `threading.Lock` per cache) so concurrent
+misses share one Mongo round trip instead of each starting their own. Tests must reset
+it (see `tests/conftest.py`'s `_reset_backend_caches` autouse fixture) or state leaks
+between tests that reuse the same `{}` query. Responses are also gzip'd now
+(`flask-compress`) since `/api/parties` is ~1MB uncompressed.
+
+This does not rule out a deeper cause of that outage — the incident included several
+minutes where the process stopped responding entirely before Render restarted it, which
+looks more like the process getting stuck or running low on memory than pure request
+queueing. If it recurs, check Render's memory graph for that window before assuming
+this cache alone will explain it.
+
 Every new endpoint or classifier change should come with a test in `tests/` and an
 OpenAPI entry. `test_*.py` at repo root are live scrape scripts, not unit tests.
 

@@ -51,6 +51,9 @@ sys.modules['flask'] = types.SimpleNamespace(Flask=_Flask, request=Flask_request
 # stub flask_cors
 sys.modules['flask_cors'] = types.SimpleNamespace(CORS=lambda app, **kwargs: None)
 
+# stub flask_compress
+sys.modules['flask_compress'] = types.SimpleNamespace(Compress=lambda app=None, **kwargs: None)
+
 # stub flask_limiter
 class _Limiter:
     def __init__(self, func, app=None):
@@ -184,3 +187,19 @@ class _BaseModel:
     def dict(self, exclude_unset=False):
         return self.__dict__
 sys.modules['pydantic'] = types.SimpleNamespace(BaseModel=_BaseModel, ValidationError=_ValidationError)
+
+# --- Cache isolation ---
+# get_parties()/default_referral_code() cache their results for a few seconds
+# (see app.py's _parties_cache) so concurrent requests share one Mongo round
+# trip instead of each paying the slow Render<->Atlas link. That module-level
+# state must not leak between tests, which each monkeypatch fresh fake
+# collections but reuse the same {} query key.
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _reset_backend_caches():
+    yield
+    import app
+    app._parties_cache.clear()
+    app._referral_cache.update({"value": app._REFERRAL_UNSET, "fetched_at": 0.0})

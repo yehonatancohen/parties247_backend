@@ -38,7 +38,9 @@ import requests
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, ValidationError
 from flask_apscheduler import APScheduler
+from flask_compress import Compress
 import threading
+import time
 
 import promo
 import wa_facts
@@ -57,6 +59,12 @@ CORS(app, origins=[
     "https://admin.parties247.co.il",
     r"https://.*\.vercel\.app",  # Vercel preview deployments of either app
 ])
+# Compresses every JSON response (gzip/br via Accept-Encoding). /api/parties
+# is ~1MB uncompressed and was being sent in full on every request; the
+# Render<->Atlas Mongo link is also very slow (~140KB/s, see the module note
+# below), so shrinking what actually goes out over HTTP matters independently
+# of the DB-side caching below.
+Compress(app)
 limiter = Limiter(get_remote_address, app=app)
 scheduler = APScheduler()
 scheduler.init_app(app)
@@ -332,17 +340,92 @@ def append_affiliate_param(url: str | None, referral: str | None) -> str | None:
     return _append_query_param(url, "aff", referral)
 
 
+# --- Short-lived read cache for /api/parties ---
+#
+# The Render<->Atlas Mongo link moves ~140 KB/s (see CLAUDE.md), and every
+# call to get_parties() ran its own full collection scan plus a separate
+# settings lookup for the referral code. Under any burst of concurrent
+# requests (a Vercel deploy's static generation, a handful of visitors
+# landing on an uncached page at once, or just our own repeated testing) each
+# one independently paid that slow round trip, and with the API's own thread
+# pool this queued up badly enough to time out (2026-09-17 outage).
+#
+# This is a single-flight, short-TTL cache: the first request for a given
+# query does the real Mongo fetch; anything else asking for the same query
+# within PARTIES_CACHE_TTL_SECONDS gets the already-fetched, already-processed
+# list instead of starting a second scan. `_parties_cache_lock` also means
+# concurrent misses don't all hit Mongo at once — they queue briefly behind
+# whichever request is already filling that entry.
+#
+# TTL default is deliberately short (well under the 30-minute price-scan
+# cadence and every frontend page's own revalidate window) so this is a
+# concurrency shock absorber, not a source of stale data.
+PARTIES_CACHE_TTL_SECONDS = int(os.environ.get("PARTIES_CACHE_TTL_SECONDS", "20"))
+REFERRAL_CACHE_TTL_SECONDS = int(os.environ.get("REFERRAL_CACHE_TTL_SECONDS", "20"))
+
+_parties_cache: dict[str, dict] = {}
+_parties_cache_lock = threading.Lock()
+_REFERRAL_UNSET = object()  # distinct from "fetched, and it's genuinely unset"
+_referral_cache: dict = {"value": _REFERRAL_UNSET, "fetched_at": 0.0}
+_referral_cache_lock = threading.Lock()
+
+
+def _fetch_parties_cached(query: dict) -> list[dict]:
+    """Returns fully-processed party dicts (str _id, slug, referral applied)
+    for the given Mongo query, shared across requests for
+    PARTIES_CACHE_TTL_SECONDS. Callers must treat the returned list and its
+    dicts as read-only — they are shared across threads and requests."""
+    key = json.dumps(query, sort_keys=True, default=str)
+    now = time.monotonic()
+
+    cached = _parties_cache.get(key)
+    if cached and now - cached["fetched_at"] < PARTIES_CACHE_TTL_SECONDS:
+        return cached["docs"]
+
+    with _parties_cache_lock:
+        # Re-check: another thread may have just filled this while we waited
+        # for the lock, which is the whole point — avoid a second scan.
+        cached = _parties_cache.get(key)
+        if cached and time.monotonic() - cached["fetched_at"] < PARTIES_CACHE_TTL_SECONDS:
+            return cached["docs"]
+
+        referral = default_referral_code()
+        docs = []
+        for party in parties_collection.find(query).sort("date", 1):
+            party["_id"] = str(party["_id"])
+            slug = party.get("slug") or slugify_value(party.get("name"))
+            party["slug"] = slug or ""
+            apply_default_referral(party, referral)
+            docs.append(party)
+
+        _parties_cache[key] = {"docs": docs, "fetched_at": time.monotonic()}
+        return docs
+
+
 def default_referral_code() -> str | None:
-    """Fetch the default referral code from the settings collection."""
+    """Fetch the default referral code from the settings collection, cached
+    for REFERRAL_CACHE_TTL_SECONDS (see _fetch_parties_cached's module note —
+    same slow-link, same fix)."""
     if settings_collection is None:
         return None
-    try:
-        doc = settings_collection.find_one({"key": REFERRAL_KEY}) or {}
-    except Exception as exc:
-        app.logger.warning(f"Failed to fetch referral code: {exc}")
-        return None
-    value = (doc.get("value") or "").strip()
-    return value or None
+
+    now = time.monotonic()
+    if _referral_cache["value"] is not _REFERRAL_UNSET and now - _referral_cache["fetched_at"] < REFERRAL_CACHE_TTL_SECONDS:
+        return _referral_cache["value"]
+
+    with _referral_cache_lock:
+        if _referral_cache["value"] is not _REFERRAL_UNSET and time.monotonic() - _referral_cache["fetched_at"] < REFERRAL_CACHE_TTL_SECONDS:
+            return _referral_cache["value"]
+        try:
+            doc = settings_collection.find_one({"key": REFERRAL_KEY}) or {}
+        except Exception as exc:
+            app.logger.warning(f"Failed to fetch referral code: {exc}")
+            fallback = _referral_cache["value"]
+            return None if fallback is _REFERRAL_UNSET else fallback  # last known value beats none
+        value = (doc.get("value") or "").strip() or None
+        _referral_cache["value"] = value
+        _referral_cache["fetched_at"] = time.monotonic()
+        return value
 
 
 def apply_default_referral(party: dict, referral: str | None) -> None:
@@ -5184,7 +5267,6 @@ def update_party(party_id):
 def get_parties():
     try:
         items = []
-        referral = default_referral_code()
         now = datetime.now(timezone.utc)
         try:
             date_param = request.args.get("date")
@@ -5219,11 +5301,14 @@ def get_parties():
         if area_filter:
             query["areas"] = area_filter
 
-        # Fetch with query
-        cursor = parties_collection.find(query).sort("date", 1)
+        # Fetch with query — shared across concurrent identical requests, see
+        # _fetch_parties_cached's module note (this used to be its own
+        # uncached parties_collection.find() + settings_collection lookup).
+        cached_docs = _fetch_parties_cached(query)
 
-        # Iterate and apply Python-side Date logic (Cleaning/Upcoming/Date Match)
-        for party in cursor:
+        # Iterate and apply Python-side Date logic (Cleaning/Upcoming/Date Match).
+        # cached_docs is shared across requests/threads — read-only here.
+        for party in cached_docs:
             event_date = parse_datetime(party.get("date") or party.get("startsAt"))
 
             if event_date:
@@ -5247,14 +5332,6 @@ def get_parties():
                 if date_param or upcoming_param:
                     continue
 
-            # Serialize
-            party["_id"] = str(party["_id"])
-            slug = party.get("slug")
-            if not slug:
-                 # [Slug generation logic]
-                 slug = slugify_value(party.get("name")) # Simplified for brevity
-            party["slug"] = slug or ""
-            apply_default_referral(party, referral)
             items.append(party)
 
         return jsonify(items), 200

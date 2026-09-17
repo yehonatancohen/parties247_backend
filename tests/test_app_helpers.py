@@ -295,3 +295,88 @@ def test_api_docs_and_openapi_spec():
     assert headers['Content-Type'].startswith('text/html')
     assert 'Parties247 API' in html
     assert '/openapi.json' in html
+
+
+def test_get_parties_shares_one_fetch_across_concurrent_identical_requests(monkeypatch):
+    """Two calls with the same query, within the cache TTL, must hit Mongo
+    once — this is the actual fix for the 2026-09-17 outage (concurrent
+    requests each independently paying the slow Render<->Atlas link)."""
+    fetch_count = {"n": 0}
+
+    class DummyCursor:
+        def __init__(self, items):
+            self._items = items
+
+        def sort(self, key, direction):
+            fetch_count["n"] += 1
+            return list(self._items)
+
+        def __iter__(self):
+            return iter(self._items)
+
+    class DummyCollection:
+        def find(self, query=None):
+            return DummyCursor([
+                {'_id': '1', 'date': '2099-01-01T00:00:00', 'name': 'A'},
+            ])
+
+    class DummySettings:
+        def find_one(self, filter):
+            return {'value': 'default-ref'}
+
+    monkeypatch.setattr(app, 'parties_collection', DummyCollection())
+    monkeypatch.setattr(app, 'settings_collection', DummySettings())
+
+    first = app._fetch_parties_cached({})
+    second = app._fetch_parties_cached({})
+
+    assert fetch_count["n"] == 1
+    assert first is second  # same cached list object, not just equal data
+    assert first[0]['slug']  # still fully processed (slug/referral applied)
+
+
+def test_get_parties_cache_expires_after_ttl(monkeypatch):
+    calls = {"n": 0}
+
+    class DummyCursor:
+        def __init__(self, items):
+            self._items = items
+
+        def sort(self, key, direction):
+            calls["n"] += 1
+            return list(self._items)
+
+        def __iter__(self):
+            return iter(self._items)
+
+    class DummyCollection:
+        def find(self, query=None):
+            return DummyCursor([{'_id': '1', 'date': '2099-01-01T00:00:00', 'name': 'A'}])
+
+    class DummySettings:
+        def find_one(self, filter):
+            return {'value': 'default-ref'}
+
+    monkeypatch.setattr(app, 'parties_collection', DummyCollection())
+    monkeypatch.setattr(app, 'settings_collection', DummySettings())
+    monkeypatch.setattr(app, 'PARTIES_CACHE_TTL_SECONDS', 0)
+
+    app._fetch_parties_cached({})
+    app._fetch_parties_cached({})
+
+    assert calls["n"] == 2  # TTL of 0 means every call is a fresh fetch
+
+
+def test_default_referral_code_is_cached(monkeypatch):
+    calls = {"n": 0}
+
+    class DummySettings:
+        def find_one(self, filter):
+            calls["n"] += 1
+            return {'value': 'cached-ref'}
+
+    monkeypatch.setattr(app, 'settings_collection', DummySettings())
+
+    assert app.default_referral_code() == 'cached-ref'
+    assert app.default_referral_code() == 'cached-ref'
+    assert calls["n"] == 1

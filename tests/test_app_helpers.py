@@ -100,7 +100,7 @@ def test_get_parties_appends_default_ref(monkeypatch):
     monkeypatch.setattr(app, 'parties_collection', DummyCollection())
     monkeypatch.setattr(app, 'settings_collection', DummySettings())
 
-    payload, status = app.get_parties()
+    payload, status, headers = app.get_parties()
     assert status == 200
     urls = {item['_id']: item.get('goOutUrl') for item in payload}
     assert urls['1'].endswith('ref=default-ref')
@@ -153,7 +153,7 @@ def test_get_parties_filters_by_date(monkeypatch):
     monkeypatch.setattr(app, 'parties_collection', DummyCollection())
     monkeypatch.setattr(app, 'settings_collection', DummySettings())
 
-    payload, status = app.get_parties()
+    payload, status, headers = app.get_parties()
     assert status == 200
     assert [item['_id'] for item in payload] == ['2']
 
@@ -224,7 +224,7 @@ def test_get_parties_filters_upcoming(monkeypatch):
     monkeypatch.setattr(app, 'parties_collection', DummyCollection())
     monkeypatch.setattr(app, 'settings_collection', DummySettings())
 
-    payload, status = app.get_parties()
+    payload, status, headers = app.get_parties()
     assert status == 200
     assert [item['_id'] for item in payload] == ['2', '3']
 

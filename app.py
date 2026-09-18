@@ -5334,7 +5334,13 @@ def get_parties():
 
             items.append(party)
 
-        return jsonify(items), 200
+        # Public, wide-open endpoint (see CORS/limiter above) with no cache
+        # headers used to mean every direct call — bots, crawlers, anything
+        # bypassing the frontend's own ISR cache — paid the full ~1MB payload
+        # against Render's bandwidth quota every time. Cache-Control here
+        # mirrors PARTIES_CACHE_TTL_SECONDS so it's never staler than the
+        # in-process cache already backing this data.
+        return json_response(items, cache_seconds=PARTIES_CACHE_TTL_SECONDS)
     except Exception as e:
         app.logger.error(f"Error fetching parties: {e}")
         return jsonify({"message": "Error fetching parties", "error": str(e)}), 500
@@ -5948,7 +5954,7 @@ def delete_carousel(carousel_id):
 def get_carousels():
     try:
         items = [serialize_carousel(carousel) for carousel in carousels_collection.find().sort("order", 1)]
-        return jsonify(items), 200
+        return json_response(items, cache_seconds=LIST_CACHE_SECONDS)
     except Exception as e:
         return jsonify({"message": "Error fetching carousels", "error": str(e)}), 500
 
@@ -5986,7 +5992,7 @@ def list_tags():
         ensure_tags_seeded()
         docs = list(tags_collection.find().sort([("order", 1), ("name", 1)]))
         items = [{"slug": d["slug"], "name": d.get("name", d["slug"]), "order": d.get("order", 0)} for d in docs]
-        return jsonify(items), 200
+        return json_response(items, cache_seconds=LIST_CACHE_SECONDS)
     except Exception as e:
         return jsonify({"message": "Error fetching tags", "error": str(e)}), 500
 
@@ -6197,7 +6203,7 @@ def list_sections():
     except Exception as exc:
         return jsonify({"message": "Error fetching sections", "error": str(exc)}), 500
     items = [normalize_section_doc(doc) for doc in cursor]
-    return jsonify(items), 200
+    return json_response(items, cache_seconds=LIST_CACHE_SECONDS)
 
 
 def add_parties_to_carousel_from_urls(

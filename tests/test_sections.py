@@ -185,7 +185,7 @@ def test_public_sections_sorted(monkeypatch):
     fake.insert_one({"title": "B", "content": "desc", "slug": "b", "order": 1})
     monkeypatch.setattr(app, "sections_collection", fake)
 
-    payload, status = app.list_sections()
+    payload, status, headers = app.list_sections()
     assert status == 200
     titles = [item["title"] for item in payload]
     assert titles == ["A", "B", "C"]

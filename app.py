@@ -1927,6 +1927,55 @@ def _parse_referrer_source(referrer: str | None, utm_source: str | None) -> str:
     return "referral"
 
 
+_CHANNEL_HOST_MAP = (
+    (("google.",), "google"),
+    (("bing.", "yahoo.", "duckduckgo.", "yandex.", "ecosia."), "other_search"),
+    (("instagram.",), "instagram"),
+    (("facebook.", "fb.", "m.facebook", "l.facebook"), "facebook"),
+    (("tiktok.",), "tiktok"),
+    (("t.me", "telegram."), "telegram"),
+    (("whatsapp.", "wa.me"), "whatsapp"),
+    (("twitter.", "t.co", "x.com"), "twitter"),
+    (("chatgpt.", "openai.", "perplexity.", "claude.ai", "gemini.google", "copilot."), "ai_assistant"),
+)
+_CHANNEL_SOURCE_ALIASES = {
+    "ig": "instagram", "insta": "instagram", "fb": "facebook", "wa": "whatsapp",
+    "tg": "telegram", "yt": "youtube", "chatgpt": "ai_assistant",
+}
+
+
+def classify_channel(
+    first_source: str | None,
+    first_referrer_host: str | None,
+    wa_code: str | None = None,
+    fallback_referer: str | None = None,
+) -> str:
+    """Single acquisition-channel label for a session's original touch.
+
+    Precedence: WhatsApp campaign code > explicit utm_source > external
+    referrer host (first touch) > the beacon's own referrer (legacy clients
+    that don't send first-touch) > "direct". "direct" therefore means "no
+    signal", which is exactly why untagged links we control need UTMs.
+    """
+    if wa_code:
+        return "whatsapp"
+    if first_source:
+        src = first_source.strip().lower()
+        return _CHANNEL_SOURCE_ALIASES.get(src, src)[:40] or "direct"
+    host = (first_referrer_host or "").strip().lower()
+    if not host and fallback_referer:
+        try:
+            host = (urlparse(fallback_referer).hostname or "").lower().removeprefix("www.")
+        except ValueError:
+            host = ""
+    if not host or "parties247" in host or host == "localhost":
+        return "direct"
+    for needles, label in _CHANNEL_HOST_MAP:
+        if any(n in host for n in needles):
+            return label
+    return "referral"
+
+
 @app.route("/api/analytics/visitor", methods=["POST"])
 @limiter.limit("120 per minute")
 def record_unique_visitor():
@@ -2110,7 +2159,20 @@ def record_party_interaction(metric: str):
                 if referer:
                     record["referer"] = referer
                     record["trafficSource"] = _parse_referrer_source(referer, None)
+                first_source = sanitize_analytics_text(body.firstSource)
+                first_host = sanitize_analytics_text(body.firstReferrerHost)
+                if first_source:
+                    record["firstSource"] = first_source
+                if body.firstMedium:
+                    record["firstMedium"] = sanitize_analytics_text(body.firstMedium)
+                if body.firstCampaign:
+                    record["firstCampaign"] = sanitize_analytics_text(body.firstCampaign)
+                if first_host:
+                    record["firstReferrerHost"] = first_host
+                if body.landingPath:
+                    record["landingPath"] = sanitize_analytics_text(body.landingPath)
                 wa_code = sanitize_analytics_text(getattr(body, "waCode", None))
+                record["channel"] = classify_channel(first_source, first_host, wa_code, referer)
                 if wa_code:
                     record["waCode"] = wa_code
                     wa_first_seen = parse_datetime(getattr(body, "waFirstSeenAt", None))
@@ -2673,6 +2735,129 @@ def analytics_sales():
         app.logger.error(f"Failed to build sales analytics: {exc}")
         return jsonify({"message": "Failed to build sales analytics."}), 500
     return jsonify({"data": data}), 200
+
+
+def build_attribution(days: int = 30) -> dict:
+    """Acquisition-channel breakdown: views -> buy click-outs -> estimated revenue.
+
+    Channel comes from the first-touch fields the website attaches to every
+    view/redirect beacon (see classify_channel). Events recorded before that
+    shipped carry no `channel` and are reported as "untracked" rather than
+    guessed at.
+
+    GoOut exposes no per-order source, so `estRevenue` is an ESTIMATE: each
+    party's windowed commission revenue is split across channels in
+    proportion to that party's click-outs by channel, then summed. Parties
+    with sales but zero tracked click-outs land in `unattributedRevenue`.
+    """
+    if analytics_collection is None or parties_collection is None:
+        raise RuntimeError("Analytics datastore unavailable")
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    pipeline = [
+        {"$match": {"category": "party", "createdAt": {"$gte": cutoff}}},
+        {"$group": {
+            "_id": {
+                "channel": {"$ifNull": ["$channel", "untracked"]},
+                "action": "$action",
+                "partyId": "$partyId",
+            },
+            "events": {"$sum": 1},
+            "sessions": {"$addToSet": "$sessionId"},
+        }},
+    ]
+
+    views: dict[str, int] = {}
+    view_sessions: dict[str, set] = {}
+    redirects: dict[str, int] = {}
+    redirect_sessions: dict[str, set] = {}
+    redirects_by_party_channel: dict[str, dict[str, int]] = {}
+    for doc in analytics_collection.aggregate(pipeline):
+        key = doc.get("_id") or {}
+        channel = key.get("channel") or "untracked"
+        sessions = {sid for sid in (doc.get("sessions") or []) if sid}
+        count = int(doc.get("events") or 0)
+        if key.get("action") == "redirect":
+            redirects[channel] = redirects.get(channel, 0) + count
+            redirect_sessions.setdefault(channel, set()).update(sessions)
+            pid = key.get("partyId")
+            if pid:
+                per = redirects_by_party_channel.setdefault(str(pid), {})
+                per[channel] = per.get(channel, 0) + count
+        else:
+            views[channel] = views.get(channel, 0) + count
+            view_sessions.setdefault(channel, set()).update(sessions)
+
+    est_revenue: dict[str, float] = {}
+    unattributed = 0.0
+    _, party_by_event_id = _load_party_index()
+    for go_out_id, totals in _sales_totals_by_event_id(cutoff=cutoff).items():
+        party = party_by_event_id.get(go_out_id)
+        revenue = float(totals.get("totalRevenue") or 0.0)
+        per = redirects_by_party_channel.get(party["partyId"]) if party else None
+        total_clicks = sum(per.values()) if per else 0
+        if not per or total_clicks == 0:
+            unattributed += revenue
+            continue
+        for channel, clicks in per.items():
+            est_revenue[channel] = est_revenue.get(channel, 0.0) + revenue * clicks / total_clicks
+
+    channels = []
+    for channel in set(views) | set(redirects) | set(est_revenue):
+        v_sessions = len(view_sessions.get(channel, ()))
+        r_sessions = len(redirect_sessions.get(channel, ()))
+        channels.append({
+            "channel": channel,
+            "views": views.get(channel, 0),
+            "viewSessions": v_sessions,
+            "redirects": redirects.get(channel, 0),
+            "redirectSessions": r_sessions,
+            "clickOutRate": round(r_sessions / v_sessions, 4) if v_sessions else None,
+            "estRevenue": round(est_revenue.get(channel, 0.0), 2),
+        })
+    channels.sort(key=lambda c: (c["estRevenue"], c["redirects"], c["views"]), reverse=True)
+
+    tracking_since = None
+    try:
+        first = analytics_collection.find_one(
+            {"category": "party", "channel": {"$exists": True}},
+            {"createdAt": 1},
+            sort=[("createdAt", 1)],
+        )
+        if first and first.get("createdAt"):
+            tracking_since = isoformat_or_none(first["createdAt"])
+    except Exception as exc:  # pragma: no cover - informational only
+        app.logger.warning(f"attribution trackingSince lookup failed: {exc}")
+
+    return {
+        "days": days,
+        "trackingSince": tracking_since,
+        "channels": channels,
+        "unattributedRevenue": round(unattributed, 2),
+        "note": "estRevenue splits each party's commission by its click-outs per channel; GoOut gives no per-order source.",
+    }
+
+
+@app.route("/api/admin/analytics/attribution", methods=["GET"])
+@limiter.limit("30 per minute")
+@protect
+def analytics_attribution():
+    """Acquisition-channel funnel (views, click-outs, click-out rate, estimated
+    revenue). Query param: days (default 30, max 180). Authenticated because
+    it derives from commission revenue."""
+    try:
+        days = int(request.args.get("days", 30))
+    except (TypeError, ValueError):
+        days = 30
+    days = max(1, min(days, 180))
+    try:
+        data = build_attribution(days=days)
+    except RuntimeError:
+        return jsonify({"message": "Analytics datastore unavailable."}), 503
+    except Exception as exc:
+        app.logger.error(f"Failed to build attribution: {exc}")
+        return jsonify({"message": "Failed to build attribution analytics."}), 500
+    return jsonify(data), 200
 
 
 @app.route("/api/admin/analytics/funnel", methods=["GET"])
@@ -4397,6 +4582,14 @@ class PartyAnalyticsRequest(BaseModel):
     # WhatsApp touch happened relative to this view/click, for recency
     # weighting later; not required, since older clients won't send it.
     waFirstSeenAt: str | None = None
+    # Original acquisition touch (website lib/firstTouch.ts, 30d) — the
+    # per-event `referrer` above is usually one of our own pages by the time
+    # someone clicks buy, so the real source has to travel separately.
+    firstSource: str | None = None
+    firstMedium: str | None = None
+    firstCampaign: str | None = None
+    firstReferrerHost: str | None = None
+    landingPath: str | None = None
 
     class Config:
         extra = "forbid"

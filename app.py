@@ -3364,6 +3364,36 @@ OPENAPI_TEMPLATE = {
                 },
             }
         },
+        "/api/admin/refresh-content": {
+            "post": {
+                "summary": "Manually trigger a content refresh scan",
+                "description": "Re-scrapes every upcoming party's GoOut page and updates imageUrl/location/description when they've changed since we first approved the listing. Runs automatically twice a day (06:20 and 18:20 UTC); this endpoint runs it on demand. Price/soldOut are refreshed separately by /api/admin/update-prices every 30 minutes.",
+                "security": [{"bearerAuth": []}],
+                "responses": {
+                    "200": {
+                        "description": "Scan completed.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "message": {"type": "string"},
+                                        "details": {
+                                            "type": "object",
+                                            "properties": {
+                                                "checked": {"type": "integer"},
+                                                "updated": {"type": "integer"},
+                                            },
+                                        },
+                                    },
+                                }
+                            }
+                        },
+                    },
+                    "401": {"description": "Missing or invalid admin token."},
+                },
+            }
+        },
         "/api/admin/promo/whatsapp": {
             "get": {
                 "summary": "WhatsApp promo drafts",
@@ -4818,7 +4848,7 @@ def scheduled_price_scan():
 @protect
 def manual_price_scan():
     try:
-        # Run in background to avoid timeout? Or just run it. 
+        # Run in background to avoid timeout? Or just run it.
         # It's lightweight so it should be fine, but if there are many parties, it might timeout.
         # Let's run it directly for now as requested "scan all parties".
         # If the user has many parties, we might want to thread it.
@@ -4829,6 +4859,94 @@ def manual_price_scan():
         return jsonify({"message": "Price scan completed.", "details": result}), 200
     except Exception as e:
         return jsonify({"message": "Error running price scan", "error": str(e)}), 500
+
+# A fresh scrape sometimes only got a fallback placeholder (bad network hit, or the
+# page shape changed) rather than a real value. Never let one of those overwrite
+# already-good stored data.
+_CONTENT_REFRESH_FALLBACKS = {
+    "imageUrl": "https://via.placeholder.com/600x400?text=No+Image+Available",
+    "location": "Unknown Location",
+    "description": "No description available.",
+}
+
+
+def _compute_content_changes(details: dict, party: dict) -> dict:
+    """Diff a fresh scrape_party_details() result against the stored party for the
+    fields that go stale when a promoter edits their listing on GoOut after we've
+    already approved it (image, location, description). Price/soldOut are already
+    kept fresh separately by scheduled_price_scan every 30 minutes; name/date are
+    left alone here since those are more likely to carry a deliberate admin edit.
+    """
+    changes = {}
+    for field, fallback in _CONTENT_REFRESH_FALLBACKS.items():
+        new_val = details.get(field)
+        if new_val and new_val != fallback and new_val != party.get(field):
+            changes[field] = new_val
+    return changes
+
+
+@scheduler.task("cron", id="content_refresh", hour="6,18", minute="20")
+def scheduled_content_refresh():
+    """Re-scrape each upcoming party's GoOut page twice a day and pick up any
+    image/location/description edit the promoter made after we first approved
+    the listing — the daily fetcher scrape never revisits a party once it
+    exists (see parties247_fetcher/CLAUDE.md), so without this job those fields
+    were stuck at whatever they were on first import, forever.
+    """
+    with app.app_context():
+        app.logger.info("[CONTENT REFRESH] Starting scan...")
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=1)
+
+        cursor = parties_collection.find(
+            {},
+            {
+                "originalUrl": 1, "goOutUrl": 1, "date": 1, "startsAt": 1,
+                "imageUrl": 1, "location": 1, "description": 1,
+            },
+        )
+        count = 0
+        updated = 0
+
+        for party in cursor:
+            try:
+                p_date_val = party.get("date") or party.get("startsAt")
+                p_date = parse_datetime(p_date_val)
+                if p_date and p_date < cutoff:
+                    continue
+
+                url = party.get("originalUrl") or party.get("goOutUrl")
+                if not url:
+                    continue
+
+                try:
+                    details = scrape_party_details(url)
+                except Exception as exc:
+                    app.logger.warning(f"[CONTENT REFRESH] scrape failed for {party.get('_id')}: {exc}")
+                    continue  # scrape/network/page-shape error — leave existing values intact
+
+                changes = _compute_content_changes(details, party)
+                if changes:
+                    parties_collection.update_one({"_id": party["_id"]}, {"$set": changes})
+                    updated += 1
+                count += 1
+            except Exception as e:
+                app.logger.error(f"[CONTENT REFRESH] Error processing party {party.get('_id')}: {e}")
+                continue
+
+        app.logger.info(f"[CONTENT REFRESH] Completed. Checked {count} parties, updated {updated}.")
+        return {"checked": count, "updated": updated}
+
+
+@app.route("/api/admin/refresh-content", methods=["POST"])
+@protect
+def manual_content_refresh():
+    try:
+        result = scheduled_content_refresh()
+        record_admin_action("manual_content_refresh", None, None, {"details": result if isinstance(result, (dict, list)) else str(result)})
+        return jsonify({"message": "Content refresh completed.", "details": result}), 200
+    except Exception as e:
+        return jsonify({"message": "Error running content refresh", "error": str(e)}), 500
 
 # --- Routes ---
 

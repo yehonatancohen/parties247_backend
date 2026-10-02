@@ -2447,6 +2447,8 @@ def analytics_recent():
                     "partyId": str(party.get("_id")) if party else "",
                     "timestamp": isoformat_or_none(doc.get("recorded_at")) or now.isoformat(),
                     "details": f"{ticket_count} כרטיסים" if ticket_count != 1 else "כרטיס אחד",
+                    "tickets": ticket_count,
+                    "commission": round(float(doc.get("revenue_earned") or 0), 2),
                     "device": "unknown",
                     "source": "goout",
                 })

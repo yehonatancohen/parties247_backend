@@ -4865,7 +4865,7 @@ def _extract_price_from_tickets(event_data: dict) -> float | None:
             base = float(t["Price"])
             commission = float(t.get("Commision", 0))  # go-out misspells "Commission"
             final = round(base * (1 + commission / 100), 2)
-            if final > 0 and (min_price is None or final < min_price):
+            if final >= 0 and (min_price is None or final < min_price):
                 min_price = final
         except (KeyError, TypeError, ValueError):
             continue
@@ -5002,10 +5002,11 @@ def scrape_party_details(url: str):
         }
 
         sold_out = _is_sold_out(event_data)
-        ticket_price = None if sold_out else (
-            _extract_price_from_schema_org(event_data.get("schemaOrg"))
-            or _extract_price_from_tickets(event_data)
-        )
+        ticket_price = None
+        if not sold_out:
+            ticket_price = _extract_price_from_schema_org(event_data.get("schemaOrg"))
+            if ticket_price is None:
+                ticket_price = _extract_price_from_tickets(event_data)
         party_details["ticketPrice"] = ticket_price
         party_details["soldOut"] = sold_out
 
@@ -5045,10 +5046,11 @@ def scrape_ticket_info(url: str) -> dict | None:
             json_data = json.loads(script_tag.string)
             event_data = json_data.get("props", {}).get("pageProps", {}).get("event", {})
             sold_out = _is_sold_out(event_data)
-            price = None if sold_out else (
-                _extract_price_from_schema_org(event_data.get("schemaOrg"))
-                or _extract_price_from_tickets(event_data)
-            )
+            price = None
+            if not sold_out:
+                price = _extract_price_from_schema_org(event_data.get("schemaOrg"))
+                if price is None:
+                    price = _extract_price_from_tickets(event_data)
             return {"price": price, "soldOut": sold_out}
     except Exception as e:
         app.logger.warning(f"[PRICE SCAN] Error fetching {url}: {e}")

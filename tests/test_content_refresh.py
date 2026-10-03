@@ -67,3 +67,40 @@ def test_missing_fields_in_scrape_are_skipped():
     party = {"imageUrl": "https://img.example/a.jpg", "location": "Club X", "description": "D."}
     details = {}
     assert app._compute_content_changes(details, party) == {}
+
+
+def test_picks_up_changed_start_time_and_keeps_date_fields_aligned():
+    party = {
+        "imageUrl": "https://img.example/a.jpg",
+        "location": "Club X",
+        "description": "Same.",
+        "date": "2026-10-10T22:00:00",
+        "startsAt": "2026-10-10T22:00:00",
+    }
+    details = {
+        "imageUrl": "https://img.example/a.jpg",
+        "location": "Club X",
+        "description": "Same.",
+        "date": "2026-10-10T23:30:00",
+    }
+    assert app._compute_content_changes(details, party) == {
+        "date": "2026-10-10T23:30:00",
+        "startsAt": "2026-10-10T23:30:00",
+    }
+
+
+def test_bad_scraped_date_never_overwrites_good_time():
+    party = {
+        "imageUrl": "https://img.example/a.jpg",
+        "location": "Club X",
+        "description": "Same.",
+        "date": "2026-10-10T22:00:00",
+        "startsAt": "2026-10-10T22:00:00",
+    }
+    details = {
+        "imageUrl": "https://img.example/a.jpg",
+        "location": "Club X",
+        "description": "Same.",
+        "date": "Unknown Date",
+    }
+    assert app._compute_content_changes(details, party) == {}

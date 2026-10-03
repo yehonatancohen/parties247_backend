@@ -5151,17 +5151,37 @@ _CONTENT_REFRESH_FALLBACKS = {
 
 
 def _compute_content_changes(details: dict, party: dict) -> dict:
-    """Diff a fresh scrape_party_details() result against the stored party for the
-    fields that go stale when a promoter edits their listing on GoOut after we've
-    already approved it (image, location, description). Price/soldOut are already
-    kept fresh separately by scheduled_price_scan every 30 minutes; name/date are
-    left alone here since those are more likely to carry a deliberate admin edit.
+    """Diff a fresh GoOut scrape against stored source-owned metadata.
+
+    Image/location/description and the event start time can all change after the
+    event was first imported. Leaving the start time frozen made the public site
+    keep stale hours even after the organizer corrected or postponed the event.
+    Price/soldOut remain handled by scheduled_price_scan every 30 minutes.
+
+    The title is intentionally still left alone because admins may curate it.
     """
     changes = {}
     for field, fallback in _CONTENT_REFRESH_FALLBACKS.items():
         new_val = details.get(field)
         if new_val and new_val != fallback and new_val != party.get(field):
             changes[field] = new_val
+
+    new_date = details.get("date")
+    if (
+        new_date
+        and new_date != "Unknown Date"
+        and parse_datetime(new_date) is not None
+        and (
+            new_date != party.get("date")
+            or (party.get("startsAt") is not None and new_date != party.get("startsAt"))
+        )
+    ):
+        # Keep the legacy date field and the newer startsAt field aligned. Most
+        # existing parties only have date; normalized event APIs prefer startsAt
+        # when present.
+        changes["date"] = new_date
+        changes["startsAt"] = new_date
+
     return changes
 
 
@@ -5183,6 +5203,7 @@ def scheduled_content_refresh():
             {
                 "originalUrl": 1, "goOutUrl": 1, "date": 1, "startsAt": 1,
                 "imageUrl": 1, "location": 1, "description": 1,
+                "date": 1, "startsAt": 1,
             },
         )
         count = 0

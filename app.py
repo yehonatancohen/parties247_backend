@@ -826,6 +826,16 @@ def find_party_for_analytics(party_id: str | None, party_slug: str | None) -> di
     return None
 
 
+# Fields build_analytics_summary reads. Without these it pulled every full party
+# document (descriptions, images...) over the slow Render<->Atlas link: ~20s per call.
+_SUMMARY_PARTY_PROJECTION = {"name": 1, "slug": 1, "date": 1, "startsAt": 1, "endsAt": 1}
+_SUMMARY_VISITOR_PROJECTION = {
+    "createdAt": 1, "trafficSource": 1, "referer": 1, "utm": 1, "deviceType": 1, "userAgent": 1,
+}
+# /api/analytics/recent only needs the name to label GoOut sales.
+_RECENT_PARTY_PROJECTION = {"name": 1, "goOutEventId": 1}
+
+
 def build_analytics_summary(window_hours: int = 24) -> dict:
     if (
         party_analytics_collection is None
@@ -839,7 +849,9 @@ def build_analytics_summary(window_hours: int = 24) -> dict:
 
     try:
         try:
-            visitor_docs = list(visitor_analytics_collection.find({"createdAt": {"$gte": visitor_cutoff}}))
+            visitor_docs = list(visitor_analytics_collection.find(
+                {"createdAt": {"$gte": visitor_cutoff}}, _SUMMARY_VISITOR_PROJECTION
+            ))
         except TypeError:  # pragma: no cover - compatibility with tests
             visitor_docs = list(visitor_analytics_collection.find())
     except Exception as exc:
@@ -866,7 +878,7 @@ def build_analytics_summary(window_hours: int = 24) -> dict:
 
     live_parties: list[dict] = []
     live_ids: set[str] = set()
-    for party in fetch_all_documents(parties_collection):
+    for party in fetch_all_documents(parties_collection, projection=_SUMMARY_PARTY_PROJECTION):
         if not isinstance(party, dict):
             continue
         party_identifier = party.get("_id")
@@ -2421,7 +2433,7 @@ def analytics_recent():
     if want_goout_purchases and goout_sales_log_collection is not None:
         try:
             party_by_event_id: dict[str, dict] = {}
-            for party in fetch_all_documents(parties_collection):
+            for party in fetch_all_documents(parties_collection, projection=_RECENT_PARTY_PROJECTION):
                 event_id = party.get("goOutEventId")
                 if event_id:
                     party_by_event_id[str(event_id)] = party

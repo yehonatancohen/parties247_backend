@@ -826,6 +826,16 @@ def find_party_for_analytics(party_id: str | None, party_slug: str | None) -> di
     return None
 
 
+# Fields build_analytics_summary reads. Without these it pulled every full party
+# document (descriptions, images...) over the slow Render<->Atlas link: ~20s per call.
+_SUMMARY_PARTY_PROJECTION = {"name": 1, "slug": 1, "date": 1, "startsAt": 1, "endsAt": 1}
+_SUMMARY_VISITOR_PROJECTION = {
+    "createdAt": 1, "trafficSource": 1, "referer": 1, "utm": 1, "deviceType": 1, "userAgent": 1,
+}
+# /api/analytics/recent only needs the name to label GoOut sales.
+_RECENT_PARTY_PROJECTION = {"name": 1, "goOutEventId": 1}
+
+
 def build_analytics_summary(window_hours: int = 24) -> dict:
     if (
         party_analytics_collection is None
@@ -839,7 +849,9 @@ def build_analytics_summary(window_hours: int = 24) -> dict:
 
     try:
         try:
-            visitor_docs = list(visitor_analytics_collection.find({"createdAt": {"$gte": visitor_cutoff}}))
+            visitor_docs = list(visitor_analytics_collection.find(
+                {"createdAt": {"$gte": visitor_cutoff}}, _SUMMARY_VISITOR_PROJECTION
+            ))
         except TypeError:  # pragma: no cover - compatibility with tests
             visitor_docs = list(visitor_analytics_collection.find())
     except Exception as exc:
@@ -866,7 +878,7 @@ def build_analytics_summary(window_hours: int = 24) -> dict:
 
     live_parties: list[dict] = []
     live_ids: set[str] = set()
-    for party in fetch_all_documents(parties_collection):
+    for party in fetch_all_documents(parties_collection, projection=_SUMMARY_PARTY_PROJECTION):
         if not isinstance(party, dict):
             continue
         party_identifier = party.get("_id")
@@ -1859,17 +1871,34 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 
+_BOT_UA_MARKERS = (
+    "bot", "crawl", "spider", "slurp", "lighthouse", "pagespeed", "headlesschrome",
+    "phantomjs", "puppeteer", "playwright", "prerender", "preview", "facebookexternalhit",
+    "python-requests", "python-urllib", "aiohttp", "httpx", "curl/", "wget", "go-http-client",
+    "okhttp", "axios", "node-fetch", "undici", "java/", "scrapy", "feedfetcher",
+)
+
+
+def _is_bot_user_agent(user_agent_str: str | None) -> bool:
+    if not user_agent_str:
+        return False
+    ua = user_agent_str.lower()
+    return any(k in ua for k in _BOT_UA_MARKERS)
+
+
 def _parse_device_type(user_agent_str: str | None) -> str:
     """Derive device type from User-Agent string."""
     if not user_agent_str:
         return "unknown"
     ua = user_agent_str.lower()
+    # Bots first: Googlebot Smartphone and friends carry "Android ... Mobile" too,
+    # and were being counted as real mobile visitors.
+    if _is_bot_user_agent(ua):
+        return "bot"
     if any(k in ua for k in ("mobile", "android", "iphone", "ipod", "windows phone")):
         return "mobile"
     if any(k in ua for k in ("ipad", "tablet")):
         return "tablet"
-    if any(k in ua for k in ("bot", "crawl", "spider", "lighthouse")):
-        return "bot"
     return "desktop"
 
 
@@ -1995,6 +2024,9 @@ def record_unique_visitor():
 
     now = datetime.now(timezone.utc)
     user_agent = sanitize_analytics_text(request.headers.get("User-Agent"))
+    if _is_bot_user_agent(user_agent):
+        # Crawlers/prerenderers run the site's JS too; they are not visitors.
+        return jsonify({"message": "Ignored (bot)."}), 202
     referer = sanitize_analytics_text(body.referrer or request.headers.get("Referer"))
     client_ip = sanitize_analytics_text(extract_client_ip(request))
 
@@ -2122,6 +2154,9 @@ def record_party_interaction(metric: str):
 
     if not (body.partyId or body.partySlug):
         return jsonify({"message": "Invalid analytics event.", "errors": [{"loc": ["partyId", "partySlug"], "msg": "Provide partyId or partySlug."}]}), 400
+
+    if _is_bot_user_agent(request.headers.get("User-Agent")):
+        return jsonify({"message": "Ignored (bot)."}), 202
 
     party_id_input = body.partyId.strip() if isinstance(body.partyId, str) else body.partyId
     party_slug_input = sanitize_analytics_text(body.partySlug)
@@ -2421,7 +2456,7 @@ def analytics_recent():
     if want_goout_purchases and goout_sales_log_collection is not None:
         try:
             party_by_event_id: dict[str, dict] = {}
-            for party in fetch_all_documents(parties_collection):
+            for party in fetch_all_documents(parties_collection, projection=_RECENT_PARTY_PROJECTION):
                 event_id = party.get("goOutEventId")
                 if event_id:
                     party_by_event_id[str(event_id)] = party
@@ -2565,6 +2600,75 @@ def admin_audit_log():
     } for doc in docs]
 
     return jsonify({"entries": entries, "total": total, "hasMore": offset + limit < total}), 200
+
+
+def purge_bot_analytics(cutoff: datetime, dry_run: bool = True) -> dict:
+    """Find (and unless dry_run, delete) bot hits recorded since `cutoff`, re-judged
+    by the current `_is_bot_user_agent`: visitor sessions, party view/redirect
+    events, and the matching increments on the per-party counters."""
+    bot_visitor_ids: list = []
+    if visitor_analytics_collection is not None:
+        for doc in visitor_analytics_collection.find({"createdAt": {"$gte": cutoff}}, {"userAgent": 1}):
+            if _is_bot_user_agent(doc.get("userAgent")):
+                bot_visitor_ids.append(doc["_id"])
+
+    bot_event_ids: list = []
+    per_party: dict[str, dict[str, int]] = {}
+    if analytics_collection is not None:
+        query = {"createdAt": {"$gte": cutoff}, "category": "party"}
+        for doc in analytics_collection.find(query, {"userAgent": 1, "partyId": 1, "action": 1}):
+            if not _is_bot_user_agent(doc.get("userAgent")):
+                continue
+            bot_event_ids.append(doc["_id"])
+            metric = "redirects" if doc.get("action") == "redirect" else "views"
+            counts = per_party.setdefault(str(doc.get("partyId") or ""), {"views": 0, "redirects": 0})
+            counts[metric] += 1
+    per_party.pop("", None)
+
+    if not dry_run:
+        if bot_visitor_ids:
+            visitor_analytics_collection.delete_many({"_id": {"$in": bot_visitor_ids}})
+        if bot_event_ids:
+            analytics_collection.delete_many({"_id": {"$in": bot_event_ids}})
+        if party_analytics_collection is not None:
+            for party_id, counts in per_party.items():
+                party_analytics_collection.update_one(
+                    {"partyId": party_id}, {"$inc": {k: -v for k, v in counts.items() if v}}
+                )
+            for metric in ("views", "redirects"):
+                party_analytics_collection.update_many({metric: {"$lt": 0}}, {"$set": {metric: 0}})
+
+    return {
+        "dryRun": dry_run,
+        "since": cutoff.isoformat(),
+        "visitorSessions": len(bot_visitor_ids),
+        "partyEvents": len(bot_event_ids),
+        "byParty": per_party,
+    }
+
+
+@app.route("/api/admin/analytics/purge-bots", methods=["POST"])
+@protect
+def admin_purge_bot_analytics():
+    """Remove bot hits already stored. Dry run unless `?dryRun=0`.
+    `hours` (1-840, default 48) bounds how far back to look."""
+    try:
+        hours = int(request.args.get("hours", 48))
+    except (TypeError, ValueError):
+        hours = 48
+    hours = max(1, min(hours, 24 * 35))
+    dry_run = request.args.get("dryRun", "1") != "0"
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    try:
+        result = purge_bot_analytics(cutoff, dry_run=dry_run)
+    except Exception as exc:
+        app.logger.error(f"Bot purge failed: {exc}")
+        return jsonify({"message": "Bot purge failed."}), 500
+    if not dry_run:
+        record_admin_action("purge_bot_analytics", "analytics", None, {
+            "hours": hours, "visitorSessions": result["visitorSessions"], "partyEvents": result["partyEvents"],
+        })
+    return jsonify(result), 200
 
 
 @app.route("/api/admin/analytics/visitors", methods=["GET"])
@@ -3292,6 +3396,21 @@ OPENAPI_TEMPLATE = {
                         }
                     }
                 }
+            }
+        },
+        "/api/admin/analytics/purge-bots": {
+            "post": {
+                "summary": "Remove stored bot hits",
+                "description": "Re-checks visitor sessions and party view/redirect events recorded in the last `hours` against the bot User-Agent list, deletes the bot ones and takes their increments back off the per-party counters. Dry run (counts only) unless dryRun=0. New bot hits are already dropped at ingest.",
+                "security": [{"bearerAuth": []}],
+                "parameters": [
+                    {"name": "hours", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 840, "default": 48}},
+                    {"name": "dryRun", "in": "query", "schema": {"type": "string", "enum": ["0", "1"], "default": "1"}},
+                ],
+                "responses": {
+                    "200": {"description": "Counts of bot visitor sessions and party events found (and removed unless dry run), per party."},
+                    "401": {"description": "Missing or invalid admin token."},
+                },
             }
         },
         "/api/admin/analytics/detailed": {

@@ -146,6 +146,43 @@ def _price(party: dict) -> float | None:
     return price if price and price > 0 else None
 
 
+def commission_by_party(parties, *, sales_by_event_id: dict, accounts_by_event_id: dict,
+                        now: datetime, account1_referral: str | None = None) -> dict[str, dict]:
+    """
+    Per upcoming party (keyed by party id): our commission per ticket and what
+    the party has earned us so far. Same tier rule as the promo ranking.
+
+    sales_by_event_id    - lifetime {goOutEventId: {"totalTicketsSold", "totalRevenue"}} from goout_sales_log
+    accounts_by_event_id - {goOutEventId: {"account1", ...}} from goout_sales
+    """
+    now_il = now.astimezone(ISRAEL_TZ) if now.tzinfo else now.replace(tzinfo=timezone.utc).astimezone(ISRAEL_TZ)
+    today = now_il.date()
+    out: dict[str, dict] = {}
+    for party in parties:
+        party_id = str(party.get("_id") or party.get("id") or "")
+        dt = party_datetime(party.get("date") or party.get("startsAt"))
+        if not party_id or dt is None or dt.date() < today:
+            continue
+        event_id = str(party.get("goOutEventId") or "")
+        sales = sales_by_event_id.get(event_id, {}) if event_id else {}
+        tier = account_tier(
+            accounts_by_event_id.get(event_id, ()) if event_id else (),
+            party.get("referralCode"),
+            account1_referral,
+        )
+        price = _price(party)
+        out[party_id] = {
+            "tier": tier,
+            "perTicket": expected_commission_per_ticket(tier, price),
+            # account2 without a scraped price uses DEFAULT_TICKET_PRICE: say so.
+            "perTicketEstimated": tier != "account1" and price is None,
+            "ticketPrice": price,
+            "ticketsSold": int(sales.get("totalTicketsSold") or 0),
+            "earned": round(float(sales.get("totalRevenue") or 0.0), 2),
+        }
+    return out
+
+
 def rank_promo_candidates(parties, *, sales_by_event_id: dict, accounts_by_event_id: dict,
                           now: datetime, days: int = 7, limit: int = 12,
                           account1_referral: str | None = None) -> list[dict]:

@@ -3041,10 +3041,7 @@ def build_whatsapp_promo(days: int = 7, limit: int = 12) -> dict:
         parties.append(party)
 
     sales_by_event_id = _sales_totals_by_event_id(cutoff=now - timedelta(days=30))
-    accounts_by_event_id: dict[str, set[str]] = {}
-    for doc in fetch_all_documents(goout_sales_collection, projection={"go_out_id": 1, "account_id": 1}):
-        if doc.get("go_out_id") and doc.get("account_id"):
-            accounts_by_event_id.setdefault(str(doc["go_out_id"]), set()).add(str(doc["account_id"]))
+    accounts_by_event_id = _accounts_by_event_id()
 
     candidates = promo.rank_promo_candidates(
         parties,
@@ -3053,6 +3050,7 @@ def build_whatsapp_promo(days: int = 7, limit: int = 12) -> dict:
         now=now,
         days=days,
         limit=limit,
+        account1_referral=ACCOUNT1_REFERRAL_CODE,
     )
     return {
         "days": days,
@@ -3061,6 +3059,45 @@ def build_whatsapp_promo(days: int = 7, limit: int = 12) -> dict:
         "candidates": candidates,
         "digest": promo.format_digest_message(candidates, days=days),
     }
+
+
+# Optional: account1's referral code, so an account1 party with no sales yet is
+# still recognised by its link (otherwise tier comes from goout_sales accounts).
+ACCOUNT1_REFERRAL_CODE = os.environ.get("ACCOUNT1_REFERRAL_CODE", "").strip() or None
+
+
+def _accounts_by_event_id() -> dict[str, set[str]]:
+    accounts: dict[str, set[str]] = {}
+    for doc in fetch_all_documents(goout_sales_collection, projection={"go_out_id": 1, "account_id": 1}):
+        if doc.get("go_out_id") and doc.get("account_id"):
+            accounts.setdefault(str(doc["go_out_id"]), set()).add(str(doc["account_id"]))
+    return accounts
+
+
+@app.route("/api/admin/parties/commission", methods=["GET"])
+@limiter.limit("30 per minute")
+@protect
+def admin_party_commission():
+    """Our commission per ticket and lifetime earnings for every upcoming party,
+    keyed by party id (used by the admin's holiday-pages screen)."""
+    if parties_collection is None:
+        return jsonify({"message": "Parties datastore unavailable."}), 503
+    try:
+        now = datetime.now(timezone.utc)
+        parties = fetch_all_documents(parties_collection, projection={
+            "date": 1, "startsAt": 1, "goOutEventId": 1, "ticketPrice": 1, "referralCode": 1,
+        })
+        data = promo.commission_by_party(
+            parties,
+            sales_by_event_id=_sales_totals_by_event_id(cutoff=None),
+            accounts_by_event_id=_accounts_by_event_id(),
+            now=now,
+            account1_referral=ACCOUNT1_REFERRAL_CODE,
+        )
+    except Exception as exc:
+        app.logger.error(f"Failed to build party commission: {exc}")
+        return jsonify({"message": "Failed to build party commission."}), 500
+    return jsonify({"generatedAt": now.isoformat(), "parties": data}), 200
 
 
 @app.route("/api/admin/promo/whatsapp", methods=["GET"])
@@ -3735,6 +3772,35 @@ OPENAPI_TEMPLATE = {
                             }
                         },
                     }
+                },
+            }
+        },
+        "/api/admin/parties/commission": {
+            "get": {
+                "summary": "Commission per upcoming party",
+                "description": "For every upcoming party, keyed by party id: our commission per ticket (account1 flat ₪25, account2 6% of the ticket price; perTicketEstimated when the price is unknown) and lifetime tickets/commission from goout_sales_log.",
+                "security": [{"bearerAuth": []}],
+                "responses": {
+                    "200": {
+                        "description": "Commission map.",
+                        "content": {"application/json": {"schema": {
+                            "type": "object",
+                            "properties": {
+                                "generatedAt": {"type": "string", "format": "date-time"},
+                                "parties": {"type": "object", "additionalProperties": {
+                                    "type": "object",
+                                    "properties": {
+                                        "tier": {"type": "string", "enum": ["account1", "account2"]},
+                                        "perTicket": {"type": "number"},
+                                        "perTicketEstimated": {"type": "boolean"},
+                                        "ticketPrice": {"type": "number", "nullable": True},
+                                        "ticketsSold": {"type": "integer"},
+                                        "earned": {"type": "number"},
+                                    },
+                                }},
+                            },
+                        }}},
+                    },
                 },
             }
         },

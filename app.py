@@ -3738,6 +3738,42 @@ OPENAPI_TEMPLATE = {
                 },
             }
         },
+        "/api/holiday-pages/{slug}": {
+            "get": {
+                "summary": "Get a holiday page's party curation",
+                "description": "Parties pinned to the top of a holiday landing page (in order) and parties hidden from it. Parties not listed keep the default: in the holiday date window, sorted by date.",
+                "parameters": [{"name": "slug", "in": "path", "required": True, "schema": {"type": "string"}, "example": "halloween"}],
+                "responses": {
+                    "200": {
+                        "description": "Curation for the page (empty lists when never set).",
+                        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/HolidayCuration"}}},
+                    },
+                    "400": {"description": "Invalid slug."},
+                },
+            }
+        },
+        "/api/admin/holiday-pages/{slug}": {
+            "put": {
+                "summary": "Set a holiday page's party curation",
+                "description": "Replaces the pinned (ordered) and hidden party id lists for a holiday page and revalidates it. A party in both lists stays pinned.",
+                "security": [{"bearerAuth": []}],
+                "parameters": [{"name": "slug", "in": "path", "required": True, "schema": {"type": "string"}}],
+                "requestBody": {
+                    "required": True,
+                    "content": {"application/json": {"schema": {
+                        "type": "object",
+                        "properties": {
+                            "partyIds": {"type": "array", "items": {"type": "string"}, "maxItems": 300},
+                            "hiddenIds": {"type": "array", "items": {"type": "string"}, "maxItems": 300},
+                        },
+                    }}},
+                },
+                "responses": {
+                    "200": {"description": "Saved curation.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/HolidayCuration"}}}},
+                    "400": {"description": "Invalid slug or body."},
+                },
+            }
+        },
         "/api/admin/refresh-token": {
             "post": {
                 "summary": "Refresh admin token",
@@ -4370,6 +4406,15 @@ OPENAPI_TEMPLATE = {
             }
         },
         "schemas": {
+            "HolidayCuration": {
+                "type": "object",
+                "properties": {
+                    "slug": {"type": "string"},
+                    "partyIds": {"type": "array", "items": {"type": "string"}, "description": "Pinned party ids, shown first in this order."},
+                    "hiddenIds": {"type": "array", "items": {"type": "string"}, "description": "Party ids removed from the page."},
+                    "updatedAt": {"type": "string", "format": "date-time", "nullable": True},
+                },
+            },
             "Party": {
                 "type": "object",
                 "properties": {
@@ -7015,6 +7060,91 @@ def set_referral():
         return jsonify({"message": "Referral updated"}), 200
     except Exception as e:
         return jsonify({"message": "Error updating referral", "error": str(e)}), 500
+
+# --- Holiday page curation ---
+# The site's holiday pages (/halloween, /sylvester, ...) list every party whose
+# date falls in the holiday window, by date. The owner can pin parties (shown
+# first, in the given order, even outside the window) and hide ones that
+# matched the window but shouldn't be there. Stored per page in `settings`.
+HOLIDAY_SLUG_RE = re.compile(r"[a-z0-9-]{1,40}")
+HOLIDAY_SETTING_PREFIX = "holidayPage:"
+HOLIDAY_MAX_IDS = 300
+
+
+def _clean_party_ids(values) -> list[str] | None:
+    """Dedupe (keeping first position) and validate a list of party id strings."""
+    if not isinstance(values, list) or len(values) > HOLIDAY_MAX_IDS:
+        return None
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
+            return None
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
+def parse_holiday_curation(payload) -> dict | None:
+    """Validate an admin PUT body; returns {partyIds, hiddenIds} or None.
+    A party can't be both pinned and hidden: pinning wins."""
+    if not isinstance(payload, dict) or set(payload) - {"partyIds", "hiddenIds"}:
+        return None
+    party_ids = _clean_party_ids(payload.get("partyIds", []))
+    hidden_ids = _clean_party_ids(payload.get("hiddenIds", []))
+    if party_ids is None or hidden_ids is None:
+        return None
+    pinned = set(party_ids)
+    return {"partyIds": party_ids, "hiddenIds": [i for i in hidden_ids if i not in pinned]}
+
+
+def load_holiday_curation(slug: str) -> dict:
+    empty = {"slug": slug, "partyIds": [], "hiddenIds": [], "updatedAt": None}
+    if settings_collection is None:
+        return empty
+    doc = settings_collection.find_one({"key": HOLIDAY_SETTING_PREFIX + slug}) or {}
+    return {
+        "slug": slug,
+        "partyIds": [str(i) for i in doc.get("partyIds") or []],
+        "hiddenIds": [str(i) for i in doc.get("hiddenIds") or []],
+        "updatedAt": isoformat_or_none(doc.get("updatedAt")),
+    }
+
+
+@app.route("/api/holiday-pages/<slug>", methods=["GET"])
+def get_holiday_curation(slug):
+    if not HOLIDAY_SLUG_RE.fullmatch(slug or ""):
+        return jsonify({"message": "Invalid holiday slug."}), 400
+    try:
+        return json_response(load_holiday_curation(slug), cache_seconds=30)
+    except Exception as e:
+        return jsonify({"message": "Error fetching holiday page", "error": str(e)}), 500
+
+
+@app.route("/api/admin/holiday-pages/<slug>", methods=["PUT"])
+@protect
+def set_holiday_curation(slug):
+    if not HOLIDAY_SLUG_RE.fullmatch(slug or ""):
+        return jsonify({"message": "Invalid holiday slug."}), 400
+    data = parse_holiday_curation(request.get_json(silent=True))
+    if data is None:
+        return jsonify({"message": "Body must be {partyIds: string[], hiddenIds: string[]} (party ids, max 300 each)."}), 400
+    key = HOLIDAY_SETTING_PREFIX + slug
+    try:
+        settings_collection.update_one(
+            {"key": key},
+            {"$set": {"key": key, **data, "updatedAt": datetime.now(timezone.utc)}},
+            upsert=True,
+        )
+        record_admin_action("set_holiday_page", "holiday_page", slug, data)
+        trigger_revalidation([f"/{slug}"])
+        return jsonify(load_holiday_curation(slug)), 200
+    except Exception as e:
+        return jsonify({"message": "Error updating holiday page", "error": str(e)}), 500
 
 # --- Advanced Classification Helpers ---
 

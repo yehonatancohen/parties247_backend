@@ -1268,6 +1268,10 @@ def build_party_funnel(days: int = 30, real_month: str | None = None) -> dict:
     }
 
 
+_TIME_SERIES_VISITOR_PROJECTION = {"_id": 0, "createdAt": 1, "sessionId": 1}
+_TIME_SERIES_EVENT_PROJECTION = {"_id": 0, "createdAt": 1, "action": 1, "partyId": 1, "label": 1}
+
+
 def build_time_series_analytics(start: datetime, end: datetime, interval: str = "day", party_slug: str | None = None) -> list[dict]:
     """
     Build time-series analytics for visits, party views, and purchases.
@@ -1287,7 +1291,9 @@ def build_time_series_analytics(start: datetime, end: datetime, interval: str = 
     # Query visitor analytics for unique sessions (Visits)
     visitor_query = {"createdAt": {"$gte": start, "$lte": end}}
     try:
-        visitor_docs = list(visitor_analytics_collection.find(visitor_query))
+        # Only the bucket timestamp and session are read; full visitor docs
+        # (UA, referer, geo...) made the admin's 7d hourly call take seconds.
+        visitor_docs = list(visitor_analytics_collection.find(visitor_query, _TIME_SERIES_VISITOR_PROJECTION))
     except Exception as exc:
         app.logger.error(f"Failed to read visitor analytics: {exc}")
         raise
@@ -1301,7 +1307,7 @@ def build_time_series_analytics(start: datetime, end: datetime, interval: str = 
     }
     
     try:
-        party_events = list(analytics_collection.find(party_event_query))
+        party_events = list(analytics_collection.find(party_event_query, _TIME_SERIES_EVENT_PROJECTION))
     except Exception as exc:
         app.logger.error(f"Failed to read analytics events: {exc}")
         raise
@@ -2451,6 +2457,7 @@ def analytics_recent():
                 })
         except Exception as exc:
             app.logger.error(f"Failed to read recent party events: {exc}")
+            return jsonify({"message": "Analytics datastore unavailable."}), 503
 
     # Fetch recent real GoOut purchases (confirmed ticket sales, not clicks)
     if want_goout_purchases and goout_sales_log_collection is not None:
@@ -2489,6 +2496,7 @@ def analytics_recent():
                 })
         except Exception as exc:
             app.logger.error(f"Failed to read recent GoOut purchases: {exc}")
+            return jsonify({"message": "Analytics datastore unavailable."}), 503
 
     # Fetch recent visitor sessions
     if want_visits and visitor_analytics_collection is not None:
@@ -2535,6 +2543,7 @@ def analytics_recent():
                 })
         except Exception as exc:
             app.logger.error(f"Failed to read recent visitors: {exc}")
+            return jsonify({"message": "Analytics datastore unavailable."}), 503
 
     # Sort merged events by timestamp descending, then paginate
     events.sort(key=lambda e: e.get("timestamp", ""), reverse=True)

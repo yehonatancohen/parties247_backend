@@ -6,8 +6,11 @@ accounts and data flow are in the workspace root `../CLAUDE.md` — read that fi
 
 ## Shape
 
-Everything is in one file, `app.py` (~6.6k lines), except `promo.py` (pure ranking +
-Hebrew WhatsApp message templates behind `GET /api/admin/promo/whatsapp`). Rough map of
+Everything is in one file, `app.py` (~8.7k lines), except three pure modules: `promo.py`
+(ranking + Hebrew WhatsApp message templates behind `GET /api/admin/promo/whatsapp`),
+`wa_facts.py`, and `listings.py` — the **Listing Guard** rules (price from ticket tiers,
+field sync with admin locks, duplicate detection, issue detectors; see root `../CLAUDE.md`).
+Line numbers below predate later growth; grep for the names. Rough map of
 `app.py` by line region:
 
 | Region | What |
@@ -20,14 +23,17 @@ Hebrew WhatsApp message templates behind `GET /api/admin/promo/whatsapp`). Rough
 | ~1660–2440 | Public analytics beacons + admin analytics routes (`/api/admin/analytics/{visitors,detailed,sales,funnel}`) |
 | ~2440–3800 | Hand-written OpenAPI document (`build_openapi_document`) — update it when adding routes |
 | ~3800–4100 | Login, pydantic schemas, taxonomy classifiers (`get_region`, `get_music_type`, `get_event_type`, `get_age`, `get_tags`) — Hebrew/English keyword tables |
-| ~4100–4400 | GoOut page scraping (`scrape_party_details`, `scrape_ticket_info`), `scheduled_price_scan` (every 30 min, upcoming parties only) |
+| ~4900–5120 | GoOut fetch + Listing Guard glue: `fetch_goout_event`, `fetch_goout_tiers`, `scrape_party_details` (add-by-URL only), `upsert_party_doc` (the **one** place a party doc is created) |
 | ~4400–5000 | Party CRUD, `delete_party` (+ `?redirectTo=` → `party_redirects`), `get_parties` |
 | ~5000–5830 | Carousels, sections, tags, URL imports |
 | ~5830–6000 | Sitemap/feed/robots routes, referral get/set |
-| ~6000–6400 | GoOut pending approve/reject (admin + internal/service-token variants), `internal_scrape_party` |
+| ~6000–6400 | GoOut pending approve/reject (admin + internal/service-token variants, shared `_approve_pending`), `internal_scrape_party` |
+| end of file | Listing Guard routes: `/api/internal/listings/{targets,sync,audit}` (service token, called by the scraper VM), `/api/admin/listings/*` (issues, resolve, changes, hidden, status, unlock, resync) |
 
-Scheduler: `Flask-APScheduler` inside the web process — `price_scan` cron is the only job.
-Render runs gunicorn, so be careful adding jobs (multiple workers = duplicate runs).
+Scheduler: `Flask-APScheduler` is still initialised but has **no jobs** — the old
+`price_scan` / `content_refresh` crons were replaced by the scraper VM posting to
+`/api/internal/listings/sync`. Keep it that way: Render runs gunicorn (multiple workers =
+duplicate runs) and every job here scraped GoOut from the web process.
 
 ## Auth
 
@@ -96,5 +102,10 @@ version marker exposed by the API; confirm deploys via `/api/health` timing or a
 - Time windows: filter `goout_sales_log` by `recorded_at` for any "last N days" figure —
   `build_sales_by_party` is lifetime and was misused for that once.
 - Deleting parties: always take the `redirectTo` path so slugs keep their SEO signal.
+  Prefer not deleting at all — `merge_listing()` / `listingStatus` hide a party reversibly.
+- Listings: every rule goes in `listings.py` with a test in `tests/test_listings_rules.py`
+  (fixtures are real cases). `parties` reads that feed the public site must go through
+  `_fetch_parties_cached()` / `all_events()` so hidden/merged listings stay out; analytics
+  joins must not filter. Never read `event["Tickets"]` from a GoOut page (placeholder).
 - `party247` is the database name. `parties247` is a different, empty DB that caused a
   split-brain incident once.

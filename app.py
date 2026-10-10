@@ -44,6 +44,7 @@ import time
 
 import promo
 import wa_facts
+import listings
 
 # --- App setup ---
 load_dotenv()
@@ -108,6 +109,8 @@ TRACKING_PREFIXES = ("utm_",)
 TRACKING_KEYS = {"fbclid", "gclid", "mc_cid", "mc_eid", "ref", "aff"}
 
 REFERRAL_KEY = "referral"
+# settings doc holding Listing Guard run state (see the routes near the bottom).
+LISTING_GUARD_KEY = "listingGuard"
 
 GO_OUT_BASE_URL = "https://www.go-out.co"
 GO_OUT_EVENT_BASE = f"{GO_OUT_BASE_URL}/event/"
@@ -370,36 +373,63 @@ _referral_cache: dict = {"value": _REFERRAL_UNSET, "fetched_at": 0.0}
 _referral_cache_lock = threading.Lock()
 
 
-def _fetch_parties_cached(query: dict) -> list[dict]:
+# The raw GoOut snapshot is only needed by the Listing Guard routes, which
+# query it themselves. Keeping it out of the list reads matters: every byte
+# here crosses the ~140 KB/s Render<->Atlas link on each cache miss.
+_PARTY_LIST_PROJECTION = {"source": 0}
+
+
+def _find_parties(query: dict):
+    try:
+        return parties_collection.find(query, _PARTY_LIST_PROJECTION)
+    except TypeError:  # pragma: no cover - simple test stubs without a projection arg
+        return parties_collection.find(query)
+
+
+def _public_party(party: dict) -> dict:
+    """Site-facing copy: without the admin-only lock list."""
+    return {k: v for k, v in party.items() if k not in ("source", "locks")}
+
+
+def _fetch_parties_cached(query: dict, include_hidden: bool = False) -> list[dict]:
     """Returns fully-processed party dicts (str _id, slug, referral applied)
     for the given Mongo query, shared across requests for
     PARTIES_CACHE_TTL_SECONDS. Callers must treat the returned list and its
-    dicts as read-only — they are shared across threads and requests."""
+    dicts as read-only — they are shared across threads and requests.
+
+    By default only listed parties, trimmed for the public site.
+    include_hidden=True is for the admin and the scraper VM: every party,
+    hidden/merged included, with `locks`."""
     key = json.dumps(query, sort_keys=True, default=str)
+    view = "docs" if include_hidden else "public"
     now = time.monotonic()
 
     cached = _parties_cache.get(key)
     if cached and now - cached["fetched_at"] < PARTIES_CACHE_TTL_SECONDS:
-        return cached["docs"]
+        return cached[view]
 
     with _parties_cache_lock:
         # Re-check: another thread may have just filled this while we waited
         # for the lock, which is the whole point — avoid a second scan.
         cached = _parties_cache.get(key)
         if cached and time.monotonic() - cached["fetched_at"] < PARTIES_CACHE_TTL_SECONDS:
-            return cached["docs"]
+            return cached[view]
 
         referral = default_referral_code()
         docs = []
-        for party in parties_collection.find(query).sort("date", 1):
+        for party in _find_parties(query).sort("date", 1):
             party["_id"] = str(party["_id"])
             slug = party.get("slug") or slugify_value(party.get("name"))
             party["slug"] = slug or ""
             apply_default_referral(party, referral)
             docs.append(party)
 
-        _parties_cache[key] = {"docs": docs, "fetched_at": time.monotonic()}
-        return docs
+        _parties_cache[key] = {
+            "docs": docs,
+            "public": [_public_party(p) for p in docs if not listings.is_hidden(p)],
+            "fetched_at": time.monotonic(),
+        }
+        return _parties_cache[key][view]
 
 
 def default_referral_code() -> str | None:
@@ -610,6 +640,21 @@ try:
     party_redirects_collection = db.party_redirects
     ensure_index(party_redirects_collection, [("fromSlug", 1)], name="unique_from_slug", unique=True)
 
+    # --- Listing Guard (see listings.py) ---
+    # listing_issues: the review queue; a resolved issue doubles as the stored
+    # decision, so its fingerprint is never asked about again.
+    # listing_rules: remembered answers that apply to future parties too.
+    # listing_changes: append-only "what the sync changed and why", 90 days.
+    listing_issues_collection = db.listing_issues
+    listing_rules_collection = db.listing_rules
+    listing_changes_collection = db.listing_changes
+    ensure_index(listing_issues_collection, [("fingerprint", 1)], name="unique_fingerprint", unique=True)
+    ensure_index(listing_issues_collection, [("status", 1), ("lastSeen", -1)], name="issue_status_seen")
+    ensure_index(listing_rules_collection, [("kind", 1), ("key", 1)], name="unique_rule", unique=True)
+    ensure_index(listing_changes_collection, [("at", 1)], name="change_at_ttl",
+                 expireAfterSeconds=90 * 24 * 60 * 60)
+    ensure_index(listing_changes_collection, [("partyId", 1), ("at", -1)], name="change_party_at")
+
     # --- WhatsApp engine collections ---
     # Written directly by the whatsapp-engine (VPS, Mongo access, not through
     # this API — see WHATSAPP-PROMO-PLAN.md) for waGroups/waMembers/waSettings
@@ -669,6 +714,9 @@ except Exception as e:
     goout_sales_log_collection = None
     admin_audit_collection = None
     party_redirects_collection = None
+    listing_issues_collection = None
+    listing_rules_collection = None
+    listing_changes_collection = None
     wa_groups_collection = None
     wa_members_collection = None
     wa_templates_collection = None
@@ -1380,19 +1428,23 @@ def build_time_series_analytics(start: datetime, end: datetime, interval: str = 
     return results
 
 
-def all_events() -> list[dict]:
+def all_events(include_hidden: bool = False) -> list[dict]:
+    """Every party as the site-facing surfaces (event API, sitemaps, feeds,
+    ICS) should see it: hidden and merged listings are left out unless asked."""
     if parties_collection is None:
         return []
     try:
-        docs = list(parties_collection.find())
+        docs = list(_find_parties({}))
     except TypeError:  # pragma: no cover - compatibility with simple stubs
-        docs = list(parties_collection.find({}))
+        docs = list(parties_collection.find())
     except Exception as exc:
         app.logger.error(f"Failed to fetch events: {exc}")
         return []
     for doc in docs:
         if "_id" in doc:
             doc["_id"] = str(doc["_id"])
+    if not include_hidden:
+        docs = [doc for doc in docs if not listings.is_hidden(doc)]
     return docs
 
 
@@ -1835,6 +1887,21 @@ def _check_service_token() -> bool:
     if not SERVICE_TOKEN:
         return False
     return request.headers.get("X-Service-Token", "") == SERVICE_TOKEN
+
+
+def _request_is_trusted() -> bool:
+    """Service token or a valid admin JWT — for the few public routes that
+    return more to our own callers (e.g. /api/parties?includeHidden=1)."""
+    if _check_service_token():
+        return True
+    auth_header = request.headers.get("Authorization", "")
+    if not JWT_SECRET or not auth_header.startswith("Bearer "):
+        return False
+    try:
+        jwt.decode(auth_header.split(" ", 1)[1].strip(), JWT_SECRET, algorithms=["HS256"])
+        return True
+    except Exception:
+        return False
 
 
 def apply_security_headers(response):
@@ -2898,7 +2965,7 @@ _PROMO_PARTY_PROJECTION = {
     "name": 1, "slug": 1, "date": 1, "startsAt": 1, "goOutEventId": 1,
     "goOutUrl": 1, "originalUrl": 1, "canonicalUrl": 1, "location": 1,
     "musicType": 1, "age": 1, "ticketPrice": 1, "referralCode": 1,
-    "hidden": 1, "isPromotion": 1,
+    "hidden": 1, "isPromotion": 1, "listingStatus": 1,
 }
 
 
@@ -2922,6 +2989,8 @@ def build_whatsapp_promo(days: int = 7, limit: int = 12) -> dict:
     referral = default_referral_code()
     parties: list[dict] = []
     for party in fetch_all_documents(parties_collection, projection=_PROMO_PARTY_PROJECTION):
+        if listings.is_hidden(party):
+            continue  # not on the site — a promo link to it would 404 or redirect
         party = dict(party)
         party["_id"] = str(party.get("_id"))
         apply_default_referral(party, referral)
@@ -3636,8 +3705,8 @@ OPENAPI_TEMPLATE = {
         },
         "/api/admin/refresh-content": {
             "post": {
-                "summary": "Manually trigger a content refresh scan",
-                "description": "Re-scrapes every upcoming party's GoOut page and updates imageUrl/location/description when they've changed since we first approved the listing. Runs automatically twice a day (06:20 and 18:20 UTC); this endpoint runs it on demand. Price/soldOut are refreshed separately by /api/admin/update-prices every 30 minutes.",
+                "summary": "Request a full listing sync",
+                "description": "Asks the goout-scraper VM's next Listing Guard sync (within 30 minutes) to be a full one: GoOut page + ticket tiers for every upcoming party. Same effect as /api/admin/update-prices; nothing is scraped by this request itself.",
                 "security": [{"bearerAuth": []}],
                 "responses": {
                     "200": {
@@ -3662,6 +3731,86 @@ OPENAPI_TEMPLATE = {
                     },
                     "401": {"description": "Missing or invalid admin token."},
                 },
+            }
+        },
+        "/api/admin/listings/issues": {
+            "get": {
+                "summary": "Listing Guard review queue",
+                "description": "Open listing issues (duplicates, unclassified free tiers, vague locations, title/date mismatches, live-page mismatches) with a card per involved party. ?status=open|resolved|ignored|auto_fixed|all.",
+                "security": [{"bearerAuth": []}],
+                "responses": {"200": {"description": "OK"}, "401": {"description": "Missing or invalid admin token."}},
+            }
+        },
+        "/api/admin/listings/issues/{issueId}/resolve": {
+            "post": {
+                "summary": "Answer a listing issue",
+                "description": "Body depends on the issue type: duplicate {decision: keep, keeperId, remember} or {decision: different, remember}; zero_tier {decision: free|not_free}; location_vague {decision: set, location}; any type {decision: ignore|hide}. The answer is stored, so the same question is never asked again.",
+                "security": [{"bearerAuth": []}],
+                "responses": {"200": {"description": "OK"}, "401": {"description": "Missing or invalid admin token."}},
+            }
+        },
+        "/api/admin/listings/changes": {
+            "get": {
+                "summary": "What the sync changed",
+                "description": "Field-level change log of the Listing Guard (old value, new value, reason). ?hours=24&partyId=.",
+                "security": [{"bearerAuth": []}],
+                "responses": {"200": {"description": "OK"}, "401": {"description": "Missing or invalid admin token."}},
+            }
+        },
+        "/api/admin/listings/hidden": {
+            "get": {
+                "summary": "Unlisted upcoming parties",
+                "description": "Upcoming parties that exist but are not listed: private on GoOut, merged duplicates, hidden by hand.",
+                "security": [{"bearerAuth": []}],
+                "responses": {"200": {"description": "OK"}, "401": {"description": "Missing or invalid admin token."}},
+            }
+        },
+        "/api/admin/listings/{partyId}/status": {
+            "post": {
+                "summary": "Hide or relist a party",
+                "description": "Body {status: live|hidden}. Relisting a merged party also removes its redirect. The choice is locked against the automatic private-event rule.",
+                "security": [{"bearerAuth": []}],
+                "responses": {"200": {"description": "OK"}, "401": {"description": "Missing or invalid admin token."}},
+            }
+        },
+        "/api/admin/listings/{partyId}/unlock": {
+            "post": {
+                "summary": "Unlock a manually edited field",
+                "description": "Body {field}. Hands a field the admin edited back to the sync.",
+                "security": [{"bearerAuth": []}],
+                "responses": {"200": {"description": "OK"}, "401": {"description": "Missing or invalid admin token."}},
+            }
+        },
+        "/api/admin/listings/{partyId}/resync": {
+            "post": {
+                "summary": "Resync one party from GoOut now",
+                "description": "Re-reads the GoOut page and ticket tiers for one party from this server and applies the Listing Guard rules.",
+                "security": [{"bearerAuth": []}],
+                "responses": {"200": {"description": "OK"}, "401": {"description": "Missing or invalid admin token."}},
+            }
+        },
+        "/api/internal/listings/targets": {
+            "get": {
+                "summary": "Listing sync targets (service)",
+                "description": "Upcoming parties the goout-scraper VM should fetch, plus whether a full sync was requested. X-Service-Token.",
+                
+                "responses": {"200": {"description": "OK"}, "401": {"description": "Missing or invalid service token."}},
+            }
+        },
+        "/api/internal/listings/sync": {
+            "post": {
+                "summary": "Apply a listing sync batch (service)",
+                "description": "Body {items: [{partyId, event?, ogImage?, pageStatus?, tiers?}], dryRun?, fullDone?} with at most 60 items. Parses the raw GoOut data, updates price / name / date / location / image / region honouring admin locks, hides private events. X-Service-Token.",
+                
+                "responses": {"200": {"description": "OK"}, "401": {"description": "Missing or invalid service token."}},
+            }
+        },
+        "/api/internal/listings/audit": {
+            "post": {
+                "summary": "Run the daily listing audit (service)",
+                "description": "Body {account1Referral, siteChecks: [{partyId, status, finalUrl, name, price}], dryRun?}. Detects duplicates and other issues, auto-merges the certain ones into the account1 listing and queues the rest. X-Service-Token.",
+                
+                "responses": {"200": {"description": "OK"}, "401": {"description": "Missing or invalid service token."}},
             }
         },
         "/api/admin/promo/whatsapp": {
@@ -4838,178 +4987,144 @@ def get_tags(text: str, location: str) -> list:
             tags.append(tag)
     return list(set(tags))
 
-def _extract_price_from_tickets(event_data: dict) -> float | None:
-    """
-    Extract the minimum available final ticket price from go-out's Tickets array.
-    Final price = Price * (1 + Commision/100) where Commision is per-ticket commission.
-    Skips sold-out and inactive tiers.
-    """
-    tickets = event_data.get("Tickets")
-    if not isinstance(tickets, list) or not tickets:
+# --- GoOut fetch + Listing Guard glue ---
+#
+# listings.py holds every rule about what a listing says; this section is only
+# the I/O around it. Day to day the goout-scraper VM does the fetching and
+# posts raw data to /api/internal/listings/sync (see the Listing Guard routes
+# near the bottom of this file) — the fetchers here exist for the two cases
+# where this process has to look at GoOut itself: adding a party by URL and
+# the admin's single-party "resync".
+GO_OUT_TIERS_URL = f"{GO_OUT_BASE_URL}/endOne/loadEventTickets"
+_GO_OUT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+PLACEHOLDER_IMAGE_URL = "https://via.placeholder.com/600x400?text=No+Image+Available"
+
+
+def fetch_goout_event(url: str) -> tuple[dict, str | None]:
+    """Fetch a public GoOut event page -> (pageProps.event, og:image). Raises
+    when the page has no event (removed, not found, shape changed)."""
+    response = requests.get(url, headers=_GO_OUT_HEADERS, timeout=15)
+    app.logger.info(f"[SCRAPER] status {response.status_code}")
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    script_tag = soup.find("script", {"id": "__NEXT_DATA__"})
+    if not script_tag:
+        raise ValueError("Could not find party data script (__NEXT_DATA__).")
+    json_data = json.loads(script_tag.string)
+    event_data = json_data.get("props", {}).get("pageProps", {}).get("event")
+    if not event_data:
+        raise ValueError("Event data not in expected format inside JSON.")
+
+    og_image_tag = soup.find("meta", {"property": "og:image"})
+    og_image = og_image_tag.get("content") if og_image_tag else None
+    return event_data, og_image
+
+
+def fetch_goout_tiers(url_id: str | None) -> list | None:
+    """Real ticket tiers for an event, or None when they can't be read. The
+    `Tickets` array on the event page itself is a placeholder (see listings.py)
+    and must never be used as a fallback for this."""
+    if not url_id:
         return None
-
-    min_price: float | None = None
-    for t in tickets:
-        if not isinstance(t, dict):
-            continue
-        if not t.get("Active", True):
-            continue
-        amount = t.get("Amount", 0)
-        sold = t.get("sold", 0)
-        try:
-            if int(sold) >= int(amount):
-                continue
-        except (TypeError, ValueError):
-            pass
-        try:
-            base = float(t["Price"])
-            commission = float(t.get("Commision", 0))  # go-out misspells "Commission"
-            final = round(base * (1 + commission / 100), 2)
-            if final >= 0 and (min_price is None or final < min_price):
-                min_price = final
-        except (KeyError, TypeError, ValueError):
-            continue
-
-    return min_price
-
-
-def _is_sold_out(event_data: dict) -> bool:
-    """
-    Return True when all tickets for the event are sold out.
-    Uses go-out's pre-computed cheapestTicket field (None = sold out) and
-    falls back to inspecting the Tickets array directly.
-    """
-    if "cheapestTicket" in event_data and event_data.get("cheapestTicket") is None:
-        return True
-    tickets = event_data.get("Tickets") or []
-    if isinstance(tickets, list) and tickets:
-        for t in tickets:
-            if not isinstance(t, dict):
-                continue
-            if not t.get("Active", True):
-                continue
-            try:
-                if int(t.get("sold", 0)) < int(t.get("Amount", 1)):
-                    return False
-            except (TypeError, ValueError):
-                return False
-        return True
-    return False
-
-
-def _extract_price_from_ticket_types(event_data: dict) -> float | None:
-    """Legacy wrapper — go-out uses 'Tickets', not 'TicketTypes'."""
-    return _extract_price_from_tickets(event_data)
-
-
-def _extract_price_from_schema_org(schema_org) -> float | None:
-    """
-    Parse the schemaOrg FAQPage from go-out.co __NEXT_DATA__ to extract the
-    final ticket price (including service fee).
-    FAQ answer contains e.g. "מתחילים ב-86.80₪ (מחיר סופי כולל עמלות)"
-    """
-    if not schema_org:
-        return None
-    faq_items = schema_org if isinstance(schema_org, list) else [schema_org]
-    for faq_item in faq_items:
-        if not faq_item or faq_item.get("@type") != "FAQPage":
-            continue
-        for question in faq_item.get("mainEntity", []):
-            answer_text = question.get("acceptedAnswer", {}).get("text", "")
-            m = re.search(r"([\d,]+\.?\d*)₪", answer_text)
-            if m:
-                price_str = m.group(1).replace(",", "")
-                return round(float(price_str), 2)
+    try:
+        response = requests.get(
+            GO_OUT_TIERS_URL,
+            params={"eventUrl": url_id},
+            headers={**_GO_OUT_HEADERS, "Referer": f"{GO_OUT_BASE_URL}/"},
+            timeout=15,
+        )
+        payload = response.json()
+        if payload.get("status") and isinstance(payload.get("tickets"), list):
+            return payload["tickets"]
+    except Exception as exc:
+        app.logger.warning(f"[LISTING] tiers fetch failed for {url_id}: {exc}")
     return None
 
-# --- Scraper ---
+
+def _zero_tier_rules() -> dict:
+    """Remembered free / not-free answers for ₪0 tier names (listing_rules)."""
+    if listing_rules_collection is None:
+        return {}
+    try:
+        return {doc["key"]: doc.get("decision") for doc in listing_rules_collection.find({"kind": "zero_tier"})}
+    except Exception as exc:
+        app.logger.warning(f"[LISTING] could not load zero-tier rules: {exc}")
+        return {}
+
+
+def build_listing_fields(source: dict, price_info: dict | None) -> dict:
+    """Display fields for a source snapshot: listings.derive_fields, with the
+    older keyword classifiers filling region/areas only where GoOut gave no
+    usable coordinates."""
+    fields = listings.derive_fields(source, price_info)
+    location = fields.get("location") or ""
+    if "region" not in fields:
+        region = get_region(location)
+        if region != "לא ידוע":
+            fields["region"] = region
+    if "areas" not in fields:
+        areas = classify_party_data(source.get("title") or "", source.get("description") or "", location).get("areas")
+        if areas:
+            fields["areas"] = areas
+    return fields
+
+
 def scrape_party_details(url: str):
     if not is_url_allowed(url):
         raise ValueError("URL is not allowed.")
     app.logger.info(f"[SCRAPER] start {url}")
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers, timeout=15)
-        app.logger.info(f"[SCRAPER] status {response.status_code}")
-        response.raise_for_status()
-
-        soup = BeautifulSoup(response.text, "html.parser")
-        script_tag = soup.find("script", {"id": "__NEXT_DATA__"})
-        if not script_tag:
-            raise ValueError("Could not find party data script (__NEXT_DATA__).")
-
-        json_data = json.loads(script_tag.string)
-        event_data = json_data.get("props", {}).get("pageProps", {}).get("event")
-        if not event_data:
-            raise ValueError("Event data not in expected format inside JSON.")
-
-        image_path = ""
-        if event_data.get("CoverImage") and event_data["CoverImage"].get("Url"):
-            image_path = event_data["CoverImage"]["Url"]
-        elif event_data.get("WhatsappImage") and event_data["WhatsappImage"].get("Url"):
-            image_path = event_data["WhatsappImage"]["Url"]
-
-        if image_path:
-            cover_image_path = image_path.replace("_whatsappImage.jpg", "_coverImage.jpg")
-            image_url = f"https://d15q6k8l9pfut7.cloudfront.net/{cover_image_path}"
-        else:
-            og_image_tag = soup.find("meta", {"property": "og:image"})
-            og_image_url = og_image_tag["content"] if og_image_tag else ""
-            if og_image_url:
-                image_url = og_image_url.replace("_whatsappImage.jpg", "_coverImage.jpg")
-            else:
-                app.logger.warning(f"Could not find party image URL for {url}. Using placeholder.")
-                image_url = "https://via.placeholder.com/600x400?text=No+Image+Available"
+        event_data, og_image = fetch_goout_event(url)
+        fetched_at = datetime.now(timezone.utc).isoformat()
+        tiers = fetch_goout_tiers(str(event_data.get("Url") or "") or None)
+        source = listings.parse_source(event_data, tiers, og_image, fetched_at)
+        price_info = listings.compute_price_info(source.get("tiers"), _zero_tier_rules())
+        fields = build_listing_fields(source, price_info)
 
         description = event_data.get("Description", "")
-        cleaned_desc = " ".join(list(filter(None, description.split("\n")))[:3]).strip()
-        if len(cleaned_desc) > 250:
-            cleaned_desc = cleaned_desc[:247] + "..."
-
-        full_text = f"{event_data.get('Title', '')} {description}"
-        location = event_data.get("Adress", "")
-        classification = classify_party_data(
-            title=event_data.get("Title", ""),
-            description=description,
-            location=location
-        )
+        title = event_data.get("Title", "")
+        full_text = f"{title} {description}"
+        location = fields.get("location") or ""
+        classification = classify_party_data(title=title, description=description, location=location)
         canonical = normalize_url(url)
         go_out = normalized_or_none_for_dedupe(url)
-
-        # Numeric GoOut panel ID (EventSerial) — the join key against the
-        # sales-tracker's goout_sales/goout_sales_log collections, which are
-        # keyed by this same value (see goout-scraper/scraper.py go_out_id).
-        go_out_event_id = event_data.get("EventSerial") or event_data.get("eventSerial")
+        if not fields.get("imageUrl"):
+            app.logger.warning(f"Could not find party image URL for {url}. Using placeholder.")
 
         party_details = {
-            "name": event_data.get("Title") or "Unknown Event",
-            "imageUrl": image_url,
-            "date": event_data.get("StartingDate") or "Unknown Date",
+            "name": fields.get("name") or "Unknown Event",
+            "imageUrl": fields.get("imageUrl") or PLACEHOLDER_IMAGE_URL,
+            "date": fields.get("date") or "Unknown Date",
             "location": location or "Unknown Location",
-            "description": cleaned_desc or "No description available.",
-            "goOutEventId": str(go_out_event_id) if go_out_event_id else None,
-            "region": get_region(location),
+            "description": fields.get("description") or "No description available.",
+            # Numeric GoOut panel ID (EventSerial) — the join key against the
+            # sales-tracker's goout_sales/goout_sales_log collections, which are
+            # keyed by this same value (see goout-scraper/scraper.py go_out_id).
+            "goOutEventId": fields.get("goOutEventId"),
+            "region": fields.get("region") or "לא ידוע",
             "musicType": get_music_type(full_text),
             "eventType": get_event_type(full_text),
             "age": get_age(full_text, event_data.get("MinimumAge", 0)),
             "tags": get_tags(full_text, location),
             "audiences": classification["audiences"],
             "musicGenres": classification["musicGenres"],
-            "areas": classification["areas"],
+            "areas": fields.get("areas") or [],
             "originalUrl": url,
             "canonicalUrl": canonical,
-            "ticketPrice": None,
+            # Unverified (tiers unreachable from here) stays None — the VM's
+            # next sync fills it in within the half hour.
+            "ticketPrice": fields.get("ticketPrice"),
+            "soldOut": bool(fields.get("soldOut")),
+            "priceInfo": price_info,
+            "source": source,
+            "listingStatus": "hidden" if source.get("publicity") == listings.PRIVATE_PUBLICITY else "live",
         }
-
-        sold_out = _is_sold_out(event_data)
-        ticket_price = None
-        if not sold_out:
-            ticket_price = _extract_price_from_schema_org(event_data.get("schemaOrg"))
-            if ticket_price is None:
-                ticket_price = _extract_price_from_tickets(event_data)
-        party_details["ticketPrice"] = ticket_price
-        party_details["soldOut"] = sold_out
-
+        if party_details["listingStatus"] == "hidden":
+            party_details["statusReason"] = "private"
         if go_out:
             party_details["goOutUrl"] = go_out
 
@@ -5023,210 +5138,72 @@ def scrape_party_details(url: str):
         app.logger.error(f"[SCRAPER] error: {e}")
         raise
 
-def scrape_ticket_info(url: str) -> dict | None:
-    """
-    Fetch a go-out event page and return {"price": float|None, "soldOut": bool}.
-    Returns None if the page couldn't be fetched at all (network error).
-    """
-    if not is_url_allowed(url):
-        return None
+
+def upsert_party_doc(party_data: dict, query: dict | None = None) -> tuple[str | None, bool]:
+    """The one place a party document gets created. Returns (party id,
+    created). An existing party is left untouched — bringing existing parties
+    up to date is the sync's job, never an ingest path's."""
+    if query is None:
+        or_clauses = []
+        if party_data.get("canonicalUrl"):
+            or_clauses.append({"canonicalUrl": party_data["canonicalUrl"]})
+        if party_data.get("goOutUrl"):
+            or_clauses.append({"goOutUrl": party_data["goOutUrl"]})
+        query = {"$or": or_clauses} if or_clauses else {"name": party_data.get("name")}
+    party_data.setdefault("listingStatus", "live")
+    result = parties_collection.update_one(query, {"$setOnInsert": party_data}, upsert=True)
+    upserted_id = getattr(result, "upserted_id", None)
+    if upserted_id is not None:
+        _parties_cache.clear()
+        return str(upserted_id), True
+    existing = parties_collection.find_one(query, {"_id": 1})
+    return (str(existing["_id"]) if existing else None), False
+
+
+def _listing_guard_state() -> dict:
+    if settings_collection is None:
+        return {}
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
-        }
-        response = requests.get(url, headers=headers, timeout=15)
-        if response.encoding and response.encoding.lower() not in ('utf-8', 'utf8'):
-            response.encoding = 'utf-8'
-
-        soup = BeautifulSoup(response.text, "html.parser")
-        script_tag = soup.find("script", {"id": "__NEXT_DATA__"})
-        if script_tag and script_tag.string:
-            json_data = json.loads(script_tag.string)
-            event_data = json_data.get("props", {}).get("pageProps", {}).get("event", {})
-            sold_out = _is_sold_out(event_data)
-            price = None
-            if not sold_out:
-                price = _extract_price_from_schema_org(event_data.get("schemaOrg"))
-                if price is None:
-                    price = _extract_price_from_tickets(event_data)
-            return {"price": price, "soldOut": sold_out}
-    except Exception as e:
-        app.logger.warning(f"[PRICE SCAN] Error fetching {url}: {e}")
-    return None
+        return (settings_collection.find_one({"key": LISTING_GUARD_KEY}) or {}).get("value") or {}
+    except Exception:
+        return {}
 
 
-def scrape_ticket_price_only(url: str) -> float | None:
-    """Legacy wrapper kept for any external callers."""
-    info = scrape_ticket_info(url)
-    return info["price"] if info else None
+def _set_listing_guard_state(**fields):
+    if settings_collection is None:
+        return
+    try:
+        settings_collection.update_one(
+            {"key": LISTING_GUARD_KEY},
+            {"$set": {f"value.{name}": value for name, value in fields.items()}},
+            upsert=True,
+        )
+    except Exception as exc:
+        app.logger.warning(f"[LISTING] could not save guard state: {exc}")
 
-@scheduler.task("cron", id="price_scan", minute="*/30")
-def scheduled_price_scan():
-    with app.app_context():
-        app.logger.info("[PRICE SCAN] Starting scan...")
-        now = datetime.now(timezone.utc)
-        cutoff = now - timedelta(days=1)
 
-        cursor = parties_collection.find({})
-        count = 0
-        updated = 0
+def _request_full_listing_sync(action: str):
+    """The old "update prices" / "refresh content" buttons. Prices and content
+    are now one sync run by the goout-scraper VM every 30 minutes; this only
+    asks its next run to be a full one (page + tiers) instead of tiers only."""
+    _set_listing_guard_state(fullSyncRequestedAt=datetime.now(timezone.utc).isoformat())
+    record_admin_action(action, None, None, {"details": "full listing sync requested"})
+    return jsonify({
+        "message": "Full sync requested — it runs with the next sync (within 30 minutes).",
+        "details": {"checked": 0, "updated": 0},
+    }), 200
 
-        for party in cursor:
-            try:
-                p_date_val = party.get("date") or party.get("startsAt")
-                p_date = parse_datetime(p_date_val)
-                if p_date and p_date < cutoff:
-                    continue
-
-                url = party.get("originalUrl") or party.get("goOutUrl")
-                if not url:
-                    continue
-
-                info = scrape_ticket_info(url)
-                if info is None:
-                    continue  # network error — leave existing values intact
-
-                changes = {}
-                if info["price"] != party.get("ticketPrice"):
-                    changes["ticketPrice"] = info["price"]
-                if info["soldOut"] != party.get("soldOut", False):
-                    changes["soldOut"] = info["soldOut"]
-
-                # Reconcile derived geo classification from the stored text.
-                # Most ingest paths use $setOnInsert, so existing events never
-                # pick up improvements to get_region / classify_party_data —
-                # this loop (already iterating every upcoming party every 30m)
-                # is where that backfill happens. Location is stored verbatim,
-                # so region/areas recompute cleanly; only write on real change.
-                loc = party.get("location") or ""
-                new_region = get_region(loc)
-                if new_region != "לא ידוע" and new_region != party.get("region"):
-                    changes["region"] = new_region
-                try:
-                    new_areas = classify_party_data(
-                        party.get("name") or "", party.get("description") or "", loc
-                    ).get("areas", [])
-                    if sorted(new_areas) != sorted(party.get("areas") or []) and new_areas:
-                        changes["areas"] = new_areas
-                except Exception:
-                    pass
-
-                if changes:
-                    parties_collection.update_one({"_id": party["_id"]}, {"$set": changes})
-                    updated += 1
-                count += 1
-            except Exception as e:
-                app.logger.error(f"[PRICE SCAN] Error processing party {party.get('_id')}: {e}")
-                continue
-
-        app.logger.info(f"[PRICE SCAN] Completed. Checked {count} parties, updated {updated}.")
-        return {"checked": count, "updated": updated}
 
 @app.route("/api/admin/update-prices", methods=["POST"])
 @protect
 def manual_price_scan():
-    try:
-        # Run in background to avoid timeout? Or just run it.
-        # It's lightweight so it should be fine, but if there are many parties, it might timeout.
-        # Let's run it directly for now as requested "scan all parties".
-        # If the user has many parties, we might want to thread it.
-        # But given the user said "only price so it wont be a long process", we assume it's fast enough.
-        # We'll just call the function.
-        result = scheduled_price_scan()
-        record_admin_action("manual_price_scan", None, None, {"details": result if isinstance(result, (dict, list)) else str(result)})
-        return jsonify({"message": "Price scan completed.", "details": result}), 200
-    except Exception as e:
-        return jsonify({"message": "Error running price scan", "error": str(e)}), 500
-
-# A fresh scrape sometimes only got a fallback placeholder (bad network hit, or the
-# page shape changed) rather than a real value. Never let one of those overwrite
-# already-good stored data.
-_CONTENT_REFRESH_FALLBACKS = {
-    "imageUrl": "https://via.placeholder.com/600x400?text=No+Image+Available",
-    "location": "Unknown Location",
-    "description": "No description available.",
-}
-
-
-def _compute_content_changes(details: dict, party: dict) -> dict:
-    """Diff a fresh scrape_party_details() result against the stored party for the
-    fields that go stale when a promoter edits their listing on GoOut after we've
-    already approved it (image, location, description). Price/soldOut are already
-    kept fresh separately by scheduled_price_scan every 30 minutes; name/date are
-    left alone here since those are more likely to carry a deliberate admin edit.
-    """
-    changes = {}
-    for field, fallback in _CONTENT_REFRESH_FALLBACKS.items():
-        new_val = details.get(field)
-        if new_val and new_val != fallback and new_val != party.get(field):
-            changes[field] = new_val
-    return changes
-
-
-@scheduler.task("cron", id="content_refresh", hour="6,18", minute="20")
-def scheduled_content_refresh():
-    """Re-scrape each upcoming party's GoOut page twice a day and pick up any
-    image/location/description edit the promoter made after we first approved
-    the listing — the daily fetcher scrape never revisits a party once it
-    exists (see parties247_fetcher/CLAUDE.md), so without this job those fields
-    were stuck at whatever they were on first import, forever.
-    """
-    with app.app_context():
-        app.logger.info("[CONTENT REFRESH] Starting scan...")
-        now = datetime.now(timezone.utc)
-        cutoff = now - timedelta(days=1)
-
-        cursor = parties_collection.find(
-            {},
-            {
-                "originalUrl": 1, "goOutUrl": 1, "date": 1, "startsAt": 1,
-                "imageUrl": 1, "location": 1, "description": 1,
-            },
-        )
-        count = 0
-        updated = 0
-
-        for party in cursor:
-            try:
-                p_date_val = party.get("date") or party.get("startsAt")
-                p_date = parse_datetime(p_date_val)
-                if p_date and p_date < cutoff:
-                    continue
-
-                url = party.get("originalUrl") or party.get("goOutUrl")
-                if not url:
-                    continue
-
-                try:
-                    details = scrape_party_details(url)
-                except Exception as exc:
-                    app.logger.warning(f"[CONTENT REFRESH] scrape failed for {party.get('_id')}: {exc}")
-                    continue  # scrape/network/page-shape error — leave existing values intact
-
-                changes = _compute_content_changes(details, party)
-                if changes:
-                    parties_collection.update_one({"_id": party["_id"]}, {"$set": changes})
-                    updated += 1
-                count += 1
-            except Exception as e:
-                app.logger.error(f"[CONTENT REFRESH] Error processing party {party.get('_id')}: {e}")
-                continue
-
-        app.logger.info(f"[CONTENT REFRESH] Completed. Checked {count} parties, updated {updated}.")
-        return {"checked": count, "updated": updated}
+    return _request_full_listing_sync("manual_price_scan")
 
 
 @app.route("/api/admin/refresh-content", methods=["POST"])
 @protect
 def manual_content_refresh():
-    try:
-        result = scheduled_content_refresh()
-        record_admin_action("manual_content_refresh", None, None, {"details": result if isinstance(result, (dict, list)) else str(result)})
-        return jsonify({"message": "Content refresh completed.", "details": result}), 200
-    except Exception as e:
-        return jsonify({"message": "Error running content refresh", "error": str(e)}), 500
+    return _request_full_listing_sync("manual_content_refresh")
 
 # --- Routes ---
 
@@ -5357,18 +5334,13 @@ def add_party():
         apply_default_referral(party_data, referral)
         party_data.setdefault("slug", slugify_party(party_data.get("name"), party_data.get("date")))
         canonical = party_data["canonicalUrl"]
-        res = parties_collection.update_one(
-            {"$or": [{"canonicalUrl": canonical}, {"goOutUrl": canonical}]},
-            {"$setOnInsert": party_data},
-            upsert=True,
+        party_db_id, created = upsert_party_doc(
+            party_data, {"$or": [{"canonicalUrl": canonical}, {"goOutUrl": canonical}]}
         )
         carousel_info = None
         added_to_carousel = False
-        if res.matched_count == 1 and res.upserted_id is None:
-            doc = parties_collection.find_one(
-                {"$or": [{"canonicalUrl": canonical}, {"goOutUrl": canonical}]},
-                {"_id": 1}
-            )
+        if not created:
+            doc = {"_id": party_db_id} if party_db_id else None
             if doc and req.carouselName:
                 carousel_doc, added = ensure_carousel_contains_party(req.carouselName, doc.get("_id"))
                 if carousel_doc:
@@ -5382,8 +5354,8 @@ def add_party():
                 if carousel_info:
                     response_payload["carousel"] = carousel_info
                 return jsonify(response_payload), 200
-            return jsonify({"message": "This party has already been added.", "id": str(doc["_id"])}), 409
-        party_data["_id"] = str(res.upserted_id)
+            return jsonify({"message": "This party has already been added.", "id": party_db_id}), 409
+        party_data["_id"] = party_db_id
         event_view = normalize_event(party_data)
         notify_indexers([event_view.get("canonicalUrl")])
         trigger_revalidation(event_related_paths(event_view))
@@ -5429,7 +5401,10 @@ def clone_party():
          return jsonify({"message": "Source party not found."}), 404
 
     new_party = copy.deepcopy(source_doc)
-    new_party.pop("_id", None)
+    # A deliberate second listing of the same GoOut event — this marker is what
+    # keeps the Listing Guard from merging it back into its source as a duplicate.
+    new_party["cloneOf"] = str(new_party.pop("_id", "") or "")
+    new_party.pop("locks", None)
     
     new_party["slug"] = new_slug
     new_party["slugOverride"] = new_slug
@@ -5561,14 +5536,24 @@ def update_party(party_id):
             data["date"] = data["startsAt"]
         if not data:
             return jsonify({"message": "No valid fields provided."}), 400
-        result = parties_collection.update_one({"_id": obj_id}, {"$set": data})
+        # A field the admin really changed becomes theirs: the sync stops
+        # overwriting it (it used to be wiped by the next price scan within
+        # 30 minutes). Compared against the stored value because the admin
+        # form sends every field on every save.
+        existing_doc = parties_collection.find_one({"_id": obj_id}) or {}
+        new_locks = listings.locks_for_admin_edit(data, existing_doc)
+        update_ops = {"$set": data}
+        if new_locks:
+            update_ops["$addToSet"] = {"locks": {"$each": new_locks}}
+        result = parties_collection.update_one({"_id": obj_id}, update_ops)
         if result.matched_count == 0:
             return jsonify({"message": "Party not found."}), 404
+        _parties_cache.clear()
         updated_doc = parties_collection.find_one({"_id": obj_id}) or {}
         event_view = normalize_event(updated_doc)
         notify_indexers([event_view.get("canonicalUrl")])
         trigger_revalidation(event_related_paths(event_view))
-        record_admin_action("update_party", "party", party_id, {"fields": list(data.keys())})
+        record_admin_action("update_party", "party", party_id, {"fields": list(data.keys()), "locked": new_locks})
         return jsonify({"message": "Party updated successfully!"}), 200
     except ValidationError as ve:
         app.logger.warning(f"[VALIDATION] {ve}")
@@ -5619,7 +5604,11 @@ def get_parties():
         # Fetch with query — shared across concurrent identical requests, see
         # _fetch_parties_cached's module note (this used to be its own
         # uncached parties_collection.find() + settings_collection lookup).
-        cached_docs = _fetch_parties_cached(query)
+        include_hidden = (
+            str(request.args.get("includeHidden") or "").lower() in {"1", "true", "yes", "on"}
+            and _request_is_trusted()
+        )
+        cached_docs = _fetch_parties_cached(query, include_hidden=include_hidden)
 
         # Iterate and apply Python-side Date logic (Cleaning/Upcoming/Date Match).
         # cached_docs is shared across requests/threads — read-only here.
@@ -5991,12 +5980,11 @@ def ensure_party_for_url(event_url: str, referral: str | None) -> tuple[dict | N
     apply_default_referral(party_data, referral)
     party_data.setdefault("slug", slugify_value(party_data.get("name")))
     try:
-        result = parties_collection.update_one(query, {"$setOnInsert": party_data}, upsert=True)
+        upserted_id, created = upsert_party_doc(party_data, query)
     except Exception as exc:
         app.logger.error(f"Failed to upsert party from {event_url}: {exc}")
         raise
-    upserted_id = getattr(result, "upserted_id", None)
-    if upserted_id is None:
+    if not created:
         try:
             existing = parties_collection.find_one(query)
         except Exception as exc:
@@ -6207,47 +6195,6 @@ def update_carousel_parties(carousel_id):
         )
     except Exception as e:
         return jsonify({"message": "Error updating carousel parties", "error": str(e)}), 500
-
-
-@app.route("/api/admin/reclassify-geo", methods=["POST"])
-@protect
-def reclassify_geo():
-    """Recompute `region` + `areas` for every stored party from its saved text.
-    The scheduled price scan does this incrementally, but this gives an
-    immediate full pass (e.g. right after deploying a classifier change).
-    Only writes when a value actually changes; never clears an existing value."""
-    if parties_collection is None:
-        return jsonify({"message": "DB unavailable"}), 503
-    checked = updated = 0
-    changed_ids = []
-    try:
-        for party in parties_collection.find({}, {"name": 1, "description": 1, "location": 1,
-                                                  "region": 1, "areas": 1}):
-            checked += 1
-            loc = party.get("location") or ""
-            changes = {}
-            new_region = get_region(loc)
-            if new_region != "לא ידוע" and new_region != party.get("region"):
-                changes["region"] = new_region
-            try:
-                new_areas = classify_party_data(
-                    party.get("name") or "", party.get("description") or "", loc
-                ).get("areas", [])
-            except Exception:
-                new_areas = []
-            if new_areas and sorted(new_areas) != sorted(party.get("areas") or []):
-                changes["areas"] = new_areas
-            if changes:
-                parties_collection.update_one({"_id": party["_id"]}, {"$set": changes})
-                updated += 1
-                if len(changed_ids) < 50:
-                    changed_ids.append({"id": str(party["_id"]), **changes})
-        record_admin_action("reclassify_geo", "party", None, {"checked": checked, "updated": updated})
-        return jsonify({"message": "Reclassified", "checked": checked, "updated": updated,
-                        "sample": changed_ids}), 200
-    except Exception as e:
-        return jsonify({"message": "Error during reclassify", "error": str(e),
-                        "checked": checked, "updated": updated}), 500
 
 
 @app.route("/api/admin/carousels/<carousel_id>", methods=["DELETE"])
@@ -7035,48 +6982,43 @@ def goout_list_pending():
         return jsonify({"message": str(exc)}), 500
 
 
+def _approve_pending(pending_id: str, edits: dict | None = None):
+    """Shared by the admin and service-token approve / edit-approve routes.
+    Returns (response, status, party_db_id, party_data)."""
+    if goout_pending_collection is None or parties_collection is None:
+        return jsonify({"message": "Database unavailable."}), 503, None, None
+    try:
+        doc = goout_pending_collection.find_one({"_id": ObjectId(pending_id)})
+    except Exception:
+        return jsonify({"message": "Invalid ID."}), 400, None, None
+    if not doc or doc.get("status") != "pending":
+        return jsonify({"message": "Not found or already processed."}), 404, None, None
+
+    party_data = {**doc.get("party_data", {}), **(edits or {})}
+    party_data.setdefault("slug", slugify_party(party_data.get("name"), party_data.get("date")))
+    try:
+        party_db_id, _created = upsert_party_doc(party_data)
+        pending_update = {"status": "approved", "approved_at": datetime.now(timezone.utc)}
+        if edits is not None:
+            pending_update["party_data"] = party_data
+        goout_pending_collection.update_one({"_id": ObjectId(pending_id)}, {"$set": pending_update})
+        event_view = normalize_event(party_data)
+        notify_indexers([event_view.get("canonicalUrl")])
+        trigger_revalidation(event_related_paths(event_view))
+        message = "Party edited and approved." if edits is not None else "Party approved and added."
+        return jsonify({"message": message, "party_db_id": party_db_id}), 200, party_db_id, party_data
+    except Exception as exc:
+        return jsonify({"message": str(exc)}), 500, None, None
+
+
 @app.route("/api/admin/goout/approve/<pending_id>", methods=["POST"])
 @protect
 def goout_approve(pending_id):
     """Approve a pending Go-Out party."""
-    if goout_pending_collection is None or parties_collection is None:
-        return jsonify({"message": "Database unavailable."}), 503
-    try:
-        doc = goout_pending_collection.find_one({"_id": ObjectId(pending_id)})
-    except Exception:
-        return jsonify({"message": "Invalid ID."}), 400
-    if not doc or doc.get("status") != "pending":
-        return jsonify({"message": "Not found or already processed."}), 404
-
-    party_data = doc.get("party_data", {})
-    party_data.setdefault("slug", slugify_party(party_data.get("name"), party_data.get("date")))
-    canonical = party_data.get("canonicalUrl")
-    go_out_url = party_data.get("goOutUrl")
-    or_clauses = []
-    if canonical:
-        or_clauses.append({"canonicalUrl": canonical})
-    if go_out_url:
-        or_clauses.append({"goOutUrl": go_out_url})
-    query = {"$or": or_clauses} if or_clauses else {"name": party_data.get("name")}
-
-    try:
-        result = parties_collection.update_one(query, {"$setOnInsert": party_data}, upsert=True)
-        party_db_id = str(result.upserted_id) if result.upserted_id else None
-        if not party_db_id:
-            existing = parties_collection.find_one(query, {"_id": 1})
-            if existing:
-                party_db_id = str(existing["_id"])
-        goout_pending_collection.update_one(
-            {"_id": ObjectId(pending_id)},
-            {"$set": {"status": "approved", "approved_at": datetime.now(timezone.utc)}},
-        )
-        event_view = normalize_event(party_data)
-        notify_indexers([event_view.get("canonicalUrl")])
-        trigger_revalidation(event_related_paths(event_view))
+    response, status, party_db_id, party_data = _approve_pending(pending_id)
+    if status == 200:
         record_admin_action("goout_approve", "goout_pending", pending_id, {"partyDbId": party_db_id, "name": party_data.get("name")})
-        return jsonify({"message": "Party approved and added.", "party_db_id": party_db_id}), 200
-    except Exception as exc:
-        return jsonify({"message": str(exc)}), 500
+    return response, status
 
 
 @app.route("/api/admin/goout/reject/<pending_id>", methods=["POST"])
@@ -7102,46 +7044,11 @@ def goout_reject(pending_id):
 @protect
 def goout_edit_approve(pending_id):
     """Edit fields then approve a pending Go-Out party."""
-    if goout_pending_collection is None or parties_collection is None:
-        return jsonify({"message": "Database unavailable."}), 503
-    data = request.get_json(silent=True) or {}
-    edits: dict = data.get("edits", {})
-    try:
-        doc = goout_pending_collection.find_one({"_id": ObjectId(pending_id)})
-    except Exception:
-        return jsonify({"message": "Invalid ID."}), 400
-    if not doc or doc.get("status") != "pending":
-        return jsonify({"message": "Not found or already processed."}), 404
-
-    party_data = {**doc.get("party_data", {}), **edits}
-    party_data.setdefault("slug", slugify_party(party_data.get("name"), party_data.get("date")))
-    canonical = party_data.get("canonicalUrl")
-    go_out_url = party_data.get("goOutUrl")
-    or_clauses = []
-    if canonical:
-        or_clauses.append({"canonicalUrl": canonical})
-    if go_out_url:
-        or_clauses.append({"goOutUrl": go_out_url})
-    query = {"$or": or_clauses} if or_clauses else {"name": party_data.get("name")}
-
-    try:
-        result = parties_collection.update_one(query, {"$setOnInsert": party_data}, upsert=True)
-        party_db_id = str(result.upserted_id) if result.upserted_id else None
-        if not party_db_id:
-            existing = parties_collection.find_one(query, {"_id": 1})
-            if existing:
-                party_db_id = str(existing["_id"])
-        goout_pending_collection.update_one(
-            {"_id": ObjectId(pending_id)},
-            {"$set": {"status": "approved", "approved_at": datetime.now(timezone.utc), "party_data": party_data}},
-        )
-        event_view = normalize_event(party_data)
-        notify_indexers([event_view.get("canonicalUrl")])
-        trigger_revalidation(event_related_paths(event_view))
+    edits: dict = (request.get_json(silent=True) or {}).get("edits", {})
+    response, status, party_db_id, party_data = _approve_pending(pending_id, edits)
+    if status == 200:
         record_admin_action("goout_edit_approve", "goout_pending", pending_id, {"partyDbId": party_db_id, "name": party_data.get("name"), "editedFields": list(edits.keys())})
-        return jsonify({"message": "Party edited and approved.", "party_db_id": party_db_id}), 200
-    except Exception as exc:
-        return jsonify({"message": str(exc)}), 500
+    return response, status
 
 
 # --- WhatsApp engine: admin endpoints ---
@@ -8211,43 +8118,8 @@ def internal_scrape_party():
 def internal_goout_approve(pending_id):
     if not _check_service_token():
         return jsonify({"message": "Unauthorized."}), 401
-    if goout_pending_collection is None or parties_collection is None:
-        return jsonify({"message": "Database unavailable."}), 503
-    try:
-        doc = goout_pending_collection.find_one({"_id": ObjectId(pending_id)})
-    except Exception:
-        return jsonify({"message": "Invalid ID."}), 400
-    if not doc or doc.get("status") != "pending":
-        return jsonify({"message": "Not found or already processed."}), 404
-
-    party_data = doc.get("party_data", {})
-    party_data.setdefault("slug", slugify_party(party_data.get("name"), party_data.get("date")))
-    canonical = party_data.get("canonicalUrl")
-    go_out_url = party_data.get("goOutUrl")
-    or_clauses = []
-    if canonical:
-        or_clauses.append({"canonicalUrl": canonical})
-    if go_out_url:
-        or_clauses.append({"goOutUrl": go_out_url})
-    query = {"$or": or_clauses} if or_clauses else {"name": party_data.get("name")}
-
-    try:
-        result = parties_collection.update_one(query, {"$setOnInsert": party_data}, upsert=True)
-        party_db_id = str(result.upserted_id) if result.upserted_id else None
-        if not party_db_id:
-            existing = parties_collection.find_one(query, {"_id": 1})
-            if existing:
-                party_db_id = str(existing["_id"])
-        goout_pending_collection.update_one(
-            {"_id": ObjectId(pending_id)},
-            {"$set": {"status": "approved", "approved_at": datetime.now(timezone.utc)}},
-        )
-        event_view = normalize_event(party_data)
-        notify_indexers([event_view.get("canonicalUrl")])
-        trigger_revalidation(event_related_paths(event_view))
-        return jsonify({"message": "Party approved and added.", "party_db_id": party_db_id}), 200
-    except Exception as exc:
-        return jsonify({"message": str(exc)}), 500
+    response, status, _party_db_id, _party_data = _approve_pending(pending_id)
+    return response, status
 
 
 @app.route("/api/internal/goout/reject/<pending_id>", methods=["POST"])
@@ -8272,45 +8144,649 @@ def internal_goout_reject(pending_id):
 def internal_goout_edit_approve(pending_id):
     if not _check_service_token():
         return jsonify({"message": "Unauthorized."}), 401
-    if goout_pending_collection is None or parties_collection is None:
+    edits: dict = (request.get_json(silent=True) or {}).get("edits", {})
+    response, status, _party_db_id, _party_data = _approve_pending(pending_id, edits)
+    return response, status
+
+
+# ===================================================================
+# Listing Guard — sync, audit, review queue
+# ===================================================================
+#
+# One pipeline owns what every listing says (see listings.py for the rules):
+#   goout-scraper VM (listing_sync.py) fetches raw GoOut data and posts it to
+#   /api/internal/listings/sync   -> source snapshot, price, display fields
+#   /api/internal/listings/audit  -> duplicates + everything that needs a person
+#   /api/admin/listings/*         -> the admin "Issues" page
+# Replaces scheduled_price_scan, scheduled_content_refresh, reclassify-geo and
+# goout-scraper's dedupe_parties.py.
+
+_LISTING_TARGET_PROJECTION = {
+    "name": 1, "slug": 1, "date": 1, "startsAt": 1, "canonicalUrl": 1, "goOutUrl": 1,
+    "originalUrl": 1, "listingStatus": 1, "statusReason": 1,
+    "source.goOutUrlId": 1, "source.fetchedAt": 1,
+}
+_LISTING_CARD_FIELDS = (
+    "name", "slug", "date", "location", "imageUrl", "referralCode", "ticketPrice",
+    "soldOut", "priceInfo", "listingStatus", "statusReason", "mergedInto", "locks",
+    "goOutEventId", "canonicalUrl",
+)
+
+
+def _local_now() -> datetime:
+    """Israel wall-clock, naive — the same frame GoOut's own dates are in."""
+    return datetime.now(JERUSALEM_TZ).replace(tzinfo=None)
+
+
+def _upcoming_date_floor() -> str:
+    return (_local_now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def _goout_url_id(party: dict) -> str | None:
+    stored = (party.get("source") or {}).get("goOutUrlId")
+    if stored:
+        return stored
+    url = party.get("canonicalUrl") or party.get("goOutUrl") or party.get("originalUrl") or ""
+    match = re.search(r"/event/([^/?#]+)", url)
+    return match.group(1) if match else None
+
+
+def _log_listing_changes(rows: list[dict]):
+    if not rows or listing_changes_collection is None:
+        return
+    try:
+        listing_changes_collection.insert_many(rows)
+    except Exception as exc:
+        app.logger.warning(f"[LISTING] could not log changes: {exc}")
+
+
+def _revalidate_parties(parties: list[dict]):
+    paths: set[str] = set()
+    for party in parties:
+        try:
+            paths.update(event_related_paths(normalize_event(party)))
+        except Exception:
+            continue
+    if paths:
+        trigger_revalidation(sorted(paths)[:300])
+
+
+def compute_listing_sync(party: dict, item: dict, zero_rules: dict, now_iso: str) -> dict:
+    """What one sync item changes on one party. Pure apart from reading the
+    classifiers — returns {"set": {...}, "changes": {field: [old, new]}}."""
+    source = dict(party.get("source") or {})
+
+    event = item.get("event")
+    if isinstance(event, dict) and event:
+        fresh = listings.parse_source(event, None, item.get("ogImage"), now_iso)
+        for key in ("tiers", "tiersFetchedAt", "tiersFailCount"):
+            if key in source:
+                fresh[key] = source[key]
+        source = fresh
+        source["failCount"] = 0
+        source["pageStatus"] = 200
+    elif item.get("pageStatus") is not None:
+        source["failCount"] = int(source.get("failCount") or 0) + 1
+        source["pageStatus"] = item.get("pageStatus")
+
+    if "tiers" in item:
+        parsed = listings.parse_tiers(item.get("tiers"))
+        if parsed is not None:
+            source["tiers"] = parsed
+            source["tiersFetchedAt"] = now_iso
+            source["tiersFailCount"] = 0
+        else:
+            source["tiersFailCount"] = int(source.get("tiersFailCount") or 0) + 1
+
+    previous = party.get("priceInfo") or {}
+    if "tiers" in source:
+        price_info = listings.compute_price_info(source["tiers"], zero_rules, previous)
+        # Stale tiers are still better than nothing for a couple of runs; after
+        # that stop vouching for the price (it stays as last seen, flagged).
+        if int(source.get("tiersFailCount") or 0) >= 3:
+            price_info["verified"] = False
+    else:
+        price_info = listings.compute_price_info(None, zero_rules, previous)
+
+    desired = build_listing_fields(source, price_info) if source.get("title") else {
+        key: value for key, value in listings.derive_fields(source, price_info).items()
+        if key in ("ticketPrice", "soldOut")
+    }
+    field_changes = listings.diff_fields(desired, party)
+    set_doc: dict = {**field_changes, "source": source, "priceInfo": price_info}
+    changes = {field: [party.get(field), new] for field, new in field_changes.items()}
+
+    status = listings.desired_status(source, party) if source.get("title") else None
+    if status:
+        set_doc["listingStatus"] = status[0]
+        set_doc["statusReason"] = status[1]
+        changes["listingStatus"] = [party.get("listingStatus") or "live", status[0]]
+    return {"set": set_doc, "changes": changes}
+
+
+def apply_listing_sync(items: list[dict], dry_run: bool = False) -> dict:
+    ids = []
+    for item in items:
+        try:
+            ids.append(ObjectId(str(item.get("partyId"))))
+        except Exception:
+            continue
+    parties = {str(doc["_id"]): doc for doc in parties_collection.find({"_id": {"$in": ids}})}
+    zero_rules = _zero_tier_rules()
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+
+    operations, change_rows, results, touched = [], [], [], []
+    for item in items:
+        pid = str(item.get("partyId"))
+        party = parties.get(pid)
+        if not party:
+            results.append({"partyId": pid, "status": "not_found"})
+            continue
+        outcome = compute_listing_sync(party, item, zero_rules, now_iso)
+        results.append({"partyId": pid, "name": party.get("name"), "changes": outcome["changes"]})
+        operations.append(UpdateOne({"_id": party["_id"]}, {"$set": outcome["set"]}))
+        if outcome["changes"]:
+            touched.append({**party, **outcome["set"]})
+            for field, (old, new) in outcome["changes"].items():
+                change_rows.append({"partyId": pid, "partyName": outcome["set"].get("name") or party.get("name"),
+                                    "field": field, "old": old, "new": new, "at": now, "reason": "sync"})
+
+    changed = sum(1 for row in results if row.get("changes"))
+    if not dry_run and operations:
+        parties_collection.bulk_write(operations, ordered=False)
+        _log_listing_changes(change_rows)
+        if touched:
+            _parties_cache.clear()
+            _revalidate_parties(touched)
+    return {"synced": len(operations), "changed": changed, "dryRun": dry_run, "results": results}
+
+
+@app.route("/api/internal/listings/targets", methods=["GET"])
+def listing_sync_targets():
+    """Upcoming parties the VM should fetch from GoOut (hidden ones too — a
+    private event that goes public has to be able to come back)."""
+    if not _check_service_token():
+        return jsonify({"message": "Unauthorized."}), 401
+    if parties_collection is None:
+        return jsonify({"message": "Database unavailable."}), 503
+    floor = _upcoming_date_floor()
+    targets = []
+    for party in parties_collection.find({"date": {"$gte": floor}}, _LISTING_TARGET_PROJECTION):
+        if party.get("listingStatus") == "merged":
+            continue
+        url = party.get("canonicalUrl") or party.get("goOutUrl") or party.get("originalUrl")
+        if not url:
+            continue
+        targets.append({
+            "partyId": str(party["_id"]),
+            "slug": party.get("slug") or "",
+            "name": party.get("name"),
+            "url": url,
+            "urlId": _goout_url_id(party),
+            "listingStatus": party.get("listingStatus") or "live",
+            "hasSource": bool((party.get("source") or {}).get("fetchedAt")),
+        })
+    state = _listing_guard_state()
+    full_requested = bool(state.get("fullSyncRequestedAt")) and (
+        state.get("fullSyncRequestedAt") > (state.get("lastFullSyncAt") or "")
+    )
+    return jsonify({"targets": targets, "fullRequested": full_requested}), 200
+
+
+@app.route("/api/internal/listings/sync", methods=["POST"])
+def listing_sync():
+    if not _check_service_token():
+        return jsonify({"message": "Unauthorized."}), 401
+    if parties_collection is None:
         return jsonify({"message": "Database unavailable."}), 503
     data = request.get_json(silent=True) or {}
-    edits: dict = data.get("edits", {})
+    items = data.get("items") or []
+    if not isinstance(items, list) or len(items) > 60:
+        return jsonify({"message": "items must be a list of at most 60."}), 400
+    dry_run = bool(data.get("dryRun"))
     try:
-        doc = goout_pending_collection.find_one({"_id": ObjectId(pending_id)})
+        result = apply_listing_sync(items, dry_run=dry_run)
+        if data.get("fullDone") and not dry_run:
+            _set_listing_guard_state(lastFullSyncAt=datetime.now(timezone.utc).isoformat())
+        return jsonify(result), 200
+    except Exception as exc:
+        app.logger.error(f"[LISTING] sync failed: {exc}")
+        return jsonify({"message": str(exc)}), 500
+
+
+def merge_listing(loser: dict, keeper: dict, reason: str):
+    """Fold a duplicate into its keeper: the loser stops being listed and its
+    URL 308s to the keeper (party_redirects, read by the website's proxy.ts).
+    Nothing is deleted, so sales history stays joined and the merge can be
+    undone from the admin."""
+    now = datetime.now(timezone.utc)
+    parties_collection.update_one(
+        {"_id": loser["_id"]},
+        {"$set": {"listingStatus": "merged", "statusReason": reason,
+                  "mergedInto": str(keeper["_id"]), "statusAt": now}},
+    )
+    loser_slug, keeper_slug = loser.get("slug"), keeper.get("slug")
+    if loser_slug and keeper_slug and loser_slug != keeper_slug and party_redirects_collection is not None:
+        try:
+            party_redirects_collection.update_one(
+                {"fromSlug": loser_slug},
+                {"$set": {"fromSlug": loser_slug, "toSlug": keeper_slug, "createdAt": datetime.utcnow()}},
+                upsert=True,
+            )
+        except Exception as exc:
+            app.logger.warning(f"Failed to record party redirect {loser_slug} -> {keeper_slug}: {exc}")
+    _log_listing_changes([{
+        "partyId": str(loser["_id"]), "partyName": loser.get("name"), "field": "listingStatus",
+        "old": loser.get("listingStatus") or "live", "new": "merged", "at": now,
+        "reason": f"merged into {keeper.get('name')} ({reason})",
+    }])
+    _parties_cache.clear()
+    _revalidate_parties([loser, keeper])
+
+
+def _revenue_by_party_id(parties: list[dict]) -> dict[str, float]:
+    try:
+        totals = _sales_totals_by_event_id()
+    except Exception as exc:
+        app.logger.warning(f"[LISTING] revenue lookup failed: {exc}")
+        return {}
+    revenue = {}
+    for party in parties:
+        event_id = party.get("goOutEventId")
+        if event_id and str(event_id) in totals:
+            revenue[str(party["_id"])] = float(totals[str(event_id)].get("totalRevenue") or 0.0)
+    return revenue
+
+
+def run_listing_audit(account1_referral: str | None, site_checks: list[dict], dry_run: bool = False) -> dict:
+    now_local = _local_now()
+    now = datetime.now(timezone.utc)
+    docs = list(parties_collection.find({"date": {"$gte": _upcoming_date_floor()}}))
+    live = [p for p in docs if not listings.is_hidden(p) and listings.is_upcoming(p, now_local)]
+    by_id = {str(p["_id"]): p for p in live}
+
+    detected: list[dict] = []
+    for party in live:
+        detected.extend(listings.detect_party_issues(party, now_local))
+    # The site check runs right after a sync, and a page whose data just
+    # changed is still served from ISR / runtime cache for a while. Comparing
+    # those would fill the queue with mismatches that fix themselves.
+    just_changed: set[str] = set()
+    if site_checks and listing_changes_collection is not None:
+        try:
+            just_changed = {doc.get("partyId") for doc in listing_changes_collection.find(
+                {"at": {"$gte": now - timedelta(hours=2)}}, {"partyId": 1})}
+        except Exception as exc:
+            app.logger.warning(f"[LISTING] could not load recent changes: {exc}")
+    for check in site_checks or []:
+        party = by_id.get(str(check.get("partyId")))
+        if party and str(party["_id"]) not in just_changed:
+            detected.extend(listings.detect_site_issues(party, check))
+
+    series_rules, decided = {}, set()
+    if listing_rules_collection is not None:
+        series_rules = {doc["key"]: doc.get("decision") for doc in listing_rules_collection.find({"kind": "series"})}
+    if listing_issues_collection is not None:
+        decided = {doc["fingerprint"] for doc in listing_issues_collection.find(
+            {"status": {"$in": ["resolved", "ignored"]}, "type": "duplicate"}, {"fingerprint": 1})}
+
+    plan = listings.plan_duplicates(
+        listings.find_duplicate_pairs(live), account1_referral,
+        _revenue_by_party_id(live), series_rules, decided,
+    )
+    detected.extend(plan["issues"])
+
+    # One open question per fingerprint (the global ₪0-tier question is raised
+    # by every party that has that tier).
+    unique: dict[str, dict] = {}
+    for issue in detected:
+        known = unique.setdefault(issue["fingerprint"], issue)
+        if known is not issue:
+            known["partyIds"] = sorted(set(known["partyIds"]) | set(issue["partyIds"]))
+
+    merges = [{**merge, "keeper": by_id[merge["keeperId"]].get("name"),
+               "loser": by_id[merge["loserId"]].get("name")} for merge in plan["merges"]]
+    summary = {"dryRun": dry_run, "checked": len(live), "merges": merges,
+               "issues": list(unique.values()) if dry_run else None}
+    if dry_run or listing_issues_collection is None:
+        summary["waiting"] = len(unique)
+        return summary
+
+    for merge in merges:
+        merge_listing(by_id[merge["loserId"]], by_id[merge["keeperId"]], merge["reason"])
+        listing_issues_collection.update_one(
+            {"fingerprint": merge["fingerprint"]},
+            {"$set": {"type": "duplicate", "partyIds": [merge["keeperId"], merge["loserId"]],
+                      "summary": f"{merge['loser']} → {merge['keeper']}", "evidence": merge["evidence"],
+                      "status": "auto_fixed", "decision": {"decision": "keep", "keeperId": merge["keeperId"],
+                                                          "why": merge["reason"]},
+                      "lastSeen": now, "resolvedAt": now},
+             "$setOnInsert": {"firstSeen": now}},
+            upsert=True,
+        )
+
+    new_count = 0
+    for issue in unique.values():
+        result = listing_issues_collection.update_one(
+            {"fingerprint": issue["fingerprint"]},
+            {"$set": {"type": issue["type"], "partyIds": issue["partyIds"], "summary": issue["summary"],
+                      "evidence": issue.get("evidence") or {}, "suggestion": issue.get("suggestion"),
+                      "lastSeen": now},
+             "$setOnInsert": {"status": "open", "firstSeen": now}},
+            upsert=True,
+        )
+        if getattr(result, "upserted_id", None) is not None:
+            new_count += 1
+
+    # A question whose cause went away (promoter fixed the title, the party
+    # passed, sync caught up) closes itself instead of lingering in the queue.
+    cleared = listing_issues_collection.update_many(
+        {"status": "open", "fingerprint": {"$nin": list(unique.keys())}},
+        {"$set": {"status": "resolved", "decision": {"decision": "cleared"}, "resolvedAt": now}},
+    )
+    waiting = listing_issues_collection.count_documents({"status": "open"})
+    summary.update({"waiting": waiting, "new": new_count,
+                    "cleared": getattr(cleared, "modified_count", 0)})
+    _set_listing_guard_state(
+        account1Referral=account1_referral,
+        lastAudit={"at": now.isoformat(), "checked": len(live), "waiting": waiting, "new": new_count,
+                   "merged": len(merges), "siteChecked": len(site_checks or [])},
+    )
+    return summary
+
+
+@app.route("/api/internal/listings/audit", methods=["POST"])
+def listing_audit():
+    if not _check_service_token():
+        return jsonify({"message": "Unauthorized."}), 401
+    if parties_collection is None:
+        return jsonify({"message": "Database unavailable."}), 503
+    data = request.get_json(silent=True) or {}
+    try:
+        summary = run_listing_audit(
+            (data.get("account1Referral") or "").strip() or _listing_guard_state().get("account1Referral"),
+            data.get("siteChecks") or [],
+            dry_run=bool(data.get("dryRun")),
+        )
+        return jsonify(summary), 200
+    except Exception as exc:
+        app.logger.error(f"[LISTING] audit failed: {exc}")
+        return jsonify({"message": str(exc)}), 500
+
+
+def _listing_card(party: dict, account1_referral: str | None, revenue: dict) -> dict:
+    source = party.get("source") or {}
+    card = {field: party.get(field) for field in _LISTING_CARD_FIELDS}
+    card["id"] = str(party["_id"])
+    card["account"] = "account1" if account1_referral and party.get("referralCode") == account1_referral else "account2"
+    card["commission"] = round(revenue.get(str(party["_id"]), 0.0), 2)
+    card["source"] = {key: source.get(key) for key in (
+        "title", "startsAt", "address", "englishAddress", "producersName", "publicity", "tiers", "fetchedAt")}
+    return card
+
+
+@app.route("/api/admin/listings/issues", methods=["GET"])
+@limiter.limit("60 per minute")
+@protect
+def list_listing_issues():
+    if listing_issues_collection is None or parties_collection is None:
+        return jsonify({"message": "Database unavailable."}), 503
+    status = request.args.get("status") or "open"
+    query = {} if status == "all" else {"status": status}
+    issues = list(listing_issues_collection.find(query).sort("lastSeen", -1).limit(200))
+    party_ids = set()
+    for issue in issues:
+        party_ids.update(issue.get("partyIds") or [])
+    lookup = []
+    for pid in party_ids:
+        try:
+            lookup.append(ObjectId(pid))
+        except Exception:
+            continue
+    parties = list(parties_collection.find({"_id": {"$in": lookup}})) if lookup else []
+    state = _listing_guard_state()
+    revenue = _revenue_by_party_id(parties)
+    cards = {str(p["_id"]): _listing_card(p, state.get("account1Referral"), revenue) for p in parties}
+    payload = []
+    for issue in issues:
+        payload.append({
+            "id": str(issue["_id"]),
+            "type": issue.get("type"),
+            "status": issue.get("status"),
+            "summary": issue.get("summary"),
+            "evidence": issue.get("evidence") or {},
+            "suggestion": issue.get("suggestion"),
+            "decision": issue.get("decision"),
+            "firstSeen": isoformat_or_none(issue.get("firstSeen")),
+            "lastSeen": isoformat_or_none(issue.get("lastSeen")),
+            "parties": [cards[pid] for pid in issue.get("partyIds") or [] if pid in cards],
+        })
+    return jsonify({
+        "issues": payload,
+        "waiting": listing_issues_collection.count_documents({"status": "open"}),
+        "lastAudit": state.get("lastAudit"),
+    }), 200
+
+
+def _remember_rule(kind: str, key: str | None, decision: str):
+    if not key or listing_rules_collection is None:
+        return
+    listing_rules_collection.update_one(
+        {"kind": kind, "key": key},
+        {"$set": {"kind": kind, "key": key, "decision": decision, "updatedAt": datetime.now(timezone.utc)}},
+        upsert=True,
+    )
+
+
+def _lock_fields(party_id, fields: list[str]):
+    if fields:
+        parties_collection.update_one({"_id": party_id}, {"$addToSet": {"locks": {"$each": fields}}})
+
+
+@app.route("/api/admin/listings/issues/<issue_id>/resolve", methods=["POST"])
+@limiter.limit("60 per minute")
+@protect
+def resolve_listing_issue(issue_id):
+    """Record the owner's answer to one issue and act on it.
+
+    Body by issue type:
+      duplicate       {"decision": "keep", "keeperId": "...", "remember": bool}
+                      {"decision": "different", "remember": bool}
+      zero_tier       {"decision": "free" | "not_free"}
+      location_vague  {"decision": "set", "location": "..."}
+      anything        {"decision": "ignore"}  |  {"decision": "hide"}
+    """
+    if listing_issues_collection is None or parties_collection is None:
+        return jsonify({"message": "Database unavailable."}), 503
+    try:
+        issue = listing_issues_collection.find_one({"_id": ObjectId(issue_id)})
     except Exception:
         return jsonify({"message": "Invalid ID."}), 400
-    if not doc or doc.get("status") != "pending":
-        return jsonify({"message": "Not found or already processed."}), 404
+    if not issue:
+        return jsonify({"message": "Issue not found."}), 404
+    data = request.get_json(silent=True) or {}
+    decision = str(data.get("decision") or "")
+    now = datetime.now(timezone.utc)
+    status = "resolved"
 
-    party_data = {**doc.get("party_data", {}), **edits}
-    party_data.setdefault("slug", slugify_party(party_data.get("name"), party_data.get("date")))
-    canonical = party_data.get("canonicalUrl")
-    go_out_url = party_data.get("goOutUrl")
-    or_clauses = []
-    if canonical:
-        or_clauses.append({"canonicalUrl": canonical})
-    if go_out_url:
-        or_clauses.append({"goOutUrl": go_out_url})
-    query = {"$or": or_clauses} if or_clauses else {"name": party_data.get("name")}
+    parties = []
+    for pid in issue.get("partyIds") or []:
+        try:
+            doc = parties_collection.find_one({"_id": ObjectId(pid)})
+        except Exception:
+            doc = None
+        if doc:
+            parties.append(doc)
 
     try:
-        result = parties_collection.update_one(query, {"$setOnInsert": party_data}, upsert=True)
-        party_db_id = str(result.upserted_id) if result.upserted_id else None
-        if not party_db_id:
-            existing = parties_collection.find_one(query, {"_id": 1})
-            if existing:
-                party_db_id = str(existing["_id"])
-        goout_pending_collection.update_one(
-            {"_id": ObjectId(pending_id)},
-            {"$set": {"status": "approved", "approved_at": datetime.now(timezone.utc), "party_data": party_data}},
-        )
-        event_view = normalize_event(party_data)
-        notify_indexers([event_view.get("canonicalUrl")])
-        trigger_revalidation(event_related_paths(event_view))
-        return jsonify({"message": "Party edited and approved.", "party_db_id": party_db_id}), 200
+        if decision == "ignore":
+            status = "ignored"
+        elif decision == "hide":
+            for party in parties:
+                parties_collection.update_one({"_id": party["_id"]}, {"$set": {
+                    "listingStatus": "hidden", "statusReason": "admin", "statusAt": now}})
+                _lock_fields(party["_id"], ["listingStatus"])
+            _parties_cache.clear()
+            _revalidate_parties(parties)
+        elif issue.get("type") == "duplicate" and decision in ("keep", "different"):
+            series_key = (issue.get("evidence") or {}).get("seriesKey")
+            if decision == "keep":
+                keeper = next((p for p in parties if str(p["_id"]) == str(data.get("keeperId"))), None)
+                if keeper is None or len(parties) != 2:
+                    return jsonify({"message": "keeperId must be one of the two parties."}), 400
+                loser = next(p for p in parties if p is not keeper)
+                merge_listing(loser, keeper, "admin")
+                if data.get("remember"):
+                    _remember_rule("series", series_key, "same")
+            elif data.get("remember"):
+                _remember_rule("series", series_key, "different")
+        elif issue.get("type") == "zero_tier" and decision in ("free", "not_free"):
+            _remember_rule("zero_tier", (issue.get("evidence") or {}).get("tierKey"),
+                           "free" if decision == "free" else "ignore")
+        elif issue.get("type") == "location_vague" and decision == "set":
+            location = str(data.get("location") or "").strip()
+            if not location:
+                return jsonify({"message": "location is required."}), 400
+            for party in parties:
+                changes = {"location": location}
+                region = get_region(location)
+                if region != "לא ידוע":
+                    changes["region"] = region
+                areas = classify_party_data(party.get("name") or "", "", location).get("areas")
+                if areas:
+                    changes["areas"] = areas
+                parties_collection.update_one({"_id": party["_id"]}, {"$set": changes})
+                _lock_fields(party["_id"], list(changes.keys()))
+            _parties_cache.clear()
+            _revalidate_parties(parties)
+        else:
+            return jsonify({"message": f"Unsupported decision '{decision}' for {issue.get('type')}."}), 400
     except Exception as exc:
+        app.logger.error(f"[LISTING] resolve failed for {issue_id}: {exc}")
         return jsonify({"message": str(exc)}), 500
+
+    listing_issues_collection.update_one(
+        {"_id": issue["_id"]},
+        {"$set": {"status": status, "resolvedAt": now,
+                  "decision": {k: data.get(k) for k in ("decision", "keeperId", "remember", "location") if k in data}}},
+    )
+    record_admin_action("resolve_listing_issue", "listing_issue", issue_id,
+                        {"type": issue.get("type"), "decision": decision, "summary": issue.get("summary")})
+    return jsonify({"message": "Issue resolved.", "status": status,
+                    "waiting": listing_issues_collection.count_documents({"status": "open"})}), 200
+
+
+@app.route("/api/admin/listings/changes", methods=["GET"])
+@limiter.limit("60 per minute")
+@protect
+def list_listing_changes():
+    """What the sync changed and why — the answer to "why does this party show
+    that price now?"."""
+    if listing_changes_collection is None:
+        return jsonify({"message": "Database unavailable."}), 503
+    hours = _int_arg("hours", 24, 1, 24 * 90)
+    query: dict = {"at": {"$gte": datetime.now(timezone.utc) - timedelta(hours=hours)}}
+    if request.args.get("partyId"):
+        query["partyId"] = request.args.get("partyId")
+    rows = []
+    for doc in listing_changes_collection.find(query).sort("at", -1).limit(300):
+        rows.append({
+            "partyId": doc.get("partyId"), "partyName": doc.get("partyName"), "field": doc.get("field"),
+            "old": doc.get("old"), "new": doc.get("new"), "reason": doc.get("reason"),
+            "at": isoformat_or_none(doc.get("at")),
+        })
+    return jsonify({"changes": rows}), 200
+
+
+@app.route("/api/admin/listings/hidden", methods=["GET"])
+@limiter.limit("60 per minute")
+@protect
+def list_hidden_listings():
+    """Upcoming parties that exist but aren't listed (private, merged, hidden by hand)."""
+    if parties_collection is None:
+        return jsonify({"message": "Database unavailable."}), 503
+    state = _listing_guard_state()
+    docs = list(parties_collection.find(
+        {"date": {"$gte": _upcoming_date_floor()}, "listingStatus": {"$in": list(listings.HIDDEN_STATUSES)}}
+    ).sort("date", 1))
+    return jsonify({"parties": [_listing_card(doc, state.get("account1Referral"), {}) for doc in docs]}), 200
+
+
+@app.route("/api/admin/listings/<party_id>/status", methods=["POST"])
+@limiter.limit("60 per minute")
+@protect
+def set_listing_status(party_id):
+    """Hide a party or bring one back (also the undo for a merge). A manual
+    choice is locked, so the private-event rule won't flip it back."""
+    data = request.get_json(silent=True) or {}
+    status = data.get("status")
+    if status not in ("live", "hidden"):
+        return jsonify({"message": "status must be 'live' or 'hidden'."}), 400
+    try:
+        obj_id = ObjectId(party_id)
+        party = parties_collection.find_one({"_id": obj_id})
+    except Exception:
+        return jsonify({"message": "Invalid ID."}), 400
+    if not party:
+        return jsonify({"message": "Party not found."}), 404
+    now = datetime.now(timezone.utc)
+    update = {"$set": {"listingStatus": status, "statusReason": "admin" if status == "hidden" else None,
+                       "statusAt": now},
+              "$addToSet": {"locks": "listingStatus"}}
+    if status == "live":
+        update["$unset"] = {"mergedInto": ""}
+        if party.get("slug") and party_redirects_collection is not None:
+            party_redirects_collection.delete_one({"fromSlug": party["slug"]})
+    parties_collection.update_one({"_id": obj_id}, update)
+    _log_listing_changes([{"partyId": party_id, "partyName": party.get("name"), "field": "listingStatus",
+                           "old": party.get("listingStatus") or "live", "new": status, "at": now, "reason": "admin"}])
+    _parties_cache.clear()
+    _revalidate_parties([party])
+    record_admin_action("set_listing_status", "party", party_id, {"status": status, "name": party.get("name")})
+    return jsonify({"message": f"Party is now {status}."}), 200
+
+
+@app.route("/api/admin/listings/<party_id>/unlock", methods=["POST"])
+@limiter.limit("60 per minute")
+@protect
+def unlock_listing_field(party_id):
+    """Hand a manually edited field back to the sync."""
+    field = (request.get_json(silent=True) or {}).get("field")
+    if field not in listings.LOCKABLE_FIELDS + ("listingStatus",):
+        return jsonify({"message": "Unknown field."}), 400
+    try:
+        result = parties_collection.update_one({"_id": ObjectId(party_id)}, {"$pull": {"locks": field}})
+    except Exception:
+        return jsonify({"message": "Invalid ID."}), 400
+    if result.matched_count == 0:
+        return jsonify({"message": "Party not found."}), 404
+    record_admin_action("unlock_listing_field", "party", party_id, {"field": field})
+    return jsonify({"message": f"{field} follows GoOut again from the next sync."}), 200
+
+
+@app.route("/api/admin/listings/<party_id>/resync", methods=["POST"])
+@limiter.limit("30 per minute")
+@protect
+def resync_listing(party_id):
+    """Re-read one party from GoOut right now (page + tiers), from this server."""
+    try:
+        party = parties_collection.find_one({"_id": ObjectId(party_id)})
+    except Exception:
+        return jsonify({"message": "Invalid ID."}), 400
+    if not party:
+        return jsonify({"message": "Party not found."}), 404
+    url = party.get("canonicalUrl") or party.get("goOutUrl") or party.get("originalUrl")
+    item: dict = {"partyId": party_id}
+    try:
+        event, og_image = fetch_goout_event(url)
+        item.update({"event": event, "ogImage": og_image})
+        item["tiers"] = fetch_goout_tiers(str(event.get("Url") or "") or _goout_url_id(party))
+    except Exception as exc:
+        return jsonify({"message": f"Could not read the GoOut page: {exc}"}), 502
+    result = apply_listing_sync([item])
+    record_admin_action("resync_listing", "party", party_id, {"name": party.get("name")})
+    return jsonify({"message": "Resynced.", "changes": (result["results"] or [{}])[0].get("changes", {})}), 200
 
 
 if __name__ == "__main__":

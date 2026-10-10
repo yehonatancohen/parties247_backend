@@ -108,6 +108,7 @@ def test_add_party_creates_carousel(monkeypatch):
     monkeypatch.setattr(app, "parties_collection", parties)
     monkeypatch.setattr(app, "carousels_collection", carousels)
     monkeypatch.setattr(app, "default_referral_code", lambda: "refcode")
+    monkeypatch.setattr(app, "is_url_allowed", lambda url: True)  # real one does a DNS lookup
     monkeypatch.setattr(app, "notify_indexers", lambda urls: None)
     monkeypatch.setattr(app, "trigger_revalidation", lambda paths: None)
     monkeypatch.setattr(
@@ -151,6 +152,7 @@ def test_add_party_existing_appends_to_carousel(monkeypatch):
     monkeypatch.setattr(app, "parties_collection", parties)
     monkeypatch.setattr(app, "carousels_collection", carousels)
     monkeypatch.setattr(app, "default_referral_code", lambda: "refcode")
+    monkeypatch.setattr(app, "is_url_allowed", lambda url: True)  # real one does a DNS lookup
     monkeypatch.setattr(app, "notify_indexers", lambda urls: None)
     monkeypatch.setattr(app, "trigger_revalidation", lambda paths: None)
     monkeypatch.setattr(

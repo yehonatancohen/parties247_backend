@@ -1640,12 +1640,19 @@ def serialize_events(include_past: bool = True) -> list[dict]:
     return serialized
 
 
-def find_event_by_slug(slug: str) -> tuple[dict | None, dict | None]:
-    """Return the normalized event and original document for the given slug."""
+def find_event_by_slug(slug: str, include_unlisted: bool = False) -> tuple[dict | None, dict | None]:
+    """Return the normalized event and original document for the given slug.
+
+    include_unlisted=True also finds a *hidden* party: hidden means "off every
+    list, no buy button", but its own page still opens for someone who has the
+    link (owner decision 2026-10-10). A merged party is never returned — its
+    slug redirects to the keeper."""
     if not slug:
         return None, None
     slug_key = slug.casefold()
-    docs = all_events()
+    docs = all_events(include_hidden=include_unlisted)
+    if include_unlisted:
+        docs = [doc for doc in docs if doc.get("listingStatus") != "merged"]
     for doc in docs:
         normalized = normalize_event(doc)
         candidates = {(normalized.get("slug") or "").casefold()}
@@ -5480,7 +5487,7 @@ def list_events_api():
 @app.route("/api/events/<slug>", methods=["GET"])
 @limiter.limit("100 per minute")
 def event_detail_api(slug: str):
-    event, original = find_event_by_slug(slug)
+    event, original = find_event_by_slug(slug, include_unlisted=True)
     if not event:
         return jsonify({"message": "Event not found."}), 404
 
@@ -5501,6 +5508,8 @@ def event_detail_api(slug: str):
     )
 
     event_payload = dict(event)
+    if listings.is_hidden(original or {}):
+        event_payload["listingStatus"] = "hidden"
     if purchase_url:
         event_payload["purchaseUrl"] = purchase_url
     original_url = original_copy.get("originalUrl")
@@ -5848,6 +5857,17 @@ def get_parties():
             and _request_is_trusted()
         )
         cached_docs = _fetch_parties_cached(query, include_hidden=include_hidden)
+
+        # ?slug=<slug>: the one party behind a direct link — also when it is
+        # hidden (off the lists, page still opens, no buy button). The site's
+        # event page falls back to this when the slug is not in the list.
+        slug_param = (request.args.get("slug") or "").strip()
+        if slug_param:
+            match = [
+                _public_party(party) for party in _fetch_parties_cached(query, include_hidden=True)
+                if party.get("slug") == slug_param and party.get("listingStatus") != "merged"
+            ]
+            return json_response(match[:1], cache_seconds=PARTIES_CACHE_TTL_SECONDS)
 
         # Iterate and apply Python-side Date logic (Cleaning/Upcoming/Date Match).
         # cached_docs is shared across requests/threads — read-only here.

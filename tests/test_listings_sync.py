@@ -326,3 +326,16 @@ def test_corrected_start_time_also_lands_in_starts_at():
     assert outcome["set"]["date"] == outcome["set"]["startsAt"] == EVENT["StartingDate"]
     locked = sync({**party, "locks": ["date"]}, {"partyId": "p1", "event": EVENT, "tiers": TIERS})
     assert "date" not in locked["set"] and "startsAt" not in locked["set"]
+
+
+def test_hidden_party_opens_by_direct_link_only_and_merged_never(monkeypatch):
+    monkeypatch.setattr(app, "all_events", lambda include_hidden=False: [
+        doc for doc in [
+            {"_id": "1", "name": "Live", "slug": "live"},
+            {"_id": "2", "name": "Private", "slug": "private", "listingStatus": "hidden"},
+            {"_id": "3", "name": "Dup", "slug": "dup", "listingStatus": "merged"},
+        ] if include_hidden or not app.listings.is_hidden(doc)])
+    assert app.find_event_by_slug("private")[1] is None
+    assert app.find_event_by_slug("private", include_unlisted=True)[1]["_id"] == "2"
+    assert app.find_event_by_slug("dup", include_unlisted=True)[1] is None
+    assert app.find_event_by_slug("live")[1]["_id"] == "1"

@@ -304,3 +304,33 @@ def test_site_render_check_compares_the_live_page_with_the_database():
     stale = listings.detect_site_issues(listed, {**ok, "price": "0"})
     assert stale[0]["evidence"] == {"price": {"site": 0.0, "db": 87.4}}
     assert listings.detect_site_issues(listed, {"status": 404})[0]["evidence"] == {"status": 404}
+
+
+# --- cases carried over from the scraper's retired dedupe_parties.py ---------
+
+def test_same_venue_same_hour_under_two_names_is_asked_not_merged():
+    a = party("1", "Organizer A presents: X", starts="2026-10-10T23:00:00.000")
+    b = party("2", "Completely Different Branding", starts="2026-10-10T23:45:00.000")
+    assert listings.pair_level(a, b)["level"] == "possible"
+    plan = listings.plan_duplicates(listings.find_duplicate_pairs([a, b]), A1)
+    assert plan["merges"] == [] and len(plan["issues"]) == 1
+
+
+def test_same_venue_hours_apart_is_not_a_duplicate():
+    a = party("1", "Party A", starts="2026-10-10T18:00:00.000")
+    b = party("2", "Other Event", starts="2026-10-10T23:30:00.000")
+    assert listings.pair_level(a, b) is None
+
+
+def test_same_brand_in_another_city_on_another_night_is_not_a_duplicate():
+    a = party("1", "THURSDAY MOON | MAINSTREAM | 06.10", starts="2026-10-10T23:00:00.000")
+    b = party("2", "THURSDAY MOON | MAINSTREAM | 6.10", starts="2026-10-10T02:30:00.000", lat=31.77, lng=35.21)
+    assert listings.pair_level(a, b) is None
+
+
+def test_test_events_and_absurd_prices_are_asked_about():
+    test_event = {"_id": "1", "goOutEventId": "100", "source": _source("TEST EVENT 123")}
+    assert [i["fingerprint"] for i in listings.detect_party_issues(test_event)] == ["test:100"]
+    pricey = {"_id": "2", "goOutEventId": "200", "source": _source("Gala 17.10"), "ticketPrice": 2500}
+    assert [i["type"] for i in listings.detect_party_issues(pricey)] == ["price_suspicious"]
+    assert listings.detect_party_issues({**pricey, "ticketPrice": 450}) == []

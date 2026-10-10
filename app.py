@@ -874,6 +874,16 @@ def find_party_for_analytics(party_id: str | None, party_slug: str | None) -> di
     return None
 
 
+# Fields build_analytics_summary reads. Without these it pulled every full party
+# document (descriptions, images...) over the slow Render<->Atlas link: ~20s per call.
+_SUMMARY_PARTY_PROJECTION = {"name": 1, "slug": 1, "date": 1, "startsAt": 1, "endsAt": 1}
+_SUMMARY_VISITOR_PROJECTION = {
+    "createdAt": 1, "trafficSource": 1, "referer": 1, "utm": 1, "deviceType": 1, "userAgent": 1,
+}
+# /api/analytics/recent only needs the name to label GoOut sales.
+_RECENT_PARTY_PROJECTION = {"name": 1, "goOutEventId": 1}
+
+
 def build_analytics_summary(window_hours: int = 24) -> dict:
     if (
         party_analytics_collection is None
@@ -887,7 +897,9 @@ def build_analytics_summary(window_hours: int = 24) -> dict:
 
     try:
         try:
-            visitor_docs = list(visitor_analytics_collection.find({"createdAt": {"$gte": visitor_cutoff}}))
+            visitor_docs = list(visitor_analytics_collection.find(
+                {"createdAt": {"$gte": visitor_cutoff}}, _SUMMARY_VISITOR_PROJECTION
+            ))
         except TypeError:  # pragma: no cover - compatibility with tests
             visitor_docs = list(visitor_analytics_collection.find())
     except Exception as exc:
@@ -914,7 +926,7 @@ def build_analytics_summary(window_hours: int = 24) -> dict:
 
     live_parties: list[dict] = []
     live_ids: set[str] = set()
-    for party in fetch_all_documents(parties_collection):
+    for party in fetch_all_documents(parties_collection, projection=_SUMMARY_PARTY_PROJECTION):
         if not isinstance(party, dict):
             continue
         party_identifier = party.get("_id")
@@ -1304,6 +1316,10 @@ def build_party_funnel(days: int = 30, real_month: str | None = None) -> dict:
     }
 
 
+_TIME_SERIES_VISITOR_PROJECTION = {"_id": 0, "createdAt": 1, "sessionId": 1}
+_TIME_SERIES_EVENT_PROJECTION = {"_id": 0, "createdAt": 1, "action": 1, "partyId": 1, "label": 1}
+
+
 def build_time_series_analytics(start: datetime, end: datetime, interval: str = "day", party_slug: str | None = None) -> list[dict]:
     """
     Build time-series analytics for visits, party views, and purchases.
@@ -1323,7 +1339,9 @@ def build_time_series_analytics(start: datetime, end: datetime, interval: str = 
     # Query visitor analytics for unique sessions (Visits)
     visitor_query = {"createdAt": {"$gte": start, "$lte": end}}
     try:
-        visitor_docs = list(visitor_analytics_collection.find(visitor_query))
+        # Only the bucket timestamp and session are read; full visitor docs
+        # (UA, referer, geo...) made the admin's 7d hourly call take seconds.
+        visitor_docs = list(visitor_analytics_collection.find(visitor_query, _TIME_SERIES_VISITOR_PROJECTION))
     except Exception as exc:
         app.logger.error(f"Failed to read visitor analytics: {exc}")
         raise
@@ -1337,7 +1355,7 @@ def build_time_series_analytics(start: datetime, end: datetime, interval: str = 
     }
     
     try:
-        party_events = list(analytics_collection.find(party_event_query))
+        party_events = list(analytics_collection.find(party_event_query, _TIME_SERIES_EVENT_PROJECTION))
     except Exception as exc:
         app.logger.error(f"Failed to read analytics events: {exc}")
         raise
@@ -1926,17 +1944,34 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 
+_BOT_UA_MARKERS = (
+    "bot", "crawl", "spider", "slurp", "lighthouse", "pagespeed", "headlesschrome",
+    "phantomjs", "puppeteer", "playwright", "prerender", "preview", "facebookexternalhit",
+    "python-requests", "python-urllib", "aiohttp", "httpx", "curl/", "wget", "go-http-client",
+    "okhttp", "axios", "node-fetch", "undici", "java/", "scrapy", "feedfetcher",
+)
+
+
+def _is_bot_user_agent(user_agent_str: str | None) -> bool:
+    if not user_agent_str:
+        return False
+    ua = user_agent_str.lower()
+    return any(k in ua for k in _BOT_UA_MARKERS)
+
+
 def _parse_device_type(user_agent_str: str | None) -> str:
     """Derive device type from User-Agent string."""
     if not user_agent_str:
         return "unknown"
     ua = user_agent_str.lower()
+    # Bots first: Googlebot Smartphone and friends carry "Android ... Mobile" too,
+    # and were being counted as real mobile visitors.
+    if _is_bot_user_agent(ua):
+        return "bot"
     if any(k in ua for k in ("mobile", "android", "iphone", "ipod", "windows phone")):
         return "mobile"
     if any(k in ua for k in ("ipad", "tablet")):
         return "tablet"
-    if any(k in ua for k in ("bot", "crawl", "spider", "lighthouse")):
-        return "bot"
     return "desktop"
 
 
@@ -2062,6 +2097,9 @@ def record_unique_visitor():
 
     now = datetime.now(timezone.utc)
     user_agent = sanitize_analytics_text(request.headers.get("User-Agent"))
+    if _is_bot_user_agent(user_agent):
+        # Crawlers/prerenderers run the site's JS too; they are not visitors.
+        return jsonify({"message": "Ignored (bot)."}), 202
     referer = sanitize_analytics_text(body.referrer or request.headers.get("Referer"))
     client_ip = sanitize_analytics_text(extract_client_ip(request))
 
@@ -2189,6 +2227,9 @@ def record_party_interaction(metric: str):
 
     if not (body.partyId or body.partySlug):
         return jsonify({"message": "Invalid analytics event.", "errors": [{"loc": ["partyId", "partySlug"], "msg": "Provide partyId or partySlug."}]}), 400
+
+    if _is_bot_user_agent(request.headers.get("User-Agent")):
+        return jsonify({"message": "Ignored (bot)."}), 202
 
     party_id_input = body.partyId.strip() if isinstance(body.partyId, str) else body.partyId
     party_slug_input = sanitize_analytics_text(body.partySlug)
@@ -2483,12 +2524,13 @@ def analytics_recent():
                 })
         except Exception as exc:
             app.logger.error(f"Failed to read recent party events: {exc}")
+            return jsonify({"message": "Analytics datastore unavailable."}), 503
 
     # Fetch recent real GoOut purchases (confirmed ticket sales, not clicks)
     if want_goout_purchases and goout_sales_log_collection is not None:
         try:
             party_by_event_id: dict[str, dict] = {}
-            for party in fetch_all_documents(parties_collection):
+            for party in fetch_all_documents(parties_collection, projection=_RECENT_PARTY_PROJECTION):
                 event_id = party.get("goOutEventId")
                 if event_id:
                     party_by_event_id[str(event_id)] = party
@@ -2521,6 +2563,7 @@ def analytics_recent():
                 })
         except Exception as exc:
             app.logger.error(f"Failed to read recent GoOut purchases: {exc}")
+            return jsonify({"message": "Analytics datastore unavailable."}), 503
 
     # Fetch recent visitor sessions
     if want_visits and visitor_analytics_collection is not None:
@@ -2567,6 +2610,7 @@ def analytics_recent():
                 })
         except Exception as exc:
             app.logger.error(f"Failed to read recent visitors: {exc}")
+            return jsonify({"message": "Analytics datastore unavailable."}), 503
 
     # Sort merged events by timestamp descending, then paginate
     events.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
@@ -2632,6 +2676,75 @@ def admin_audit_log():
     } for doc in docs]
 
     return jsonify({"entries": entries, "total": total, "hasMore": offset + limit < total}), 200
+
+
+def purge_bot_analytics(cutoff: datetime, dry_run: bool = True) -> dict:
+    """Find (and unless dry_run, delete) bot hits recorded since `cutoff`, re-judged
+    by the current `_is_bot_user_agent`: visitor sessions, party view/redirect
+    events, and the matching increments on the per-party counters."""
+    bot_visitor_ids: list = []
+    if visitor_analytics_collection is not None:
+        for doc in visitor_analytics_collection.find({"createdAt": {"$gte": cutoff}}, {"userAgent": 1}):
+            if _is_bot_user_agent(doc.get("userAgent")):
+                bot_visitor_ids.append(doc["_id"])
+
+    bot_event_ids: list = []
+    per_party: dict[str, dict[str, int]] = {}
+    if analytics_collection is not None:
+        query = {"createdAt": {"$gte": cutoff}, "category": "party"}
+        for doc in analytics_collection.find(query, {"userAgent": 1, "partyId": 1, "action": 1}):
+            if not _is_bot_user_agent(doc.get("userAgent")):
+                continue
+            bot_event_ids.append(doc["_id"])
+            metric = "redirects" if doc.get("action") == "redirect" else "views"
+            counts = per_party.setdefault(str(doc.get("partyId") or ""), {"views": 0, "redirects": 0})
+            counts[metric] += 1
+    per_party.pop("", None)
+
+    if not dry_run:
+        if bot_visitor_ids:
+            visitor_analytics_collection.delete_many({"_id": {"$in": bot_visitor_ids}})
+        if bot_event_ids:
+            analytics_collection.delete_many({"_id": {"$in": bot_event_ids}})
+        if party_analytics_collection is not None:
+            for party_id, counts in per_party.items():
+                party_analytics_collection.update_one(
+                    {"partyId": party_id}, {"$inc": {k: -v for k, v in counts.items() if v}}
+                )
+            for metric in ("views", "redirects"):
+                party_analytics_collection.update_many({metric: {"$lt": 0}}, {"$set": {metric: 0}})
+
+    return {
+        "dryRun": dry_run,
+        "since": cutoff.isoformat(),
+        "visitorSessions": len(bot_visitor_ids),
+        "partyEvents": len(bot_event_ids),
+        "byParty": per_party,
+    }
+
+
+@app.route("/api/admin/analytics/purge-bots", methods=["POST"])
+@protect
+def admin_purge_bot_analytics():
+    """Remove bot hits already stored. Dry run unless `?dryRun=0`.
+    `hours` (1-840, default 48) bounds how far back to look."""
+    try:
+        hours = int(request.args.get("hours", 48))
+    except (TypeError, ValueError):
+        hours = 48
+    hours = max(1, min(hours, 24 * 35))
+    dry_run = request.args.get("dryRun", "1") != "0"
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    try:
+        result = purge_bot_analytics(cutoff, dry_run=dry_run)
+    except Exception as exc:
+        app.logger.error(f"Bot purge failed: {exc}")
+        return jsonify({"message": "Bot purge failed."}), 500
+    if not dry_run:
+        record_admin_action("purge_bot_analytics", "analytics", None, {
+            "hours": hours, "visitorSessions": result["visitorSessions"], "partyEvents": result["partyEvents"],
+        })
+    return jsonify(result), 200
 
 
 @app.route("/api/admin/analytics/visitors", methods=["GET"])
@@ -2997,10 +3110,7 @@ def build_whatsapp_promo(days: int = 7, limit: int = 12) -> dict:
         parties.append(party)
 
     sales_by_event_id = _sales_totals_by_event_id(cutoff=now - timedelta(days=30))
-    accounts_by_event_id: dict[str, set[str]] = {}
-    for doc in fetch_all_documents(goout_sales_collection, projection={"go_out_id": 1, "account_id": 1}):
-        if doc.get("go_out_id") and doc.get("account_id"):
-            accounts_by_event_id.setdefault(str(doc["go_out_id"]), set()).add(str(doc["account_id"]))
+    accounts_by_event_id = _accounts_by_event_id()
 
     candidates = promo.rank_promo_candidates(
         parties,
@@ -3009,6 +3119,7 @@ def build_whatsapp_promo(days: int = 7, limit: int = 12) -> dict:
         now=now,
         days=days,
         limit=limit,
+        account1_referral=ACCOUNT1_REFERRAL_CODE,
     )
     return {
         "days": days,
@@ -3017,6 +3128,45 @@ def build_whatsapp_promo(days: int = 7, limit: int = 12) -> dict:
         "candidates": candidates,
         "digest": promo.format_digest_message(candidates, days=days),
     }
+
+
+# Optional: account1's referral code, so an account1 party with no sales yet is
+# still recognised by its link (otherwise tier comes from goout_sales accounts).
+ACCOUNT1_REFERRAL_CODE = os.environ.get("ACCOUNT1_REFERRAL_CODE", "").strip() or None
+
+
+def _accounts_by_event_id() -> dict[str, set[str]]:
+    accounts: dict[str, set[str]] = {}
+    for doc in fetch_all_documents(goout_sales_collection, projection={"go_out_id": 1, "account_id": 1}):
+        if doc.get("go_out_id") and doc.get("account_id"):
+            accounts.setdefault(str(doc["go_out_id"]), set()).add(str(doc["account_id"]))
+    return accounts
+
+
+@app.route("/api/admin/parties/commission", methods=["GET"])
+@limiter.limit("30 per minute")
+@protect
+def admin_party_commission():
+    """Our commission per ticket and lifetime earnings for every upcoming party,
+    keyed by party id (used by the admin's holiday-pages screen)."""
+    if parties_collection is None:
+        return jsonify({"message": "Parties datastore unavailable."}), 503
+    try:
+        now = datetime.now(timezone.utc)
+        parties = fetch_all_documents(parties_collection, projection={
+            "date": 1, "startsAt": 1, "goOutEventId": 1, "ticketPrice": 1, "referralCode": 1,
+        })
+        data = promo.commission_by_party(
+            parties,
+            sales_by_event_id=_sales_totals_by_event_id(cutoff=None),
+            accounts_by_event_id=_accounts_by_event_id(),
+            now=now,
+            account1_referral=ACCOUNT1_REFERRAL_CODE,
+        )
+    except Exception as exc:
+        app.logger.error(f"Failed to build party commission: {exc}")
+        return jsonify({"message": "Failed to build party commission."}), 500
+    return jsonify({"generatedAt": now.isoformat(), "parties": data}), 200
 
 
 @app.route("/api/admin/promo/whatsapp", methods=["GET"])
@@ -3363,6 +3513,21 @@ OPENAPI_TEMPLATE = {
                 }
             }
         },
+        "/api/admin/analytics/purge-bots": {
+            "post": {
+                "summary": "Remove stored bot hits",
+                "description": "Re-checks visitor sessions and party view/redirect events recorded in the last `hours` against the bot User-Agent list, deletes the bot ones and takes their increments back off the per-party counters. Dry run (counts only) unless dryRun=0. New bot hits are already dropped at ingest.",
+                "security": [{"bearerAuth": []}],
+                "parameters": [
+                    {"name": "hours", "in": "query", "schema": {"type": "integer", "minimum": 1, "maximum": 840, "default": 48}},
+                    {"name": "dryRun", "in": "query", "schema": {"type": "string", "enum": ["0", "1"], "default": "1"}},
+                ],
+                "responses": {
+                    "200": {"description": "Counts of bot visitor sessions and party events found (and removed unless dry run), per party."},
+                    "401": {"description": "Missing or invalid admin token."},
+                },
+            }
+        },
         "/api/admin/analytics/detailed": {
             "get": {
                 "summary": "Detailed time-series analytics",
@@ -3676,6 +3841,71 @@ OPENAPI_TEMPLATE = {
                             }
                         },
                     }
+                },
+            }
+        },
+        "/api/admin/parties/commission": {
+            "get": {
+                "summary": "Commission per upcoming party",
+                "description": "For every upcoming party, keyed by party id: our commission per ticket (account1 flat ₪25, account2 6% of the ticket price; perTicketEstimated when the price is unknown) and lifetime tickets/commission from goout_sales_log.",
+                "security": [{"bearerAuth": []}],
+                "responses": {
+                    "200": {
+                        "description": "Commission map.",
+                        "content": {"application/json": {"schema": {
+                            "type": "object",
+                            "properties": {
+                                "generatedAt": {"type": "string", "format": "date-time"},
+                                "parties": {"type": "object", "additionalProperties": {
+                                    "type": "object",
+                                    "properties": {
+                                        "tier": {"type": "string", "enum": ["account1", "account2"]},
+                                        "perTicket": {"type": "number"},
+                                        "perTicketEstimated": {"type": "boolean"},
+                                        "ticketPrice": {"type": "number", "nullable": True},
+                                        "ticketsSold": {"type": "integer"},
+                                        "earned": {"type": "number"},
+                                    },
+                                }},
+                            },
+                        }}},
+                    },
+                },
+            }
+        },
+        "/api/holiday-pages/{slug}": {
+            "get": {
+                "summary": "Get a holiday page's party curation",
+                "description": "Parties pinned to the top of a holiday landing page (in order) and parties hidden from it. Parties not listed keep the default: in the holiday date window, sorted by date.",
+                "parameters": [{"name": "slug", "in": "path", "required": True, "schema": {"type": "string"}, "example": "halloween"}],
+                "responses": {
+                    "200": {
+                        "description": "Curation for the page (empty lists when never set).",
+                        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/HolidayCuration"}}},
+                    },
+                    "400": {"description": "Invalid slug."},
+                },
+            }
+        },
+        "/api/admin/holiday-pages/{slug}": {
+            "put": {
+                "summary": "Set a holiday page's party curation",
+                "description": "Replaces the pinned (ordered) and hidden party id lists for a holiday page and revalidates it. A party in both lists stays pinned.",
+                "security": [{"bearerAuth": []}],
+                "parameters": [{"name": "slug", "in": "path", "required": True, "schema": {"type": "string"}}],
+                "requestBody": {
+                    "required": True,
+                    "content": {"application/json": {"schema": {
+                        "type": "object",
+                        "properties": {
+                            "partyIds": {"type": "array", "items": {"type": "string"}, "maxItems": 300},
+                            "hiddenIds": {"type": "array", "items": {"type": "string"}, "maxItems": 300},
+                        },
+                    }}},
+                },
+                "responses": {
+                    "200": {"description": "Saved curation.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/HolidayCuration"}}}},
+                    "400": {"description": "Invalid slug or body."},
                 },
             }
         },
@@ -4391,6 +4621,15 @@ OPENAPI_TEMPLATE = {
             }
         },
         "schemas": {
+            "HolidayCuration": {
+                "type": "object",
+                "properties": {
+                    "slug": {"type": "string"},
+                    "partyIds": {"type": "array", "items": {"type": "string"}, "description": "Pinned party ids, shown first in this order."},
+                    "hiddenIds": {"type": "array", "items": {"type": "string"}, "description": "Party ids removed from the page."},
+                    "updatedAt": {"type": "string", "format": "date-time", "nullable": True},
+                },
+            },
             "Party": {
                 "type": "object",
                 "properties": {
@@ -6814,6 +7053,91 @@ def set_referral():
     except Exception as e:
         return jsonify({"message": "Error updating referral", "error": str(e)}), 500
 
+# --- Holiday page curation ---
+# The site's holiday pages (/halloween, /sylvester, ...) list every party whose
+# date falls in the holiday window, by date. The owner can pin parties (shown
+# first, in the given order, even outside the window) and hide ones that
+# matched the window but shouldn't be there. Stored per page in `settings`.
+HOLIDAY_SLUG_RE = re.compile(r"[a-z0-9-]{1,40}")
+HOLIDAY_SETTING_PREFIX = "holidayPage:"
+HOLIDAY_MAX_IDS = 300
+
+
+def _clean_party_ids(values) -> list[str] | None:
+    """Dedupe (keeping first position) and validate a list of party id strings."""
+    if not isinstance(values, list) or len(values) > HOLIDAY_MAX_IDS:
+        return None
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
+            return None
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
+def parse_holiday_curation(payload) -> dict | None:
+    """Validate an admin PUT body; returns {partyIds, hiddenIds} or None.
+    A party can't be both pinned and hidden: pinning wins."""
+    if not isinstance(payload, dict) or set(payload) - {"partyIds", "hiddenIds"}:
+        return None
+    party_ids = _clean_party_ids(payload.get("partyIds", []))
+    hidden_ids = _clean_party_ids(payload.get("hiddenIds", []))
+    if party_ids is None or hidden_ids is None:
+        return None
+    pinned = set(party_ids)
+    return {"partyIds": party_ids, "hiddenIds": [i for i in hidden_ids if i not in pinned]}
+
+
+def load_holiday_curation(slug: str) -> dict:
+    empty = {"slug": slug, "partyIds": [], "hiddenIds": [], "updatedAt": None}
+    if settings_collection is None:
+        return empty
+    doc = settings_collection.find_one({"key": HOLIDAY_SETTING_PREFIX + slug}) or {}
+    return {
+        "slug": slug,
+        "partyIds": [str(i) for i in doc.get("partyIds") or []],
+        "hiddenIds": [str(i) for i in doc.get("hiddenIds") or []],
+        "updatedAt": isoformat_or_none(doc.get("updatedAt")),
+    }
+
+
+@app.route("/api/holiday-pages/<slug>", methods=["GET"])
+def get_holiday_curation(slug):
+    if not HOLIDAY_SLUG_RE.fullmatch(slug or ""):
+        return jsonify({"message": "Invalid holiday slug."}), 400
+    try:
+        return json_response(load_holiday_curation(slug), cache_seconds=30)
+    except Exception as e:
+        return jsonify({"message": "Error fetching holiday page", "error": str(e)}), 500
+
+
+@app.route("/api/admin/holiday-pages/<slug>", methods=["PUT"])
+@protect
+def set_holiday_curation(slug):
+    if not HOLIDAY_SLUG_RE.fullmatch(slug or ""):
+        return jsonify({"message": "Invalid holiday slug."}), 400
+    data = parse_holiday_curation(request.get_json(silent=True))
+    if data is None:
+        return jsonify({"message": "Body must be {partyIds: string[], hiddenIds: string[]} (party ids, max 300 each)."}), 400
+    key = HOLIDAY_SETTING_PREFIX + slug
+    try:
+        settings_collection.update_one(
+            {"key": key},
+            {"$set": {"key": key, **data, "updatedAt": datetime.now(timezone.utc)}},
+            upsert=True,
+        )
+        record_admin_action("set_holiday_page", "holiday_page", slug, data)
+        trigger_revalidation([f"/{slug}"])
+        return jsonify(load_holiday_curation(slug)), 200
+    except Exception as e:
+        return jsonify({"message": "Error updating holiday page", "error": str(e)}), 500
+
 # --- Advanced Classification Helpers ---
 
 def classify_party_data(title: str, description: str, location: str) -> dict:
@@ -8255,6 +8579,14 @@ def compute_listing_sync(party: dict, item: dict, zero_rules: dict, now_iso: str
     field_changes = listings.diff_fields(desired, party)
     set_doc: dict = {**field_changes, "source": source, "priceInfo": price_info}
     changes = {field: [party.get(field), new] for field, new in field_changes.items()}
+
+    # Some parties also carry `startsAt`, and the event feeds read it before
+    # `date` — a corrected start time has to land in both.
+    if (isinstance(party.get("startsAt"), str) and desired.get("date")
+            and "date" not in (party.get("locks") or [])
+            and listings.parse_local(party["startsAt"]) != listings.parse_local(desired["date"])):
+        set_doc["startsAt"] = desired["date"]
+        changes.setdefault("date", [party.get("startsAt"), desired["date"]])
 
     status = listings.desired_status(source, party) if source.get("title") else None
     if status:

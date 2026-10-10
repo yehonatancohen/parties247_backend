@@ -78,3 +78,32 @@ def test_funnel_and_sales_use_projections(monkeypatch):
     assert parties.calls == [app._PARTY_INDEX_PROJECTION]
     assert sales.calls == [app._SALES_BY_PARTY_PROJECTION]
     assert rows[0]["partyName"] == "One" and rows[0]["realOwnRevenue"] == 300.0
+
+
+def test_summary_and_recent_project_party_reads(monkeypatch):
+    # Both used to scan full party docs: /summary took ~20s, /recent ~8s.
+    parties = RecordingCollection([{"_id": "p1", "name": "One", "slug": "one", "date": "2099-01-01T22:00:00"}])
+    monkeypatch.setattr(app, "parties_collection", parties)
+    monkeypatch.setattr(app, "party_analytics_collection", RecordingCollection([]))
+    monkeypatch.setattr(app, "visitor_analytics_collection", RecordingCollection([]))
+
+    summary = app.build_analytics_summary()
+    assert [p["partyId"] for p in summary["parties"]] == ["p1"]
+    assert parties.calls == [app._SUMMARY_PARTY_PROJECTION]
+    assert "description" not in app._SUMMARY_PARTY_PROJECTION
+
+
+def test_time_series_projects_only_bucket_fields(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    visitors = RecordingCollection([{"createdAt": now, "sessionId": "s1"}])
+    events = RecordingCollection([{"createdAt": now, "action": "view", "partyId": "p1"}])
+    monkeypatch.setattr(app, "visitor_analytics_collection", visitors)
+    monkeypatch.setattr(app, "analytics_collection", events)
+
+    rows = app.build_time_series_analytics(now - timedelta(hours=1), now + timedelta(hours=1), "hour")
+
+    assert rows[0]["visits"] == 1 and rows[0]["partyViews"] == 1
+    assert visitors.calls == [app._TIME_SERIES_VISITOR_PROJECTION]
+    assert events.calls == [app._TIME_SERIES_EVENT_PROJECTION]

@@ -291,3 +291,12 @@ def test_site_check_skips_parties_whose_page_is_still_cached_from_before_a_chang
     app.run_listing_audit("acc1", checks)
 
     assert [doc["fingerprint"] for doc in issues.docs] == ["site:e2:price"]
+
+
+def test_corrected_start_time_also_lands_in_starts_at():
+    party = {"_id": "p1", "name": EVENT["Title"], "date": "2026-10-16T22:00:00.000",
+             "startsAt": "2026-10-16T22:00:00.000"}
+    outcome = sync(party, {"partyId": "p1", "event": EVENT, "tiers": TIERS})
+    assert outcome["set"]["date"] == outcome["set"]["startsAt"] == EVENT["StartingDate"]
+    locked = sync({**party, "locks": ["date"]}, {"partyId": "p1", "event": EVENT, "tiers": TIERS})
+    assert "date" not in locked["set"] and "startsAt" not in locked["set"]

@@ -648,6 +648,11 @@ def location_is_vague(party: dict) -> bool:
     return _text(party.get("location")).lower() in _VAGUE_LOCATIONS
 
 
+# A promoter's "test" / "בדיקה" event that was left public on GoOut.
+_TEST_TITLE_RE = re.compile(r"^\s*(?:test(?:\s+event)?|demo(?:\s+event)?|טסט|בדיקה)(?:\s|$|[-_/])", re.IGNORECASE)
+MAX_PLAUSIBLE_PRICE = 2000.0
+
+
 def detect_party_issues(party: dict, now: datetime | None = None) -> list[dict]:
     """Issues for one live, upcoming party that need a person. Each fingerprint
     is stable, so a question answered once is never asked again."""
@@ -689,6 +694,14 @@ def detect_party_issues(party: dict, now: datetime | None = None) -> list[dict]:
         add("title_date", f"titledate:{ref}:{(source.get('startsAt') or '')[:10]}",
             f"{name}: title date doesn't match the start date",
             {"title": source.get("title"), "startsAt": source.get("startsAt")})
+
+    if _TEST_TITLE_RE.search(str(source.get("title") or "")):
+        add("test_listing", f"test:{ref}", f"{name}: looks like a test event")
+
+    price = party.get("ticketPrice")
+    if isinstance(price, (int, float)) and price > MAX_PLAUSIBLE_PRICE:
+        add("price_suspicious", f"highprice:{ref}", f"{name}: ticket price ₪{price:g} looks wrong",
+            {"ticketPrice": price})
 
     if location_is_vague(party):
         add("location_vague", f"loc:{ref}", f"{name}: no usable location",

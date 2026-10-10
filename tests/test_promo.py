@@ -166,3 +166,27 @@ def test_build_whatsapp_promo_joins_collections(monkeypatch):
     assert "parties247.co.il/event/s1" in c["message"]
     # the party read must be projected, never a full-document load
     assert parties.projections and "description" not in parties.projections[0]
+
+
+def test_commission_by_party_tiers_earnings_and_upcoming_only():
+    now = datetime(2026, 10, 20, 12, tzinfo=timezone.utc)
+    parties = [
+        {"_id": "a1", "date": "2026-10-30T23:00:00", "goOutEventId": "e1", "ticketPrice": 80},
+        {"_id": "a2", "date": "2026-10-31T23:00:00", "goOutEventId": "e2", "ticketPrice": 120},
+        {"_id": "a3", "date": "2026-10-31T23:00:00", "goOutEventId": "e3"},
+        {"_id": "ref", "date": "2026-10-31T23:00:00", "referralCode": "acc1code", "ticketPrice": 90},
+        {"_id": "past", "date": "2026-10-01T23:00:00", "goOutEventId": "e1"},
+    ]
+    out = promo.commission_by_party(
+        parties,
+        sales_by_event_id={"e1": {"totalTicketsSold": 6, "totalRevenue": 150.0}},
+        accounts_by_event_id={"e1": {"account1"}},
+        now=now,
+        account1_referral="acc1code",
+    )
+    assert set(out) == {"a1", "a2", "a3", "ref"}
+    assert out["a1"] == {"tier": "account1", "perTicket": 25.0, "perTicketEstimated": False,
+                         "ticketPrice": 80.0, "ticketsSold": 6, "earned": 150.0}
+    assert out["a2"]["tier"] == "account2" and out["a2"]["perTicket"] == 7.2 and out["a2"]["earned"] == 0.0
+    assert out["a3"]["perTicketEstimated"] is True
+    assert out["ref"]["tier"] == "account1"

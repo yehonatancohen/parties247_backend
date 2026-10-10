@@ -204,10 +204,25 @@ class FakeIssues:
         return types.SimpleNamespace(upserted_id="new")
 
     def update_many(self, query, update):
-        keep = set(query["fingerprint"]["$nin"])
+        def matches(doc):
+            status, prints = query.get("status"), query.get("fingerprint") or {}
+            if isinstance(status, dict) and doc.get("status") not in status["$in"]:
+                return False
+            if isinstance(status, str) and doc.get("status") != status:
+                return False
+            if "type" in query and doc.get("type") != query["type"]:
+                return False
+            if "$nin" in prints and doc["fingerprint"] in prints["$nin"]:
+                return False
+            if "$in" in prints and doc["fingerprint"] not in prints["$in"]:
+                return False
+            if "firstSeen" in query and not doc.get("firstSeen") < query["firstSeen"]["$lt"]:
+                return False
+            return True
+
         changed = 0
         for doc in self.docs:
-            if doc.get("status") == "open" and doc["fingerprint"] not in keep:
+            if matches(doc):
                 doc.update(update["$set"])
                 changed += 1
         return types.SimpleNamespace(modified_count=changed)
@@ -224,39 +239,44 @@ def _listed(pid, title, ref, **extra):
             "source": source, **extra}
 
 
+revalidated = []
+
+
 def _audit_env(monkeypatch, parties, issues, recent_changes=()):
     merged = []
+    revalidated.clear()
     monkeypatch.setattr(app, "listing_changes_collection", types.SimpleNamespace(
         find=lambda query, projection=None: [{"partyId": pid} for pid in recent_changes]))
     monkeypatch.setattr(app, "parties_collection", parties)
     monkeypatch.setattr(app, "listing_issues_collection", issues)
     monkeypatch.setattr(app, "listing_rules_collection", types.SimpleNamespace(find=lambda q: []))
     monkeypatch.setattr(app, "_sales_totals_by_event_id", lambda cutoff=None: {})
+    monkeypatch.setattr(app, "_accounts_by_event_id", lambda: {})
+    monkeypatch.setattr(app, "_revalidate_parties", lambda parties: revalidated.extend(p["_id"] for p in parties))
     monkeypatch.setattr(app, "_local_now", lambda: app.datetime(2099, 10, 16, 13))
     monkeypatch.setattr(app, "_set_listing_guard_state", lambda **fields: None)
     monkeypatch.setattr(app, "merge_listing", lambda loser, keeper, reason: merged.append((loser["_id"], keeper["_id"], reason)))
     return merged
 
 
-def test_audit_merges_account1_duplicates_and_queues_the_rest(monkeypatch):
+def test_audit_merges_duplicates_into_the_best_paying_listing_and_asks_nothing(monkeypatch):
     parties = FakeParties([
-        _listed("1", "WineNot? In The City 17.10🌅", "acc2"),
-        _listed("2", "WineNot In The City 17.10🌅🍷", "acc1"),
-        _listed("3", "Other Party 17.10", "acc2"),          # same door, same hour, different party?
+        {**_listed("1", "WineNot? In The City 17.10🌅", "acc2"), "ticketPrice": 120},   # 6% = ₪7.20
+        _listed("2", "WineNot In The City 17.10🌅🍷", "acc1"),                           # flat fee
+        {**_listed("3", "Other Name 17.10", "acc2"), "ticketPrice": 90},                 # same door, same hour
         _listed("9", "Hidden Private 17.10", "acc2", listingStatus="hidden"),
     ])
-    issues = FakeIssues([{"fingerprint": "titledate:gone:2099-01-01", "status": "open", "type": "title_date"}])
+    issues = FakeIssues([{"fingerprint": "stale:gone", "status": "open", "type": "stale_sync"}])
     merged = _audit_env(monkeypatch, parties, issues)
 
     summary = app.run_listing_audit("acc1", [])
 
-    assert merged == [("1", "2", "certain:account1")]
+    assert sorted(merged) == [("1", "2", "certain:commission"), ("3", "2", "certain:commission")]
     by_print = {doc["fingerprint"]: doc for doc in issues.docs}
-    assert by_print["dup:e1:e2"]["status"] == "auto_fixed"
-    assert by_print["dup:e2:e3"]["status"] == "open"          # asked, not merged
+    assert by_print["dup:e1:e2"]["status"] == by_print["dup:e2:e3"]["status"] == "auto_fixed"
     assert not any("e9" in fp for fp in by_print)              # hidden parties are out of it
-    assert by_print["titledate:gone:2099-01-01"]["status"] == "resolved"  # cause went away
-    assert summary["waiting"] == 1 and summary["new"] == 1 and summary["cleared"] == 1
+    assert by_print["stale:gone"]["status"] == "resolved"      # cause went away
+    assert summary["waiting"] == 0 and summary["new"] == 0 and summary["cleared"] == 1
 
 
 def test_audit_dry_run_writes_nothing(monkeypatch):
@@ -270,27 +290,33 @@ def test_audit_dry_run_writes_nothing(monkeypatch):
     assert summary["merges"][0]["keeper"] == "Same 17.10" and summary["merges"][0]["keeperId"] == "2"
 
 
-def test_answered_duplicate_is_not_reopened(monkeypatch):
+def test_a_merge_undone_by_hand_is_not_repeated(monkeypatch):
     parties = FakeParties([_listed("2", "Night A 17.10", "acc2"), _listed("3", "Night B 17.10", "acc2")])
     issues = FakeIssues([{"fingerprint": "dup:e2:e3", "status": "resolved", "type": "duplicate"}])
-    _audit_env(monkeypatch, parties, issues)
+    merged = _audit_env(monkeypatch, parties, issues)
 
     summary = app.run_listing_audit("acc1", [])
 
-    assert summary["waiting"] == 0 and issues.docs[0]["status"] == "resolved"
+    assert merged == [] and summary["waiting"] == 0 and issues.docs[0]["status"] == "resolved"
 
 
-def test_site_check_skips_parties_whose_page_is_still_cached_from_before_a_change(monkeypatch):
+def test_stale_page_is_rerendered_first_and_only_asked_about_if_it_stays_wrong(monkeypatch):
     parties = FakeParties([{**_listed("1", "Alpha 17.10", "acc2"), "ticketPrice": 87.4},
                            {**_listed("2", "Beta 19.10", "acc2", date="2099-10-19T17:00:00.000"), "ticketPrice": 50}])
     parties.docs[1]["source"]["startsAt"] = "2099-10-19T17:00:00.000"
     issues = FakeIssues()
+    # Party 1 changed in the last two hours: its page is still cached, not checked.
     _audit_env(monkeypatch, parties, issues, recent_changes=["1"])
     checks = [{"partyId": "1", "status": 200, "price": "0"}, {"partyId": "2", "status": 200, "price": "0"}]
 
-    app.run_listing_audit("acc1", checks)
+    summary = app.run_listing_audit("acc1", checks)
 
-    assert [doc["fingerprint"] for doc in issues.docs] == ["site:e2:price"]
+    assert [(doc["fingerprint"], doc["status"]) for doc in issues.docs] == [("site:e2:price", "watching")]
+    assert revalidated == ["2"] and summary["waiting"] == 0
+
+    issues.docs[0]["firstSeen"] = issues.docs[0]["firstSeen"] - app.timedelta(days=1)
+    summary = app.run_listing_audit("acc1", checks)
+    assert issues.docs[0]["status"] == "open" and summary["waiting"] == 1
 
 
 def test_corrected_start_time_also_lands_in_starts_at():

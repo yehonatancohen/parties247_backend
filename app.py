@@ -8731,6 +8731,28 @@ def _revenue_by_party_id(parties: list[dict]) -> dict[str, float]:
     return revenue
 
 
+def _commission_by_party_id(parties: list[dict], account1_referral: str | None) -> dict[str, float]:
+    """Expected commission per ticket for each listing — what decides which
+    duplicate is kept. Rates live in promo.py only."""
+    try:
+        accounts = _accounts_by_event_id()
+    except Exception as exc:
+        app.logger.warning(f"[LISTING] account lookup failed: {exc}")
+        accounts = {}
+    result = {}
+    for party in parties:
+        tier = promo.account_tier(accounts.get(str(party.get("goOutEventId") or "")),
+                                  party.get("referralCode"), account1_referral)
+        price = party.get("ticketPrice")
+        if tier != "account1" and not (isinstance(price, (int, float)) and price > 0):
+            # 6% of a free or unknown ticket: don't let promo's ₪100 guess
+            # outrank a listing whose price we actually know.
+            result[str(party["_id"])] = 0.0
+            continue
+        result[str(party["_id"])] = promo.expected_commission_per_ticket(tier, price)
+    return result
+
+
 def run_listing_audit(account1_referral: str | None, site_checks: list[dict], dry_run: bool = False) -> dict:
     now_local = _local_now()
     now = datetime.now(timezone.utc)
@@ -8764,10 +8786,9 @@ def run_listing_audit(account1_referral: str | None, site_checks: list[dict], dr
             {"status": {"$in": ["resolved", "ignored"]}, "type": "duplicate"}, {"fingerprint": 1})}
 
     plan = listings.plan_duplicates(
-        listings.find_duplicate_pairs(live), account1_referral,
+        listings.find_duplicate_pairs(live), _commission_by_party_id(live, account1_referral),
         _revenue_by_party_id(live), series_rules, decided,
     )
-    detected.extend(plan["issues"])
 
     # One open question per fingerprint (the global ₪0-tier question is raised
     # by every party that has that tier).
@@ -8779,7 +8800,7 @@ def run_listing_audit(account1_referral: str | None, site_checks: list[dict], dr
 
     merges = [{**merge, "keeper": by_id[merge["keeperId"]].get("name"),
                "loser": by_id[merge["loserId"]].get("name")} for merge in plan["merges"]]
-    summary = {"dryRun": dry_run, "checked": len(live), "merges": merges,
+    summary = {"dryRun": dry_run, "checked": len(live), "merges": merges, "skipped": plan["skipped"],
                "issues": list(unique.values()) if dry_run else None}
     if dry_run or listing_issues_collection is None:
         summary["waiting"] = len(unique)
@@ -8805,16 +8826,29 @@ def run_listing_audit(account1_referral: str | None, site_checks: list[dict], dr
             {"$set": {"type": issue["type"], "partyIds": issue["partyIds"], "summary": issue["summary"],
                       "evidence": issue.get("evidence") or {}, "suggestion": issue.get("suggestion"),
                       "lastSeen": now},
-             "$setOnInsert": {"status": "open", "firstSeen": now}},
+             "$setOnInsert": {"status": "watching" if issue["type"] == "site_render" else "open",
+                              "firstSeen": now}},
             upsert=True,
         )
-        if getattr(result, "upserted_id", None) is not None:
+        if getattr(result, "upserted_id", None) is not None and issue["type"] != "site_render":
             new_count += 1
+
+    # A page that disagrees with the database is first just re-rendered. Only
+    # one that still disagrees at the next audit is worth a person's time.
+    stale_pages = [by_id[pid] for issue in unique.values() if issue["type"] == "site_render"
+                   for pid in issue["partyIds"] if pid in by_id]
+    if stale_pages:
+        _revalidate_parties(stale_pages)
+    listing_issues_collection.update_many(
+        {"type": "site_render", "status": "watching", "fingerprint": {"$in": list(unique.keys())},
+         "firstSeen": {"$lt": now - timedelta(hours=12)}},
+        {"$set": {"status": "open"}},
+    )
 
     # A question whose cause went away (promoter fixed the title, the party
     # passed, sync caught up) closes itself instead of lingering in the queue.
     cleared = listing_issues_collection.update_many(
-        {"status": "open", "fingerprint": {"$nin": list(unique.keys())}},
+        {"status": {"$in": ["open", "watching"]}, "fingerprint": {"$nin": list(unique.keys())}},
         {"$set": {"status": "resolved", "decision": {"decision": "cleared"}, "resolvedAt": now}},
     )
     waiting = listing_issues_collection.count_documents({"status": "open"})
@@ -9045,6 +9079,32 @@ def list_hidden_listings():
     return jsonify({"parties": [_listing_card(doc, state.get("account1Referral"), {}) for doc in docs]}), 200
 
 
+def _remember_unmerge(party: dict):
+    """Relisting a merged party means "these are two parties". Remember it for
+    the pair and for its venue + promoter series, so next week's edition of
+    the same two parties is not merged again."""
+    keeper_id = party.get("mergedInto")
+    if party.get("listingStatus") != "merged" or not keeper_id:
+        return
+    try:
+        keeper = parties_collection.find_one({"_id": ObjectId(keeper_id)})
+        if not keeper:
+            return
+        now = datetime.now(timezone.utc)
+        if listing_issues_collection is not None:
+            listing_issues_collection.update_one(
+                {"fingerprint": listings.pair_fingerprint(party, keeper)},
+                {"$set": {"type": "duplicate", "status": "resolved", "decision": {"decision": "different"},
+                          "partyIds": [str(keeper["_id"]), str(party["_id"])], "resolvedAt": now, "lastSeen": now},
+                 "$setOnInsert": {"firstSeen": now}},
+                upsert=True,
+            )
+        if (party.get("statusReason") or "").split(":")[0] != "identical":
+            _remember_rule("series", listings.series_rule_key(party, keeper), "different")
+    except Exception as exc:
+        app.logger.warning(f"[LISTING] could not remember unmerge of {party.get('_id')}: {exc}")
+
+
 @app.route("/api/admin/listings/<party_id>/status", methods=["POST"])
 @limiter.limit("60 per minute")
 @protect
@@ -9068,6 +9128,7 @@ def set_listing_status(party_id):
               "$addToSet": {"locks": "listingStatus"}}
     if status == "live":
         update["$unset"] = {"mergedInto": ""}
+        _remember_unmerge(party)
         if party.get("slug") and party_redirects_collection is not None:
             party_redirects_collection.delete_one({"fromSlug": party["slug"]})
     parties_collection.update_one({"_id": obj_id}, update)

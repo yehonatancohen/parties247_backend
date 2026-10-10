@@ -165,23 +165,27 @@ def party(pid, title, ref="acc2ref", event_id=None, **source):
             "source": _source(title, **source)}
 
 
-def test_same_event_on_both_accounts_keeps_account1_automatically():
+def test_duplicate_keeps_the_listing_that_pays_more_per_ticket():
+    # WineNot on both accounts: account1 pays a flat fee, account2 6% of ₪120.
     a = party("1", "WineNot? In The City 17.10🌅", organizerId="o1")
     b = party("2", "WineNot In The City 17.10🌅🍷", ref=A1, organizerId="o2")
     pairs = listings.find_duplicate_pairs([a, b])
     assert pairs[0]["level"] == "certain"
-    plan = listings.plan_duplicates(pairs, A1)
-    assert plan["issues"] == []
-    assert plan["merges"][0]["keeperId"] == "2" and plan["merges"][0]["loserId"] == "1"
+    plan = listings.plan_duplicates(pairs, {"1": 7.2, "2": 25.0})
+    assert [(m["keeperId"], m["loserId"], m["reason"]) for m in plan["merges"]] == [("2", "1", "certain:commission")]
+    # ...and the account does not matter: an expensive account2 ticket wins.
+    plan = listings.plan_duplicates(pairs, {"1": 30.0, "2": 25.0})
+    assert plan["merges"][0]["keeperId"] == "1"
 
 
-def test_account2_only_duplicate_is_asked_with_the_earning_listing_suggested():
+def test_equal_commission_keeps_the_listing_that_already_earned_then_the_older_one():
     a = party("1", "WTGL: OFF SCRIPT 10.12", starts="2026-12-10T22:00:00.000")
     b = party("2", "WTGL: OFF SCRIPT 10.12", starts="2026-12-10T22:00:00.000")
-    plan = listings.plan_duplicates(listings.find_duplicate_pairs([a, b]), A1, revenue={"2": 40.0})
-    assert plan["merges"] == []
-    assert plan["issues"][0]["type"] == "duplicate"
-    assert plan["issues"][0]["suggestion"] == {"keeperId": "2", "why": "revenue"}
+    pairs = listings.find_duplicate_pairs([a, b])
+    plan = listings.plan_duplicates(pairs, {"1": 6.0, "2": 6.0}, revenue={"2": 40.0})
+    assert (plan["merges"][0]["keeperId"], plan["merges"][0]["reason"]) == ("2", "certain:revenue")
+    plan = listings.plan_duplicates(pairs)
+    assert (plan["merges"][0]["keeperId"], plan["merges"][0]["reason"]) == ("1", "certain:older")
 
 
 def test_same_flyer_same_hour_is_certain_even_with_different_titles():
@@ -190,18 +194,17 @@ def test_same_flyer_same_hour_is_certain_even_with_different_titles():
     assert listings.pair_level(a, b)["level"] == "certain"
 
 
-def test_same_venue_same_hour_different_promoters_is_asked_not_merged():
-    # Bustan: "מיינסטרים בקבוע" (account1) vs "עד הדכא" (account2), same door, same hour.
+def test_same_venue_same_hour_under_two_names_is_merged_without_asking():
+    # Bustan: "מיינסטרים בקבוע" vs "עד הדכא", same door, same hour (owner decision 2026-10-10).
     a = party("1", "עד הדכא • בר חופשי • אוויר הפתוח • 9.10🍺", organizerId="o1")
     b = party("2", "מיינסטרים בקבוע • בר חופשי // 09.10🍺", ref=A1, organizerId="o2")
     pairs = listings.find_duplicate_pairs([a, b])
-    assert pairs[0]["level"] == "possible"
-    plan = listings.plan_duplicates(pairs, A1)
-    assert plan["merges"] == []
-    assert plan["issues"][0]["suggestion"]["why"] == "account1"
+    assert pairs[0]["level"] == "certain"
+    plan = listings.plan_duplicates(pairs, {"1": 6.0, "2": 25.0})
+    assert plan["merges"][0]["keeperId"] == "2" and plan["skipped"] == []
 
 
-def test_remembered_series_answer_decides_the_next_week_without_asking():
+def test_an_undone_merge_is_remembered_for_the_following_weeks():
     a = party("1", "FRIDAY MAINSTREAM | 16.10", organizerId="waves")
     b = party("2", "SHTUBY x CLUB DE COMBAT • FRIDAY OPEN AIR", organizerId="waves")
     key = listings.series_rule_key(a, b)
@@ -209,17 +212,26 @@ def test_remembered_series_answer_decides_the_next_week_without_asking():
     next_b = party("4", "DARWISH x HELLO VERA • FRIDAY OPEN AIR", organizerId="waves", starts="2026-10-24T17:00:00.000")
     assert listings.series_rule_key(next_a, next_b) == key  # titles change weekly, the key doesn't
     pairs = listings.find_duplicate_pairs([next_a, next_b])
-    assert listings.plan_duplicates(pairs, A1, series_rules={key: "different"}) == {"merges": [], "issues": []}
-    same = listings.plan_duplicates(pairs, A1, series_rules={key: "same"})
-    assert len(same["merges"]) == 1 and same["issues"] == []
+    assert len(listings.plan_duplicates(pairs)["merges"]) == 1
+    assert listings.plan_duplicates(pairs, series_rules={key: "different"})["merges"] == []
 
 
-def test_answered_pair_is_not_asked_again():
+def test_a_pair_decided_by_hand_is_never_merged():
     a = party("1", "DECISION FESTIVAL | GAGARIN TLV | 15.10")
     b = party("2", "COLORFUL FESTIVAL | GAGARIN TLV | 15.10")
     pairs = listings.find_duplicate_pairs([a, b])
-    assert len(listings.plan_duplicates(pairs, A1)["issues"]) == 1
-    assert listings.plan_duplicates(pairs, A1, decided={listings.pair_fingerprint(a, b)})["issues"] == []
+    assert len(listings.plan_duplicates(pairs)["merges"]) == 1
+    assert listings.plan_duplicates(pairs, decided={listings.pair_fingerprint(a, b)})["merges"] == []
+    relisted = {**b, "locks": ["listingStatus"]}  # the admin brought it back
+    assert listings.plan_duplicates(listings.find_duplicate_pairs([a, relisted]))["merges"] == []
+
+
+def test_similar_title_without_a_shared_venue_is_reported_not_merged():
+    centroid = {"lat": 31.046051, "lng": 34.851612}  # GoOut's "no location"
+    a = party("1", "FOREST GATHERING 17.10", **centroid)
+    b = party("2", "FOREST GATHERING 17.10 - SECOND RELEASE", starts="2026-10-17T19:00:00.000", **centroid)
+    plan = listings.plan_duplicates(listings.find_duplicate_pairs([a, b]))
+    assert plan["merges"] == [] and plan["skipped"][0]["partyIds"] == ["1", "2"]
 
 
 def test_different_weeks_of_a_series_are_not_duplicates():
@@ -246,13 +258,13 @@ def test_admin_clones_are_never_merged_back_into_their_source():
     assert plan["merges"][0]["reason"].startswith("identical")
 
 
-def test_one_party_is_never_merged_twice_in_one_run():
-    a = party("1", "Same Party", ref=A1)
-    b = party("2", "Same Party")
-    c = party("3", "Same Party")
-    plan = listings.plan_duplicates(listings.find_duplicate_pairs([a, b, c]), A1)
-    assert sorted(m["loserId"] for m in plan["merges"]) == ["2", "3"]
-    assert {m["keeperId"] for m in plan["merges"]} == {"1"}
+def test_three_listings_of_one_party_end_up_as_one_keeper_not_a_chain():
+    a = party("1", "Same Party")
+    b = party("2", "Same Party", ref=A1)
+    c = party("3", "Completely Other Name")  # same door, same hour
+    plan = listings.plan_duplicates(listings.find_duplicate_pairs([a, b, c]), {"1": 6.0, "2": 25.0, "3": 9.0})
+    assert sorted(m["loserId"] for m in plan["merges"]) == ["1", "3"]
+    assert {m["keeperId"] for m in plan["merges"]} == {"2"}
 
 
 # --- detectors --------------------------------------------------------------
@@ -271,24 +283,38 @@ def test_title_date_mismatch():
     assert mismatch("Winenot in the city 17/10", "2026-10-17T17:00:00.000") is False
 
 
-def test_party_issue_fingerprints_are_stable_and_zero_tier_is_global():
+def test_what_can_be_decided_is_not_asked():
+    # A ₪0 tier with an unclear name is simply not "free"; a title/date mismatch
+    # and a missing location follow GoOut. None of them is a question.
     info = price_of(tier("כרטיסים אחרונים", 0))
-    one = {"_id": "1", "goOutEventId": "100", "source": _source("A 17.10"), "priceInfo": info}
-    two = {"_id": "2", "goOutEventId": "200", "source": _source("B 17.10"), "priceInfo": info}
-    first = [i["fingerprint"] for i in listings.detect_party_issues(one)]
-    assert first == [i["fingerprint"] for i in listings.detect_party_issues(two)] == ["zero:כרטיסים אחרונים"]
+    assert info["hasFree"] is False and listings.ticket_price_from(info) is None
+    unclear = {"_id": "1", "goOutEventId": "100", "source": _source("A 17.10"), "priceInfo": info}
+    vague = {"_id": "2", "location": "Israël", "source": {"title": "X", "geo": {"lat": 31.046051, "lng": 34.851612}}}
+    wrong_date = {"_id": "3", "source": _source("HANUKKAH // 6.12", starts="2026-12-09T22:00:00.000")}
+    for listed in (unclear, vague, wrong_date):
+        assert listings.detect_party_issues(listed) == []
 
 
-def test_vague_location_is_flagged_unless_the_admin_set_one():
-    vague = {"_id": "1", "location": "Israël", "source": {"title": "X", "geo": {"lat": 31.046051, "lng": 34.851612}}}
-    assert [i["type"] for i in listings.detect_party_issues(vague)] == ["location_vague"]
-    assert listings.detect_party_issues({**vague, "location": "Kibbutz Y", "locks": ["location"]}) == []
+def test_test_events_and_vanished_pages_are_hidden_and_come_back_by_themselves():
+    assert listings.desired_status(_source("TEST EVENT 123"), {}) == ("hidden", "test")
+    assert listings.desired_status(_source("בדיקה - לא לפרסם"), {}) == ("hidden", "test")
+    assert listings.desired_status(_source("Testament Live 17.10"), {}) is None
+    gone = {**_source("X 17.10"), "failCount": 2}
+    assert listings.desired_status(gone, {}) == ("hidden", "gone")
+    assert listings.desired_status({**gone, "failCount": 1}, {}) is None
+    back = _source("X 17.10")
+    assert listings.desired_status(back, {"listingStatus": "hidden", "statusReason": "gone"}) == ("live", None)
+    assert listings.desired_status(back, {"listingStatus": "hidden", "statusReason": "admin"}) is None
+    assert listings.desired_status(gone, {"locks": ["listingStatus"]}) is None
 
 
-def test_gone_stale_and_unverified_sources_are_flagged():
+def test_an_absurd_price_is_not_shown():
+    assert listings.ticket_price_from(price_of(tier("שולחן VIP", 2500))) is None
+    assert listings.ticket_price_from(price_of(tier("רגיל", 450))) == 450
+
+
+def test_only_a_broken_sync_reaches_a_person():
     now = datetime(2026, 10, 9, 12)
-    gone = {"_id": "1", "source": {**_source("X 17.10"), "failCount": 2, "pageStatus": 404}}
-    assert [i["type"] for i in listings.detect_party_issues(gone, now)] == ["source_gone"]
     stale = {"_id": "2", "source": {**_source("X 17.10"), "fetchedAt": "2026-10-07T12:00:00"}}
     assert [i["type"] for i in listings.detect_party_issues(stale, now)] == ["stale_sync"]
     unverified = {"_id": "3", "priceInfo": {"verified": False},
@@ -308,12 +334,10 @@ def test_site_render_check_compares_the_live_page_with_the_database():
 
 # --- cases carried over from the scraper's retired dedupe_parties.py ---------
 
-def test_same_venue_same_hour_under_two_names_is_asked_not_merged():
+def test_same_venue_within_the_hour_under_two_names_is_one_party():
     a = party("1", "Organizer A presents: X", starts="2026-10-10T23:00:00.000")
     b = party("2", "Completely Different Branding", starts="2026-10-10T23:45:00.000")
-    assert listings.pair_level(a, b)["level"] == "possible"
-    plan = listings.plan_duplicates(listings.find_duplicate_pairs([a, b]), A1)
-    assert plan["merges"] == [] and len(plan["issues"]) == 1
+    assert listings.pair_level(a, b)["level"] == "certain"
 
 
 def test_same_venue_hours_apart_is_not_a_duplicate():
@@ -328,9 +352,9 @@ def test_same_brand_in_another_city_on_another_night_is_not_a_duplicate():
     assert listings.pair_level(a, b) is None
 
 
-def test_test_events_and_absurd_prices_are_asked_about():
-    test_event = {"_id": "1", "goOutEventId": "100", "source": _source("TEST EVENT 123")}
-    assert [i["fingerprint"] for i in listings.detect_party_issues(test_event)] == ["test:100"]
-    pricey = {"_id": "2", "goOutEventId": "200", "source": _source("Gala 17.10"), "ticketPrice": 2500}
-    assert [i["type"] for i in listings.detect_party_issues(pricey)] == ["price_suspicious"]
-    assert listings.detect_party_issues({**pricey, "ticketPrice": 450}) == []
+def test_a_different_event_down_the_street_is_not_the_same_venue():
+    # Real pair: a bar crawl starting 182 m from a club night, half an hour apart.
+    a = party("1", "Thursday on Rothschild 15.10", starts="2026-10-15T22:30:00.000")
+    b = party("2", "D-TLV Bar Quest Crawl", starts="2026-10-15T22:00:00.000", lat=32.0716, lng=34.7802)
+    assert 100 < listings.distance_m(a["source"], b["source"]) < 250
+    assert listings.pair_level(a, b) is None

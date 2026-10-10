@@ -211,6 +211,12 @@ def zero_tier_key(name: str) -> str:
     return re.sub(r"\s+", " ", name).strip().lower()
 
 
+AUTO_HIDE_REASONS = ("private", "test", "gone")
+# A promoter's "test" / "בדיקה" event that was left public on GoOut.
+_TEST_TITLE_RE = re.compile(r"^\s*(?:test(?:\s+event)?|demo(?:\s+event)?|טסט|בדיקה)(?:\s|$|[-_/])", re.IGNORECASE)
+MAX_PLAUSIBLE_PRICE = 2000.0
+
+
 def classify_zero_tier(name: str, zero_tier_rules: dict | None = None) -> str:
     """'free' | 'ignore' | 'unknown' for a tier priced ₪0. A ₪0 tier is often
     not free entry at all ("משלמים במקום", "שמירת שולחן") — only an explicit
@@ -280,8 +286,10 @@ def compute_price_info(tiers: list[dict] | None, zero_tier_rules: dict | None = 
 def ticket_price_from(price_info: dict):
     """Legacy `ticketPrice` (website, promo.py, WhatsApp engine all read it):
     the paid price, 0 only when the event really is free-only."""
-    if price_info.get("from") is not None:
-        return price_info["from"]
+    price = price_info.get("from")
+    if price is not None:
+        # A four-digit "ticket" is a table or a typo — better no price than that one.
+        return price if price <= MAX_PLAUSIBLE_PRICE else None
     return 0 if price_info.get("onlyFree") else None
 
 
@@ -375,17 +383,30 @@ def derive_fields(source: dict, price_info: dict | None = None) -> dict:
     return fields
 
 
+def auto_hide_reason(source: dict) -> str | None:
+    """Why a listing must not be on the site, decided without asking:
+    private on GoOut (owner decision), a promoter's test event, or a GoOut
+    page that failed to load twice in a row (cancelled / removed)."""
+    if source.get("publicity") == PRIVATE_PUBLICITY:
+        return "private"
+    if _TEST_TITLE_RE.search(str(source.get("title") or "")):
+        return "test"
+    if int(source.get("failCount") or 0) >= 2:
+        return "gone"
+    return None
+
+
 def desired_status(source: dict, party: dict) -> tuple[str, str | None] | None:
-    """Private GoOut events are never listed (owner decision). Returns the
-    (status, reason) the party should move to, or None for "leave it"; only
-    ever undoes a hide that this same rule made."""
+    """Returns the (status, reason) the party should move to, or None for
+    "leave it". Only ever undoes a hide that these same rules made, so a
+    listing comes back by itself when its GoOut page does."""
     if "listingStatus" in (party.get("locks") or []):
         return None  # the admin decided this one by hand
     status = party.get("listingStatus") or "live"
-    private = source.get("publicity") == PRIVATE_PUBLICITY
-    if private and status == "live":
-        return "hidden", "private"
-    if not private and status == "hidden" and party.get("statusReason") == "private":
+    reason = auto_hide_reason(source)
+    if reason and status == "live":
+        return "hidden", reason
+    if not reason and status == "hidden" and party.get("statusReason") in AUTO_HIDE_REASONS:
         return "live", None
     return None
 
@@ -482,6 +503,11 @@ def pair_fingerprint(a: dict, b: dict) -> str:
     return f"dup:{first}:{second}"
 
 
+# "Same venue" means the same pin on GoOut's map. 200 m was tried on real data
+# and merged a bar crawl into a club night down the street.
+SAME_VENUE_METERS = 50
+
+
 def pair_level(a: dict, b: dict) -> dict | None:
     """How sure we are that two listings are the same real-world party.
     Compares GoOut's live data (`source`), never our stored name — the stored
@@ -516,10 +542,11 @@ def pair_level(a: dict, b: dict) -> dict | None:
     same_title = bool(title_a) and len(title_a) >= 4 and title_a == title_b
     if hours <= 0.5 and near and (same_title or same_image):
         return {"level": "certain", **info}
-    # Same venue at the same hour: possibly one party sold under two names by
-    # two promoters (or by one promoter under two brands). Only a human knows.
-    if hours <= 1.0 and distance is not None and distance <= 200:
-        return {"level": "possible", **info}
+    # Same venue at the same hour is one party sold under two names (by two
+    # promoters, or by one promoter under two brands). Owner decision
+    # 2026-10-10: merge these without asking; an undo is remembered.
+    if hours <= 1.0 and distance is not None and distance <= SAME_VENUE_METERS:
+        return {"level": "certain", **info}
     if near and similarity >= 0.6:
         return {"level": "possible", **info}
     return None
@@ -536,73 +563,96 @@ def find_duplicate_pairs(parties: list[dict]) -> list[dict]:
     return pairs
 
 
-def _pick_keeper(a: dict, b: dict, account1_referral: str | None, revenue: dict) -> tuple[dict, dict, str]:
-    """(keeper, loser, why). account1 always wins (priority account); then the
-    listing that actually earned us commission; then the older document."""
-    a1 = bool(account1_referral) and a.get("referralCode") == account1_referral
-    b1 = bool(account1_referral) and b.get("referralCode") == account1_referral
-    if a1 != b1:
-        return (a, b, "account1") if a1 else (b, a, "account1")
-    rev_a, rev_b = revenue.get(str(a.get("_id")), 0.0), revenue.get(str(b.get("_id")), 0.0)
-    if rev_a != rev_b:
-        return (a, b, "revenue") if rev_a > rev_b else (b, a, "revenue")
-    return (a, b, "older") if str(a.get("_id")) <= str(b.get("_id")) else (b, a, "older")
+def _rank(party: dict, commission: dict, revenue: dict) -> tuple:
+    pid = str(party.get("_id"))
+    return (commission.get(pid, 0.0), revenue.get(pid, 0.0))
 
 
-def plan_duplicates(pairs: list[dict], account1_referral: str | None = None, revenue: dict | None = None,
+def _pick_keeper(group: list[dict], commission: dict, revenue: dict) -> dict:
+    """The listing that pays us the most per ticket; then the one that has
+    actually earned; then the older document. Owner decision 2026-10-10: the
+    account does not matter, only the commission."""
+    ordered = sorted(group, key=lambda p: str(p.get("_id")))
+    return max(ordered, key=lambda p: _rank(p, commission, revenue))
+
+
+def _why(keeper: dict, loser: dict, commission: dict, revenue: dict) -> str:
+    k, l = _rank(keeper, commission, revenue), _rank(loser, commission, revenue)
+    if k[0] != l[0]:
+        return "commission"
+    return "revenue" if k[1] != l[1] else "older"
+
+
+def plan_duplicates(pairs: list[dict], commission: dict | None = None, revenue: dict | None = None,
                     series_rules: dict | None = None, decided: set | None = None) -> dict:
-    """Turn suspicious pairs into {"merges": [...], "issues": [...]}.
+    """Turn suspicious pairs into {"merges": [...], "skipped": [...]}.
 
-    Owner rule (2026-10-09): when one side is account1, account1 is kept
-    automatically; account2-only groups are asked. Low-confidence ("possible")
-    pairs are always asked the first time — that is the "same party, different
-    promoter, different name" case — and a "remember for this series" answer
-    (series_rules) decides every later week without asking again.
+    Owner rule (2026-10-10): nothing is asked. "identical" and "certain" pairs
+    are merged, keeping the listing with the higher expected commission per
+    ticket (`commission`: party id -> ₪). "possible" pairs (similar title, not
+    provably the same venue) are left alone and only reported.
+
+    An undo sticks: a pair is never merged when either listing's status was
+    set by hand (`listingStatus` lock), when its fingerprint is in `decided`,
+    or when its venue + promoter series was marked "different".
+
+    Merges are planned per group, so three listings of one party end up as one
+    keeper and two losers, never a chain.
     """
-    revenue = revenue or {}
-    series_rules = series_rules or {}
-    decided = decided or set()
-    merges, issues, gone = [], [], set()
+    commission, revenue = commission or {}, revenue or {}
+    series_rules, decided = series_rules or {}, decided or set()
+    parent: dict[str, str] = {}
+    by_id: dict[str, dict] = {}
+    linked: dict[frozenset, dict] = {}
+    skipped = []
 
-    order = {"identical": 0, "certain": 1, "possible": 2}
-    for pair in sorted(pairs, key=lambda p: order[p["level"]]):
+    def find(x: str) -> str:
+        while parent.setdefault(x, x) != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for pair in pairs:
         a, b = pair["a"], pair["b"]
-        if str(a.get("_id")) in gone or str(b.get("_id")) in gone:
+        ida, idb = str(a.get("_id")), str(b.get("_id"))
+        hand_set = any("listingStatus" in (p.get("locks") or []) for p in (a, b))
+        rule = series_rules.get(series_rule_key(a, b) or "")
+        mergeable = pair["level"] in ("identical", "certain") or rule == "same"
+        if pair["level"] != "identical" and rule == "different":
+            mergeable = False
+        if hand_set or pair_fingerprint(a, b) in decided:
+            mergeable = False
+        if not mergeable:
+            if pair["level"] == "possible" and not hand_set:
+                skipped.append({"partyIds": [ida, idb], "fingerprint": pair_fingerprint(a, b),
+                                **{k: pair[k] for k in ("level", "hours", "distance", "similarity")}})
             continue
-        fingerprint = pair_fingerprint(a, b)
-        keeper, loser, why = _pick_keeper(a, b, account1_referral, revenue)
-        evidence = {k: pair[k] for k in ("level", "hours", "distance", "similarity", "sameImage")}
+        by_id[ida], by_id[idb] = a, b
+        linked[frozenset((ida, idb))] = pair
+        parent[find(ida)] = find(idb)
 
-        def merge(reason: str, keeper=keeper, loser=loser):
-            merges.append({"keeperId": str(keeper["_id"]), "loserId": str(loser["_id"]),
-                           "reason": reason, "fingerprint": fingerprint, "evidence": evidence})
-            gone.add(str(loser["_id"]))
+    groups: dict[str, list[dict]] = {}
+    for pid, party in by_id.items():
+        groups.setdefault(find(pid), []).append(party)
 
-        if pair["level"] == "identical":
-            merge(f"identical:{why}")
-            continue
-        if pair["level"] == "certain" and why == "account1":
-            merge("certain:account1")
-            continue
-        if fingerprint in decided:
-            continue
-        if pair["level"] == "possible":
-            rule = series_rules.get(series_rule_key(a, b) or "")
-            if rule == "different":
+    merges = []
+    for group in groups.values():
+        keeper = _pick_keeper(group, commission, revenue)
+        for loser in sorted(group, key=lambda p: str(p.get("_id"))):
+            if loser is keeper:
                 continue
-            if rule == "same":
-                merge(f"series_rule:{why}")
-                continue
-        issues.append({
-            "type": "duplicate",
-            "fingerprint": fingerprint,
-            "partyIds": [str(a["_id"]), str(b["_id"])],
-            "summary": f"{(a.get('source') or {}).get('title') or a.get('name')} ↔ "
-                       f"{(b.get('source') or {}).get('title') or b.get('name')}",
-            "evidence": {**evidence, "seriesKey": series_rule_key(a, b)},
-            "suggestion": {"keeperId": str(keeper["_id"]), "why": why},
-        })
-    return {"merges": merges, "issues": issues}
+            ids = frozenset((str(keeper["_id"]), str(loser["_id"])))
+            pair = linked.get(ids) or next(p for key, p in linked.items() if str(loser["_id"]) in key)
+            merges.append({
+                "keeperId": str(keeper["_id"]), "loserId": str(loser["_id"]),
+                "reason": f"{pair['level']}:{_why(keeper, loser, commission, revenue)}",
+                "fingerprint": pair_fingerprint(keeper, loser),
+                "seriesKey": series_rule_key(keeper, loser),
+                "evidence": {**{k: pair[k] for k in ("level", "hours", "distance", "similarity", "sameImage")},
+                             "keeperCommission": commission.get(str(keeper["_id"])),
+                             "loserCommission": commission.get(str(loser["_id"]))},
+            })
+    return {"merges": merges, "skipped": skipped}
 
 
 # --- per-party detectors ---------------------------------------------------
@@ -648,14 +698,14 @@ def location_is_vague(party: dict) -> bool:
     return _text(party.get("location")).lower() in _VAGUE_LOCATIONS
 
 
-# A promoter's "test" / "בדיקה" event that was left public on GoOut.
-_TEST_TITLE_RE = re.compile(r"^\s*(?:test(?:\s+event)?|demo(?:\s+event)?|טסט|בדיקה)(?:\s|$|[-_/])", re.IGNORECASE)
-MAX_PLAUSIBLE_PRICE = 2000.0
-
-
 def detect_party_issues(party: dict, now: datetime | None = None) -> list[dict]:
-    """Issues for one live, upcoming party that need a person. Each fingerprint
-    is stable, so a question answered once is never asked again."""
+    """Things about one live, upcoming party that only a person can fix.
+
+    Owner rule (2026-10-10): don't ask what can be decided. So this is only
+    "the sync itself is not working for this party" — a ₪0 tier with an unclear
+    name is treated as not free, a test or vanished event is hidden by
+    `desired_status`, and a title/date mismatch or a missing location simply
+    follows GoOut."""
     pid = str(party.get("_id"))
     source = party.get("source") or {}
     price_info = party.get("priceInfo") or {}
@@ -671,10 +721,7 @@ def detect_party_issues(party: dict, now: datetime | None = None) -> list[dict]:
         add("stale_sync", f"stale:{ref}", f"{name}: never synced with GoOut")
         return issues
 
-    if (source.get("failCount") or 0) >= 2:
-        add("source_gone", f"gone:{ref}", f"{name}: GoOut page is gone",
-            {"failCount": source.get("failCount"), "pageStatus": source.get("pageStatus")})
-    elif now is not None:
+    if now is not None and not (source.get("failCount") or 0):
         fetched = parse_local(source.get("fetchedAt"))
         if fetched and now - fetched > timedelta(hours=24):
             add("stale_sync", f"stale:{ref}", f"{name}: not synced for over 24h",
@@ -682,30 +729,6 @@ def detect_party_issues(party: dict, now: datetime | None = None) -> list[dict]:
 
     if price_info.get("verified") is False and (source.get("tiersFailCount") or 0) >= 3:
         add("price_unverified", f"price:{ref}", f"{name}: ticket tiers unreachable, price not verified")
-
-    for tier_name in price_info.get("unknownZeroTiers") or []:
-        key = zero_tier_key(tier_name)
-        if key:
-            # Global on purpose: the answer is about the tier's wording, not this party.
-            add("zero_tier", f"zero:{key}", f"₪0 ticket \"{tier_name}\" — is this free entry?",
-                {"tierName": tier_name, "tierKey": key})
-
-    if title_date_mismatch(source):
-        add("title_date", f"titledate:{ref}:{(source.get('startsAt') or '')[:10]}",
-            f"{name}: title date doesn't match the start date",
-            {"title": source.get("title"), "startsAt": source.get("startsAt")})
-
-    if _TEST_TITLE_RE.search(str(source.get("title") or "")):
-        add("test_listing", f"test:{ref}", f"{name}: looks like a test event")
-
-    price = party.get("ticketPrice")
-    if isinstance(price, (int, float)) and price > MAX_PLAUSIBLE_PRICE:
-        add("price_suspicious", f"highprice:{ref}", f"{name}: ticket price ₪{price:g} looks wrong",
-            {"ticketPrice": price})
-
-    if location_is_vague(party):
-        add("location_vague", f"loc:{ref}", f"{name}: no usable location",
-            {"location": party.get("location"), "englishAddress": source.get("englishAddress")})
 
     return issues
 

@@ -13,12 +13,17 @@ Revenue model (see workspace root CLAUDE.md):
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
 
-ACCOUNT1_FLAT_FEE = 25.0
+# Set ACCOUNT1_FLAT_FEE on Render when the account1 deal changes (the owner
+# said on 2026-10-10 it is about to drop to ₪15). This is the *expected* fee
+# used for ranking and for choosing which duplicate listing to keep; recorded
+# sales keep whatever the sales tracker logged at the time.
+ACCOUNT1_FLAT_FEE = float(os.environ.get("ACCOUNT1_FLAT_FEE") or 25.0)
 ACCOUNT2_PCT = 0.06
 # Used only to estimate account2 commission when a party has no scraped price yet.
 DEFAULT_TICKET_PRICE = 100.0

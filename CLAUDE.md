@@ -96,7 +96,9 @@ version marker exposed by the API; confirm deploys via `/api/health` timing or a
 ## Rules
 
 - Never change the referral logic so account2's code wins over account1's on a shared
-  party (see root doc). `settings` collection key `referral` is the site-wide default.
+  party (see root doc). That is about one GoOut event both accounts can sell; which of two
+  *separate* duplicate listings is kept is a different rule (higher expected commission, any
+  account — `listings.plan_duplicates`). Don't "fix" one to match the other. `settings` collection key `referral` is the site-wide default.
 - Analytics `revenue` must stay **our commission** (from `goout_sales_log`), not GoOut gross;
   `real*` fields carry GoOut's own numbers.
 - Time windows: filter `goout_sales_log` by `recorded_at` for any "last N days" figure —

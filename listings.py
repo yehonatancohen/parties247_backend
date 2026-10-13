@@ -31,8 +31,6 @@ from datetime import datetime, timedelta
 # would put every venue-less event 0 m away from every other one.
 PLACEHOLDER_GEO = (31.046051, 34.851612)
 
-PRIVATE_PUBLICITY = "פרטי"
-
 # Display fields the sync may overwrite, and therefore the ones an admin edit
 # can lock. Anything not listed here is never touched by the sync.
 LOCKABLE_FIELDS = (
@@ -384,11 +382,11 @@ def derive_fields(source: dict, price_info: dict | None = None) -> dict:
 
 
 def auto_hide_reason(source: dict) -> str | None:
-    """Why a listing must not be on the site, decided without asking:
-    private on GoOut (owner decision), a promoter's test event, or a GoOut
-    page that failed to load twice in a row (cancelled / removed)."""
-    if source.get("publicity") == PRIVATE_PUBLICITY:
-        return "private"
+    """Why a listing must not be on the site, decided without asking: a
+    promoter's test event, or a GoOut page that failed to load twice in a row
+    (cancelled / removed). Private-on-GoOut events stay listed (owner decision
+    2026-10-13, reversing 2026-10-10); "private" stays in AUTO_HIDE_REASONS so
+    the ones hidden under the old rule come back on their next sync."""
     if _TEST_TITLE_RE.search(str(source.get("title") or "")):
         return "test"
     if int(source.get("failCount") or 0) >= 2:

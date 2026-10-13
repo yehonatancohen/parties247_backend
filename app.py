@@ -3997,7 +3997,7 @@ OPENAPI_TEMPLATE = {
         "/api/admin/listings/hidden": {
             "get": {
                 "summary": "Unlisted upcoming parties",
-                "description": "Upcoming parties that exist but are not listed: private on GoOut, merged duplicates, hidden by hand.",
+                "description": "Upcoming parties that exist but are not listed: test events, vanished GoOut pages, merged duplicates, hidden by hand. A merged party carries mergedIntoParty {id, name, slug, date, listingStatus} (null if that party is gone).",
                 "security": [{"bearerAuth": []}],
                 "responses": {"200": {"description": "OK"}, "401": {"description": "Missing or invalid admin token."}},
             }
@@ -4005,7 +4005,7 @@ OPENAPI_TEMPLATE = {
         "/api/admin/listings/{partyId}/status": {
             "post": {
                 "summary": "Hide or relist a party",
-                "description": "Body {status: live|hidden}. Relisting a merged party also removes its redirect. The choice is locked against the automatic private-event rule.",
+                "description": "Body {status: live|hidden}. Relisting a merged party also removes its redirect. The choice is locked against the automatic hide rules.",
                 "security": [{"bearerAuth": []}],
                 "responses": {"200": {"description": "OK"}, "401": {"description": "Missing or invalid admin token."}},
             }
@@ -4037,7 +4037,7 @@ OPENAPI_TEMPLATE = {
         "/api/internal/listings/sync": {
             "post": {
                 "summary": "Apply a listing sync batch (service)",
-                "description": "Body {items: [{partyId, event?, ogImage?, pageStatus?, tiers?}], dryRun?, fullDone?} with at most 60 items. Parses the raw GoOut data, updates price / name / date / location / image / region honouring admin locks, hides private events. X-Service-Token.",
+                "description": "Body {items: [{partyId, event?, ogImage?, pageStatus?, tiers?}], dryRun?, fullDone?} with at most 60 items. Parses the raw GoOut data, updates price / name / date / location / image / region honouring admin locks, hides test events and vanished pages. X-Service-Token.",
                 
                 "responses": {"200": {"description": "OK"}, "401": {"description": "Missing or invalid service token."}},
             }
@@ -5367,10 +5367,8 @@ def scrape_party_details(url: str):
             "soldOut": bool(fields.get("soldOut")),
             "priceInfo": price_info,
             "source": source,
-            "listingStatus": "hidden" if source.get("publicity") == listings.PRIVATE_PUBLICITY else "live",
+            "listingStatus": "live",
         }
-        if party_details["listingStatus"] == "hidden":
-            party_details["statusReason"] = "private"
         if go_out:
             party_details["goOutUrl"] = go_out
 
@@ -9089,14 +9087,42 @@ def list_listing_changes():
 @limiter.limit("60 per minute")
 @protect
 def list_hidden_listings():
-    """Upcoming parties that exist but aren't listed (private, merged, hidden by hand)."""
+    """Upcoming parties that exist but aren't listed (test, gone, merged, hidden by hand).
+    A merged one also carries the party it was merged into, so the admin can
+    see where its traffic goes."""
     if parties_collection is None:
         return jsonify({"message": "Database unavailable."}), 503
     state = _listing_guard_state()
     docs = list(parties_collection.find(
         {"date": {"$gte": _upcoming_date_floor()}, "listingStatus": {"$in": list(listings.HIDDEN_STATUSES)}}
     ).sort("date", 1))
-    return jsonify({"parties": [_listing_card(doc, state.get("account1Referral"), {}) for doc in docs]}), 200
+    keepers = _merge_keepers(docs)
+    cards = []
+    for doc in docs:
+        card = _listing_card(doc, state.get("account1Referral"), {})
+        if doc.get("listingStatus") == "merged":
+            card["mergedIntoParty"] = keepers.get(str(doc.get("mergedInto") or ""))
+        cards.append(card)
+    return jsonify({"parties": cards}), 200
+
+
+def _merge_keepers(docs: list[dict]) -> dict[str, dict]:
+    """Party id -> {id, name, slug, date, listingStatus} for every party the
+    merged listings in `docs` were folded into, in one projected read."""
+    ids = []
+    for doc in docs:
+        if doc.get("listingStatus") == "merged" and doc.get("mergedInto"):
+            try:
+                ids.append(ObjectId(str(doc["mergedInto"])))
+            except Exception:
+                continue
+    if not ids:
+        return {}
+    keepers = parties_collection.find(
+        {"_id": {"$in": ids}}, {"name": 1, "slug": 1, "date": 1, "listingStatus": 1})
+    return {str(k["_id"]): {"id": str(k["_id"]), "name": k.get("name"), "slug": k.get("slug"),
+                            "date": k.get("date"), "listingStatus": k.get("listingStatus") or "live"}
+            for k in keepers}
 
 
 def _remember_unmerge(party: dict):
@@ -9130,7 +9156,7 @@ def _remember_unmerge(party: dict):
 @protect
 def set_listing_status(party_id):
     """Hide a party or bring one back (also the undo for a merge). A manual
-    choice is locked, so the private-event rule won't flip it back."""
+    choice is locked, so the automatic hide rules won't flip it back."""
     data = request.get_json(silent=True) or {}
     status = data.get("status")
     if status not in ("live", "hidden"):

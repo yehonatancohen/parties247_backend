@@ -79,10 +79,12 @@ def test_missing_page_counts_failures_without_touching_fields():
     assert outcome["set"]["source"]["failCount"] == 1 and outcome["set"]["source"]["title"] == EVENT["Title"]
 
 
-def test_private_event_is_hidden_by_the_sync():
+def test_private_event_stays_listed_by_the_sync():
     outcome = sync({"_id": "p1", "name": "x"}, {"partyId": "p1", "event": {**EVENT, "EventPublicity": "פרטי"}})
-    assert outcome["set"]["listingStatus"] == "hidden" and outcome["set"]["statusReason"] == "private"
-    assert outcome["changes"]["listingStatus"] == ["live", "hidden"]
+    assert "listingStatus" not in outcome["set"] and "listingStatus" not in outcome["changes"]
+    hidden = {"_id": "p1", "name": "x", "listingStatus": "hidden", "statusReason": "private"}
+    back = sync(hidden, {"partyId": "p1", "event": {**EVENT, "EventPublicity": "פרטי"}})
+    assert back["set"]["listingStatus"] == "live"
 
 
 def test_admin_locked_price_survives_the_sync():
@@ -339,3 +341,23 @@ def test_hidden_party_opens_by_direct_link_only_and_merged_never(monkeypatch):
     assert app.find_event_by_slug("private", include_unlisted=True)[1]["_id"] == "2"
     assert app.find_event_by_slug("dup", include_unlisted=True)[1] is None
     assert app.find_event_by_slug("live")[1]["_id"] == "1"
+
+
+def test_merge_keepers_names_the_party_each_duplicate_went_into(monkeypatch):
+    parties = FakeParties([
+        {"_id": "k1", "name": "Keeper", "slug": "keeper", "date": "2026-10-16T23:00:00"},
+        {"_id": "k2", "name": "Hidden keeper", "slug": "k2", "date": "2026-10-17T23:00:00", "listingStatus": "hidden"},
+    ])
+    monkeypatch.setattr(app, "parties_collection", parties)
+    docs = [
+        {"_id": "d1", "listingStatus": "merged", "mergedInto": "k1"},
+        {"_id": "d2", "listingStatus": "merged", "mergedInto": "k2"},
+        {"_id": "d3", "listingStatus": "merged", "mergedInto": "gone"},
+        {"_id": "h1", "listingStatus": "hidden", "mergedInto": "k1"},
+    ]
+    keepers = app._merge_keepers(docs)
+    assert keepers["k1"] == {"id": "k1", "name": "Keeper", "slug": "keeper",
+                             "date": "2026-10-16T23:00:00", "listingStatus": "live"}
+    assert keepers["k2"]["listingStatus"] == "hidden"
+    assert "gone" not in keepers
+    assert app._merge_keepers([{"_id": "h1", "listingStatus": "hidden"}]) == {}

@@ -145,14 +145,17 @@ def test_geo_beats_keywords_and_centroid_placeholder_is_no_location():
     assert listings.geo_classification({"geo": {"lat": 31.046051, "lng": 34.851612}}) == {}  # "Israël"
 
 
-def test_private_events_are_hidden_and_come_back_when_public():
+def test_private_events_stay_listed_and_old_private_hides_come_back():
     private = {"publicity": "פרטי"}
-    assert listings.desired_status(private, {}) == ("hidden", "private")
-    assert listings.desired_status({"publicity": "פומבי"}, {"listingStatus": "hidden", "statusReason": "private"}) == ("live", None)
+    assert listings.desired_status(private, {}) is None
+    assert listings.desired_status(private, {"listingStatus": "live"}) is None
+    # Hidden under the old private rule -> back on the site at the next sync.
+    assert listings.desired_status(private, {"listingStatus": "hidden", "statusReason": "private"}) == ("live", None)
     # Never undo a hide somebody made by hand, never touch a merge.
-    assert listings.desired_status({"publicity": "פומבי"}, {"listingStatus": "hidden", "statusReason": "admin"}) is None
+    assert listings.desired_status(private, {"listingStatus": "hidden", "statusReason": "admin"}) is None
     assert listings.desired_status(private, {"listingStatus": "merged"}) is None
-    assert listings.desired_status(private, {"listingStatus": "live", "locks": ["listingStatus"]}) is None
+    assert listings.desired_status(private, {"listingStatus": "hidden", "statusReason": "private",
+                                             "locks": ["listingStatus"]}) is None
 
 
 # --- duplicates -------------------------------------------------------------

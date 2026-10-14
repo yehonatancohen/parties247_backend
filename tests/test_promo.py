@@ -287,11 +287,14 @@ def test_attach_rank_scores_uses_cached_inputs_and_survives_failures(monkeypatch
         return {"sales_by_event_id": {}, "accounts_by_event_id": {}, "stats_by_party_id": {}}
 
     monkeypatch.setattr(app, "_ranking_inputs", inputs)
-    docs = [{"_id": "1", "ticketPrice": 100, "commission": {"type": "fixed", "value": 50}},
-            {"_id": "2", "ticketPrice": 100},
-            {"_id": "3", "ticketPrice": 100, "listingStatus": "merged"}]
+    future, past = "2099-01-01T23:00:00", "2000-01-01T23:00:00"
+    docs = [{"_id": "1", "date": future, "ticketPrice": 100, "commission": {"type": "fixed", "value": 50}},
+            {"_id": "2", "date": future, "ticketPrice": 100},
+            {"_id": "3", "date": future, "ticketPrice": 100, "listingStatus": "merged"},
+            {"_id": "4", "date": past, "ticketPrice": 100, "commission": {"type": "fixed", "value": 500}}]
     app._attach_rank_scores(docs)
-    assert docs[0]["rankScore"] == 100.0 and 0 < docs[1]["rankScore"] < 100 and "rankScore" not in docs[2]
+    assert docs[0]["rankScore"] == 100.0 and 0 < docs[1]["rankScore"] < 100
+    assert "rankScore" not in docs[2] and "rankScore" not in docs[3]
 
     def boom():
         raise RuntimeError("mongo down")

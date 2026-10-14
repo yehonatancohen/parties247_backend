@@ -440,7 +440,10 @@ def _attach_rank_scores(docs: list[dict]) -> None:
     """Sets `rankScore` (0-100, best party = 100) on each party; the site
     orders by it. Best effort: without it the site falls back to date order."""
     try:
-        ranking = _rank([d for d in docs if not listings.is_hidden(d)])
+        now_local = _local_now()
+        # Upcoming only: a past party's lifetime sales would otherwise set the
+        # "100" and squeeze every upcoming party's rankScore toward 0.
+        ranking = _rank([d for d in docs if not listings.is_hidden(d) and listings.is_upcoming(d, now_local)])
     except Exception as exc:
         app.logger.warning(f"[RANKING] could not rank parties: {exc}")
         return

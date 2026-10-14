@@ -70,6 +70,14 @@ Performance rule: never `fetch_all_documents(coll)` without a `projection` on `p
 or `goout_sales` — the Render↔Atlas link moves ~140 KB/s, so full-document scans are
 where the admin dashboard's multi-second waits came from (see root doc).
 
+Site ranking: `promo.rank_parties` scores each party as our ₪ per ticket (party
+`commission` {type: fixed|percent, value} set in the admin, else account1 flat fee /
+account2 6%) x tickets per 100 views (site counters + lifetime sales, shrunk toward the site
+average). `_fetch_parties_cached` adds `rankScore` (0-100) to every party; its slow inputs
+are cached 10 min (`_ranking_inputs`). `commission` is stripped from public responses.
+`/api/admin/ranking` and the commission PUT back the admin's `/ranking` page. Recorded
+revenue in `goout_sales_log` is still what the sales tracker computed.
+
 `/api/parties` (`get_parties`) and `default_referral_code()` share a 20s in-process
 cache (`_parties_cache` / `_referral_cache` in app.py) — added 2026-09-17 after a real
 outage where concurrent requests (a Vercel deploy's static generation plus normal

@@ -387,8 +387,67 @@ def _find_parties(query: dict):
 
 
 def _public_party(party: dict) -> dict:
-    """Site-facing copy: without the admin-only lock list."""
-    return {k: v for k, v in party.items() if k not in ("source", "locks")}
+    """Site-facing copy: without the admin-only lock list or the party's
+    commission deal (the site only gets the derived `rankScore`)."""
+    return {k: v for k, v in party.items() if k not in ("source", "locks", "commission")}
+
+
+# --- Site ranking (promo.rank_parties) ---
+#
+# Inputs that are slow to gather (sales log aggregate, sales-tracker accounts,
+# per-party view/click counters) are cached far longer than the 20s parties
+# cache: they move slowly, and re-reading them on every parties miss would
+# bring back the slow-link pile-up of 2026-09-17. The ranking itself is pure
+# and recomputed from whatever party list is being served.
+RANKING_INPUTS_TTL_SECONDS = int(os.environ.get("RANKING_INPUTS_TTL_SECONDS", "600"))
+_ranking_inputs_cache: dict = {"value": None, "fetched_at": 0.0}
+_ranking_inputs_lock = threading.Lock()
+
+
+def _party_stats_by_id() -> dict[str, dict]:
+    stats: dict[str, dict] = {}
+    if party_analytics_collection is None:
+        return stats
+    for doc in fetch_all_documents(party_analytics_collection,
+                                   projection={"_id": 0, "partyId": 1, "views": 1, "redirects": 1}):
+        if doc.get("partyId"):
+            stats[str(doc["partyId"])] = {"views": doc.get("views") or 0, "redirects": doc.get("redirects") or 0}
+    return stats
+
+
+def _ranking_inputs() -> dict:
+    cached = _ranking_inputs_cache["value"]
+    if cached is not None and time.monotonic() - _ranking_inputs_cache["fetched_at"] < RANKING_INPUTS_TTL_SECONDS:
+        return cached
+    with _ranking_inputs_lock:
+        cached = _ranking_inputs_cache["value"]
+        if cached is not None and time.monotonic() - _ranking_inputs_cache["fetched_at"] < RANKING_INPUTS_TTL_SECONDS:
+            return cached
+        value = {
+            "sales_by_event_id": _sales_totals_by_event_id(cutoff=None),
+            "accounts_by_event_id": _accounts_by_event_id() if goout_sales_collection is not None else {},
+            "stats_by_party_id": _party_stats_by_id(),
+        }
+        _ranking_inputs_cache.update(value=value, fetched_at=time.monotonic())
+        return value
+
+
+def _rank(parties: list[dict]) -> dict[str, dict]:
+    return promo.rank_parties(parties, account1_referral=ACCOUNT1_REFERRAL_CODE, **_ranking_inputs())
+
+
+def _attach_rank_scores(docs: list[dict]) -> None:
+    """Sets `rankScore` (0-100, best party = 100) on each party; the site
+    orders by it. Best effort: without it the site falls back to date order."""
+    try:
+        ranking = _rank([d for d in docs if not listings.is_hidden(d)])
+    except Exception as exc:
+        app.logger.warning(f"[RANKING] could not rank parties: {exc}")
+        return
+    for doc in docs:
+        row = ranking.get(str(doc.get("_id")))
+        if row:
+            doc["rankScore"] = row["rankScore"]
 
 
 def _fetch_parties_cached(query: dict, include_hidden: bool = False) -> list[dict]:
@@ -423,6 +482,7 @@ def _fetch_parties_cached(query: dict, include_hidden: bool = False) -> list[dic
             party["slug"] = slug or ""
             apply_default_referral(party, referral)
             docs.append(party)
+        _attach_rank_scores(docs)
 
         _parties_cache[key] = {
             "docs": docs,
@@ -3085,7 +3145,7 @@ _PROMO_PARTY_PROJECTION = {
     "name": 1, "slug": 1, "date": 1, "startsAt": 1, "goOutEventId": 1,
     "goOutUrl": 1, "originalUrl": 1, "canonicalUrl": 1, "location": 1,
     "musicType": 1, "age": 1, "ticketPrice": 1, "referralCode": 1,
-    "hidden": 1, "isPromotion": 1, "listingStatus": 1,
+    "hidden": 1, "isPromotion": 1, "listingStatus": 1, "commission": 1,
 }
 
 
@@ -3161,7 +3221,7 @@ def admin_party_commission():
     try:
         now = datetime.now(timezone.utc)
         parties = fetch_all_documents(parties_collection, projection={
-            "date": 1, "startsAt": 1, "goOutEventId": 1, "ticketPrice": 1, "referralCode": 1,
+            "date": 1, "startsAt": 1, "goOutEventId": 1, "ticketPrice": 1, "referralCode": 1, "commission": 1,
         })
         data = promo.commission_by_party(
             parties,
@@ -3195,6 +3255,74 @@ def promo_whatsapp():
         app.logger.error(f"Failed to build WhatsApp promo drafts: {exc}")
         return jsonify({"message": "Failed to build promo drafts."}), 500
     return jsonify(data), 200
+
+
+_RANKING_PARTY_PROJECTION = {
+    "name": 1, "slug": 1, "date": 1, "startsAt": 1, "goOutEventId": 1, "ticketPrice": 1,
+    "referralCode": 1, "soldOut": 1, "listingStatus": 1, "commission": 1, "imageUrl": 1,
+}
+
+
+@app.route("/api/admin/ranking", methods=["GET"])
+@limiter.limit("30 per minute")
+@protect
+def admin_ranking():
+    """Upcoming listed parties in site order: our ₪ per ticket (with the
+    party's own commission deal if set), buy likelihood, and the score the
+    site sorts by. Reads fresh inputs, not the 10-minute cache."""
+    if parties_collection is None:
+        return jsonify({"message": "Parties datastore unavailable."}), 503
+    try:
+        now_local = _local_now()
+        parties = [p for p in fetch_all_documents(parties_collection, projection=_RANKING_PARTY_PROJECTION)
+                   if not listings.is_hidden(p) and listings.is_upcoming(p, now_local)]
+        _ranking_inputs_cache.update(value=None, fetched_at=0.0)
+        ranking = _rank(parties)
+    except Exception as exc:
+        app.logger.error(f"Failed to build ranking: {exc}")
+        return jsonify({"message": "Failed to build ranking."}), 500
+    rows = []
+    for party in parties:
+        row = ranking.get(str(party["_id"]))
+        if not row:
+            continue
+        rows.append({**row, "name": party.get("name"), "slug": party.get("slug"),
+                     "date": party.get("date") or party.get("startsAt"), "imageUrl": party.get("imageUrl")})
+    rows.sort(key=lambda r: r["position"])
+    return jsonify({
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "defaults": {"account1FlatFee": promo.ACCOUNT1_FLAT_FEE, "account2Percent": promo.ACCOUNT2_PCT * 100},
+        "parties": rows,
+    }), 200
+
+
+@app.route("/api/admin/parties/<party_id>/commission", methods=["PUT"])
+@limiter.limit("60 per minute")
+@protect
+def set_party_commission(party_id):
+    """Set this party's own commission deal: {type: "fixed", value: ₪ per
+    ticket} or {type: "percent", value: % of the ticket price}. {type: null}
+    goes back to the account default."""
+    if parties_collection is None:
+        return jsonify({"message": "Parties datastore unavailable."}), 503
+    data = request.get_json(silent=True) or {}
+    clearing = data.get("type") is None
+    commission = None if clearing else promo.clean_commission(data)
+    if not clearing and commission is None:
+        return jsonify({"message": "Body must be {type: 'fixed'|'percent', value: number} (percent 0-100), or {type: null}."}), 400
+    try:
+        obj_id = ObjectId(party_id)
+        party = parties_collection.find_one({"_id": obj_id}, {"name": 1, "commission": 1})
+    except Exception:
+        return jsonify({"message": "Invalid ID."}), 400
+    if not party:
+        return jsonify({"message": "Party not found."}), 404
+    update = {"$unset": {"commission": ""}} if clearing else {"$set": {"commission": commission}}
+    parties_collection.update_one({"_id": obj_id}, update)
+    _parties_cache.clear()
+    record_admin_action("set_party_commission", "party", party_id,
+                        {"name": party.get("name"), "old": party.get("commission"), "new": commission})
+    return jsonify({"message": "Commission saved.", "commission": commission}), 200
 
 
 @app.route("/analytics", methods=["GET"])
@@ -3854,7 +3982,7 @@ OPENAPI_TEMPLATE = {
         "/api/admin/parties/commission": {
             "get": {
                 "summary": "Commission per upcoming party",
-                "description": "For every upcoming party, keyed by party id: our commission per ticket (account1 flat ₪25, account2 6% of the ticket price; perTicketEstimated when the price is unknown) and lifetime tickets/commission from goout_sales_log.",
+                "description": "For every upcoming party, keyed by party id: our commission per ticket (the party's own commission deal if set, else account1 flat ₪25 / account2 6% of the ticket price; perTicketEstimated when the price is unknown) and lifetime tickets/commission from goout_sales_log.",
                 "security": [{"bearerAuth": []}],
                 "responses": {
                     "200": {
@@ -3878,6 +4006,23 @@ OPENAPI_TEMPLATE = {
                         }}},
                     },
                 },
+            }
+        },
+        "/api/admin/ranking": {
+            "get": {
+                "summary": "Site ranking of upcoming parties",
+                "description": "Upcoming listed parties in the order the site shows them: perTicket (our ₪ per ticket, from the party's own commission if set, else account1 flat fee / account2 6%), views/redirects (site counters), tickets (lifetime, any of our links), ticketsPer100Views (buy likelihood, shrunk toward the site average), score = perTicket x ticketsPer100Views (expected ₪ per 100 views; 0 when sold out), rankScore (0-100, the only figure the public site gets) and position.",
+                "security": [{"bearerAuth": []}],
+                "responses": {"200": {"description": "{generatedAt, defaults: {account1FlatFee, account2Percent}, parties: [...]}"}},
+            }
+        },
+        "/api/admin/parties/{party_id}/commission": {
+            "put": {
+                "summary": "Set a party's own commission deal",
+                "description": "Body {type: 'fixed', value: ₪ per ticket} or {type: 'percent', value: % of the ticket price (0-100)}; {type: null} returns the party to its account default. Used for ranking, promo drafts, duplicate keeping and the commission column; recorded sales keep what the sales tracker logged.",
+                "security": [{"bearerAuth": []}],
+                "parameters": [{"name": "party_id", "in": "path", "required": True, "schema": {"type": "string"}}],
+                "responses": {"200": {"description": "Saved."}, "400": {"description": "Invalid body or id."}, "404": {"description": "Party not found."}},
             }
         },
         "/api/holiday-pages/{slug}": {
@@ -8762,12 +8907,13 @@ def _commission_by_party_id(parties: list[dict], account1_referral: str | None) 
         tier = promo.account_tier(accounts.get(str(party.get("goOutEventId") or "")),
                                   party.get("referralCode"), account1_referral)
         price = party.get("ticketPrice")
-        if tier != "account1" and not (isinstance(price, (int, float)) and price > 0):
-            # 6% of a free or unknown ticket: don't let promo's ₪100 guess
+        override = party.get("commission")
+        if promo.commission_needs_price(tier, override) and not (isinstance(price, (int, float)) and price > 0):
+            # A share of a free or unknown ticket: don't let promo's ₪100 guess
             # outrank a listing whose price we actually know.
             result[str(party["_id"])] = 0.0
             continue
-        result[str(party["_id"])] = promo.expected_commission_per_ticket(tier, price)
+        result[str(party["_id"])] = promo.expected_commission_per_ticket(tier, price, override)
     return result
 
 

@@ -203,3 +203,4 @@ def _reset_backend_caches():
     import app
     app._parties_cache.clear()
     app._referral_cache.update({"value": app._REFERRAL_UNSET, "fetched_at": 0.0})
+    app._ranking_inputs_cache.update({"value": None, "fetched_at": 0.0})

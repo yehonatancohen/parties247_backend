@@ -185,8 +185,118 @@ def test_commission_by_party_tiers_earnings_and_upcoming_only():
         account1_referral="acc1code",
     )
     assert set(out) == {"a1", "a2", "a3", "ref"}
-    assert out["a1"] == {"tier": "account1", "perTicket": 25.0, "perTicketEstimated": False,
+    assert out["a1"] == {"tier": "account1", "perTicket": 25.0, "perTicketEstimated": False, "commission": None,
                          "ticketPrice": 80.0, "ticketsSold": 6, "earned": 150.0}
     assert out["a2"]["tier"] == "account2" and out["a2"]["perTicket"] == 7.2 and out["a2"]["earned"] == 0.0
     assert out["a3"]["perTicketEstimated"] is True
     assert out["ref"]["tier"] == "account1"
+
+
+# --- per-party commission deal ----------------------------------------------
+
+def test_clean_commission_accepts_fixed_and_percent_only():
+    assert promo.clean_commission({"type": "fixed", "value": "30"}) == {"type": "fixed", "value": 30.0}
+    assert promo.clean_commission({"type": "percent", "value": 8.5}) == {"type": "percent", "value": 8.5}
+    for bad in (None, {}, {"type": "fixed"}, {"type": "fixed", "value": -1}, {"type": "percent", "value": 101},
+                {"type": "bonus", "value": 5}, {"type": "fixed", "value": "abc"}, {"type": "fixed", "value": float("nan")}):
+        assert promo.clean_commission(bad) is None
+
+
+def test_party_commission_overrides_the_account_default():
+    fixed, pct = {"type": "fixed", "value": 30}, {"type": "percent", "value": 10}
+    assert promo.expected_commission_per_ticket("account2", 200, fixed) == 30.0
+    assert promo.expected_commission_per_ticket("account1", 200, pct) == 20.0
+    assert promo.expected_commission_per_ticket("account1", None, pct) == promo.DEFAULT_TICKET_PRICE * 0.10
+    # an invalid stored deal is ignored, not an error
+    assert promo.expected_commission_per_ticket("account1", 200, {"type": "x"}) == promo.ACCOUNT1_FLAT_FEE
+    assert promo.commission_needs_price("account1", pct) and not promo.commission_needs_price("account2", fixed)
+    assert promo.commission_needs_price("account2") and not promo.commission_needs_price("account1")
+
+
+def test_commission_by_party_reports_the_override():
+    now = datetime(2026, 9, 8, 12, 0, tzinfo=ISRAEL)
+    party = _party(ticketPrice=None, commission={"type": "fixed", "value": 40})
+    row = promo.commission_by_party([party], sales_by_event_id={}, accounts_by_event_id={}, now=now)["p1"]
+    assert row["perTicket"] == 40.0 and row["perTicketEstimated"] is False
+    assert row["commission"] == {"type": "fixed", "value": 40.0}
+
+
+# --- site ranking -------------------------------------------------------------
+
+def _ranked(parties, stats, sales=None, accounts=None):
+    return promo.rank_parties(parties, sales_by_event_id=sales or {}, accounts_by_event_id=accounts or {},
+                              stats_by_party_id=stats, account1_referral="A1")
+
+
+def test_rank_is_commission_times_buy_likelihood():
+    parties = [
+        {"_id": "cheap-hot", "goOutEventId": "1", "ticketPrice": 100, "referralCode": "A2"},   # ₪6/ticket
+        {"_id": "rich-cold", "goOutEventId": "2", "ticketPrice": 100, "referralCode": "A1"},   # ₪25/ticket
+    ]
+    stats = {"cheap-hot": {"views": 1000, "redirects": 300}, "rich-cold": {"views": 1000, "redirects": 20}}
+    sales = {"1": {"totalTicketsSold": 120}, "2": {"totalTicketsSold": 2}}
+    ranked = _ranked(parties, stats, sales)
+    hot, cold = ranked["cheap-hot"], ranked["rich-cold"]
+    assert hot["ticketsPer100Views"] > 5 * cold["ticketsPer100Views"]
+    assert hot["score"] == round(hot["perTicket"] * hot["ticketsPer100Views"], 3)
+    assert hot["position"] == 1 and hot["rankScore"] == 100.0 and 0 < cold["rankScore"] < 100
+
+    # Raising the cold party's deal enough flips the order.
+    parties[1]["commission"] = {"type": "fixed", "value": 200}
+    assert _ranked(parties, stats, sales)["rich-cold"]["position"] == 1
+
+
+def test_parties_without_traffic_rank_by_commission_and_sold_out_scores_zero():
+    parties = [
+        {"_id": "a", "ticketPrice": 100, "referralCode": "A2"},
+        {"_id": "b", "ticketPrice": 100, "referralCode": "A1"},
+        {"_id": "c", "ticketPrice": 100, "referralCode": "A1", "soldOut": True},
+    ]
+    ranked = _ranked(parties, {})
+    assert ranked["a"]["ticketsPer100Views"] == ranked["b"]["ticketsPer100Views"] > 0
+    assert [p for p, _ in sorted(ranked.items(), key=lambda kv: kv[1]["position"])] == ["b", "a", "c"]
+    assert ranked["c"]["score"] == 0.0 and ranked["c"]["rankScore"] == 0.0
+
+
+def test_one_lucky_click_does_not_beat_steady_demand():
+    parties = [{"_id": "lucky", "goOutEventId": "1", "ticketPrice": 100},
+               {"_id": "steady", "goOutEventId": "2", "ticketPrice": 100}]
+    stats = {"lucky": {"views": 1, "redirects": 1}, "steady": {"views": 500, "redirects": 100}}
+    sales = {"2": {"totalTicketsSold": 20}}
+    assert _ranked(parties, stats, sales)["steady"]["position"] == 1
+
+
+def test_many_clicks_and_no_sales_is_a_bad_sign_and_no_sales_anywhere_still_ranks():
+    parties = [{"_id": "clicked", "ticketPrice": 100}, {"_id": "new", "ticketPrice": 100}]
+    ranked = _ranked(parties, {"clicked": {"views": 500, "redirects": 100}})
+    assert ranked["new"]["position"] == 1
+    assert ranked["clicked"]["score"] > 0  # site has no sales at all: still a number, not 0
+
+
+def test_public_party_never_carries_the_commission_deal():
+    party = {"_id": "1", "name": "x", "commission": {"type": "fixed", "value": 30}, "locks": [], "rankScore": 50}
+    public = app._public_party(party)
+    assert "commission" not in public and public["rankScore"] == 50
+
+
+def test_attach_rank_scores_uses_cached_inputs_and_survives_failures(monkeypatch):
+    calls = []
+
+    def inputs():
+        calls.append(1)
+        return {"sales_by_event_id": {}, "accounts_by_event_id": {}, "stats_by_party_id": {}}
+
+    monkeypatch.setattr(app, "_ranking_inputs", inputs)
+    docs = [{"_id": "1", "ticketPrice": 100, "commission": {"type": "fixed", "value": 50}},
+            {"_id": "2", "ticketPrice": 100},
+            {"_id": "3", "ticketPrice": 100, "listingStatus": "merged"}]
+    app._attach_rank_scores(docs)
+    assert docs[0]["rankScore"] == 100.0 and 0 < docs[1]["rankScore"] < 100 and "rankScore" not in docs[2]
+
+    def boom():
+        raise RuntimeError("mongo down")
+
+    monkeypatch.setattr(app, "_ranking_inputs", boom)
+    fresh = [{"_id": "1"}]
+    app._attach_rank_scores(fresh)
+    assert "rankScore" not in fresh[0]

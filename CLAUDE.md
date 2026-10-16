@@ -89,6 +89,12 @@ it (see `tests/conftest.py`'s `_reset_backend_caches` autouse fixture) or state 
 between tests that reuse the same `{}` query. Responses are also gzip'd now
 (`flask-compress`) since `/api/parties` is ~1MB uncompressed.
 
+Admin analytics (`/api/admin/analytics/{sales,funnel}`, the party index behind them and
+the recent-sales feed) go through `_admin_cached` (60s, single-flight); results that depend
+on sales are keyed on the newest `goout_sales_log.recorded_at`, so a new sale shows on the
+next request. `/api/admin/analytics/detailed` counts buckets with a Mongo `$group`
+(`_time_series_via_aggregation`) — pulling raw events made 30d/month/all-time time out.
+
 This does not rule out a deeper cause of that outage — the incident included several
 minutes where the process stopped responding entirely before Render restarted it, which
 looks more like the process getting stuck or running low on memory than pure request

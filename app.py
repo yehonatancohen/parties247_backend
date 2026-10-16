@@ -432,6 +432,53 @@ def _ranking_inputs() -> dict:
         return value
 
 
+# Admin analytics responses (sales, funnel, recent sales, party index), cached
+# briefly so the dashboard's burst of calls on open and its once-a-minute refresh
+# don't each re-scan `parties` / `goout_sales` over the slow Atlas link. A cached
+# value that depends on sales is keyed on the newest goout_sales_log row, so a
+# sale logged by the fetcher shows up on the very next request, not after the TTL.
+ADMIN_ANALYTICS_TTL_SECONDS = int(os.environ.get("ADMIN_ANALYTICS_TTL_SECONDS", "60"))
+_admin_analytics_cache: dict[str, dict] = {}
+_admin_analytics_locks: dict[str, threading.Lock] = {}
+_admin_analytics_locks_guard = threading.Lock()
+
+
+def _sales_log_stamp():
+    """Newest goout_sales_log `recorded_at` (one indexed read), None if unknown."""
+    if goout_sales_log_collection is None:
+        return None
+    try:
+        doc = goout_sales_log_collection.find_one({}, {"recorded_at": 1}, sort=[("recorded_at", -1)])
+    except Exception as exc:  # a failed stamp just means "rebuild"
+        app.logger.warning(f"sales log stamp lookup failed: {exc}")
+        return object()
+    return (doc or {}).get("recorded_at")
+
+
+def _admin_cached(key: str, build, stamp=None, ttl: float | None = None):
+    """Single-flight TTL cache: concurrent misses on one key share one build."""
+    ttl = ADMIN_ANALYTICS_TTL_SECONDS if ttl is None else ttl
+
+    def fresh():
+        entry = _admin_analytics_cache.get(key)
+        if entry and entry["stamp"] == stamp and time.monotonic() - entry["at"] < ttl:
+            return entry
+        return None
+
+    entry = fresh()
+    if entry:
+        return entry["value"]
+    with _admin_analytics_locks_guard:
+        lock = _admin_analytics_locks.setdefault(key, threading.Lock())
+    with lock:
+        entry = fresh()
+        if entry:
+            return entry["value"]
+        value = build()
+        _admin_analytics_cache[key] = {"value": value, "stamp": stamp, "at": time.monotonic()}
+        return value
+
+
 def _rank(parties: list[dict]) -> dict[str, dict]:
     return promo.rank_parties(parties, account1_referral=ACCOUNT1_REFERRAL_CODE, **_ranking_inputs())
 
@@ -943,9 +990,6 @@ _SUMMARY_PARTY_PROJECTION = {"name": 1, "slug": 1, "date": 1, "startsAt": 1, "en
 _SUMMARY_VISITOR_PROJECTION = {
     "createdAt": 1, "trafficSource": 1, "referer": 1, "utm": 1, "deviceType": 1, "userAgent": 1,
 }
-# /api/analytics/recent only needs the name to label GoOut sales.
-_RECENT_PARTY_PROJECTION = {"name": 1, "goOutEventId": 1}
-
 
 def build_analytics_summary(window_hours: int = 24) -> dict:
     if (
@@ -1084,8 +1128,14 @@ def _load_party_index() -> tuple[dict[str, dict], dict[str, dict]]:
     """
     One projected pass over `parties` -> (parties_by_id, party_by_goout_event_id).
     Both analytics builders need both views; loading once instead of twice halves
-    the Atlas round-trips for the funnel endpoint.
+    the Atlas round-trips for the funnel endpoint. Cached for the admin TTL:
+    sales, funnel, attribution and the recent-sales feed all read it. Callers
+    must treat the result as read-only.
     """
+    return _admin_cached("party_index", _build_party_index)
+
+
+def _build_party_index() -> tuple[dict[str, dict], dict[str, dict]]:
     parties_by_id: dict[str, dict] = {}
     party_by_event_id: dict[str, dict] = {}
     for party in fetch_all_documents(parties_collection, projection=_PARTY_INDEX_PROJECTION):
@@ -1383,6 +1433,74 @@ _TIME_SERIES_VISITOR_PROJECTION = {"_id": 0, "createdAt": 1, "sessionId": 1}
 _TIME_SERIES_EVENT_PROJECTION = {"_id": 0, "createdAt": 1, "action": 1, "partyId": 1, "label": 1}
 
 
+def _time_series_target_ids(party_slug: str | None) -> set[str]:
+    """IDs/slugs an optional party filter matches (input may be either)."""
+    target_ids: set[str] = set()
+    if party_slug:
+        # User input might be an ID or a Slug. We accept both by resolving loosely.
+        # We also look up the party to get its canonical ID and Slug to be safe.
+        p = find_party_for_analytics(party_slug, party_slug)
+        if p:
+            if p.get("_id"):
+                target_ids.add(str(p["_id"]))
+            if p.get("slug"):
+                target_ids.add(p.get("slug"))
+        # Also add the raw input just in case analytics were logged with raw input before resolution
+        target_ids.add(party_slug)
+    return target_ids
+
+
+def _time_series_via_aggregation(start: datetime, end: datetime, interval: str,
+                                 target_ids: set[str]) -> list[dict]:
+    """
+    Same buckets as the Python loop in build_time_series_analytics, but counted
+    inside Mongo. Pulling every raw view/click over the ~140 KB/s Atlas link made
+    the admin chart's 30-day, month and all-time ranges time out, and the admin
+    then kept showing an old cached series with empty recent days.
+    """
+    fmt = "%Y-%m-%dT%H:00:00Z" if interval == "hour" else "%Y-%m-%d"
+    bucket = {"$dateToString": {"format": fmt, "date": "$createdAt"}}  # UTC, like the Python path
+    window = {"$gte": start, "$lte": end}
+
+    buckets: dict[str, dict] = {}
+
+    def row(key: str) -> dict:
+        return buckets.setdefault(key, {"timestamp": key, "visits": 0, "partyViews": 0, "purchases": 0})
+
+    try:
+        # One visitor doc per session (sessionId is unique), so a count is the
+        # number of distinct sessions that started in the bucket.
+        for doc in visitor_analytics_collection.aggregate([
+            {"$match": {"createdAt": window}},
+            {"$group": {"_id": bucket, "visits": {"$sum": 1}}},
+        ]):
+            if doc.get("_id"):
+                row(doc["_id"])["visits"] = int(doc.get("visits") or 0)
+    except Exception as exc:
+        app.logger.error(f"Failed to aggregate visitor analytics: {exc}")
+        raise
+
+    event_match: dict = {"createdAt": window, "category": "party", "action": {"$in": ["view", "redirect"]}}
+    if target_ids:
+        ids = sorted(target_ids)
+        event_match["$or"] = [{"partyId": {"$in": ids}}, {"label": {"$in": ids}}]
+    try:
+        for doc in analytics_collection.aggregate([
+            {"$match": event_match},
+            {"$group": {"_id": {"b": bucket, "a": "$action"}, "n": {"$sum": 1}}},
+        ]):
+            key = (doc.get("_id") or {}).get("b")
+            if not key:
+                continue
+            field = "purchases" if doc["_id"].get("a") == "redirect" else "partyViews"
+            row(key)[field] += int(doc.get("n") or 0)
+    except Exception as exc:
+        app.logger.error(f"Failed to aggregate analytics events: {exc}")
+        raise
+
+    return sorted(buckets.values(), key=lambda r: r["timestamp"])
+
+
 def build_time_series_analytics(start: datetime, end: datetime, interval: str = "day", party_slug: str | None = None) -> list[dict]:
     """
     Build time-series analytics for visits, party views, and purchases.
@@ -1398,7 +1516,10 @@ def build_time_series_analytics(start: datetime, end: datetime, interval: str = 
     """
     if visitor_analytics_collection is None or analytics_collection is None:
         raise RuntimeError("Analytics datastore unavailable")
-    
+
+    if hasattr(analytics_collection, "aggregate") and hasattr(visitor_analytics_collection, "aggregate"):
+        return _time_series_via_aggregation(start, end, interval, _time_series_target_ids(party_slug))
+
     # Query visitor analytics for unique sessions (Visits)
     visitor_query = {"createdAt": {"$gte": start, "$lte": end}}
     try:
@@ -1423,19 +1544,7 @@ def build_time_series_analytics(start: datetime, end: datetime, interval: str = 
         app.logger.error(f"Failed to read analytics events: {exc}")
         raise
 
-    # Resolve filtering if party_slug is provided
-    target_ids = set()
-    if party_slug:
-        # User input might be an ID or a Slug. We accept both by resolving loosely.
-        # We also look up the party to get its canonical ID and Slug to be safe.
-        p = find_party_for_analytics(party_slug, party_slug)
-        if p:
-            if p.get("_id"):
-                target_ids.add(str(p["_id"]))
-            if p.get("slug"):
-                target_ids.add(p.get("slug"))
-        # Also add the raw input just in case analytics were logged with raw input before resolution
-        target_ids.add(party_slug)
+    target_ids = _time_series_target_ids(party_slug)
 
     buckets = {}
     
@@ -2599,11 +2708,9 @@ def analytics_recent():
     # Fetch recent real GoOut purchases (confirmed ticket sales, not clicks)
     if want_goout_purchases and goout_sales_log_collection is not None:
         try:
-            party_by_event_id: dict[str, dict] = {}
-            for party in fetch_all_documents(parties_collection, projection=_RECENT_PARTY_PROJECTION):
-                event_id = party.get("goOutEventId")
-                if event_id:
-                    party_by_event_id[str(event_id)] = party
+            # Shared, cached party index instead of a full `parties` scan per call:
+            # the dashboard asks for recent sales three times on every refresh.
+            party_by_event_id = _party_by_goout_event_id() if parties_collection is not None else {}
 
             sale_query = {"recorded_at": {"$gte": cutoff}, "delta_confirmed": {"$gt": 0}}
             try:
@@ -2622,8 +2729,8 @@ def analytics_recent():
                 events.append({
                     "id": str(doc.get("_id", "")),
                     "type": "goout_purchase",
-                    "partyName": (party.get("name") if party else None) or sanitize_analytics_text(doc.get("event_name")) or "",
-                    "partyId": str(party.get("_id")) if party else "",
+                    "partyName": (party.get("partyName") if party else None) or sanitize_analytics_text(doc.get("event_name")) or "",
+                    "partyId": party.get("partyId") if party else "",
                     "timestamp": isoformat_or_none(doc.get("recorded_at")) or now.isoformat(),
                     "details": f"{ticket_count} כרטיסים" if ticket_count != 1 else "כרטיס אחד",
                     "tickets": ticket_count,
@@ -2980,7 +3087,7 @@ def analytics_sales():
     /api/analytics/summary payload.
     """
     try:
-        data = build_sales_by_party()
+        data = _admin_cached("sales", build_sales_by_party, stamp=_sales_log_stamp())
     except RuntimeError:
         return jsonify({"message": "Sales datastore unavailable."}), 503
     except Exception as exc:
@@ -3135,7 +3242,11 @@ def analytics_funnel():
         real_month = ""
 
     try:
-        data = build_party_funnel(days=days, real_month=real_month or None)
+        data = _admin_cached(
+            f"funnel:{days}:{real_month}",
+            lambda: build_party_funnel(days=days, real_month=real_month or None),
+            stamp=_sales_log_stamp(),
+        )
     except RuntimeError:
         return jsonify({"message": "Analytics datastore unavailable."}), 503
     except Exception as exc:

@@ -75,7 +75,7 @@ def test_funnel_and_sales_use_projections(monkeypatch):
     parties.calls.clear()
     sales.calls.clear()
     rows = app.build_sales_by_party()
-    assert parties.calls == [app._PARTY_INDEX_PROJECTION]
+    assert parties.calls == [], "the party index is cached and shared between builders"
     assert sales.calls == [app._SALES_BY_PARTY_PROJECTION]
     assert rows[0]["partyName"] == "One" and rows[0]["realOwnRevenue"] == 300.0
 
@@ -93,17 +93,77 @@ def test_summary_and_recent_project_party_reads(monkeypatch):
     assert "description" not in app._SUMMARY_PARTY_PROJECTION
 
 
-def test_time_series_projects_only_bucket_fields(monkeypatch):
+def test_time_series_counts_inside_mongo(monkeypatch):
+    # Raw docs are never pulled: the 30d/month/all-time chart timed out doing that.
     from datetime import datetime, timedelta, timezone
 
-    now = datetime.now(timezone.utc)
-    visitors = RecordingCollection([{"createdAt": now, "sessionId": "s1"}])
-    events = RecordingCollection([{"createdAt": now, "action": "view", "partyId": "p1"}])
+    class AggregatingCollection:
+        def __init__(self, rows):
+            self.rows = rows
+            self.pipelines = []
+
+        def find(self, *args, **kwargs):
+            raise AssertionError("time series must not read raw documents")
+
+        def aggregate(self, pipeline):
+            self.pipelines.append(pipeline)
+            return list(self.rows)
+
+    visitors = AggregatingCollection([{"_id": "2026-10-15", "visits": 3}])
+    events = AggregatingCollection([
+        {"_id": {"b": "2026-10-15", "a": "view"}, "n": 10},
+        {"_id": {"b": "2026-10-15", "a": "redirect"}, "n": 2},
+        {"_id": {"b": "2026-10-16", "a": "view"}, "n": 4},
+    ])
     monkeypatch.setattr(app, "visitor_analytics_collection", visitors)
     monkeypatch.setattr(app, "analytics_collection", events)
+    monkeypatch.setattr(app, "find_party_for_analytics", lambda *a: {"_id": "p1", "slug": "one"})
 
-    rows = app.build_time_series_analytics(now - timedelta(hours=1), now + timedelta(hours=1), "hour")
+    now = datetime(2026, 10, 16, 12, tzinfo=timezone.utc)
+    rows = app.build_time_series_analytics(now - timedelta(days=30), now, "day", party_slug="one")
 
-    assert rows[0]["visits"] == 1 and rows[0]["partyViews"] == 1
-    assert visitors.calls == [app._TIME_SERIES_VISITOR_PROJECTION]
-    assert events.calls == [app._TIME_SERIES_EVENT_PROJECTION]
+    assert rows == [
+        {"timestamp": "2026-10-15", "visits": 3, "partyViews": 10, "purchases": 2},
+        {"timestamp": "2026-10-16", "visits": 0, "partyViews": 4, "purchases": 0},
+    ]
+    match = events.pipelines[0][0]["$match"]
+    assert match["category"] == "party" and match["createdAt"]["$gte"] == now - timedelta(days=30)
+    assert match["$or"] == [{"partyId": {"$in": ["one", "p1"]}}, {"label": {"$in": ["one", "p1"]}}]
+    app._time_series_via_aggregation(now, now, "hour", set())
+    assert events.pipelines[-1][1]["$group"]["_id"]["b"]["$dateToString"]["format"] == "%Y-%m-%dT%H:00:00Z"
+
+
+def test_admin_cache_reuses_until_ttl_or_new_sale(monkeypatch):
+    builds = []
+
+    def build():
+        builds.append(1)
+        return len(builds)
+
+    assert app._admin_cached("k", build, stamp="t1") == 1
+    assert app._admin_cached("k", build, stamp="t1") == 1, "same sales stamp -> cached"
+    assert app._admin_cached("k", build, stamp="t2") == 2, "a newer sale rebuilds at once"
+    assert app._admin_cached("k", build, stamp="t2", ttl=0) == 3, "expired -> rebuilt"
+
+
+def test_admin_cache_does_not_store_failures():
+    def boom():
+        raise RuntimeError("down")
+
+    try:
+        app._admin_cached("k2", boom)
+    except RuntimeError:
+        pass
+    assert app._admin_cached("k2", lambda: "ok") == "ok"
+
+
+def test_sales_log_stamp_is_newest_recorded_at(monkeypatch):
+    class Log:
+        def find_one(self, query, projection, sort=None):
+            assert sort == [("recorded_at", -1)]
+            return {"recorded_at": "2026-10-16T21:00:00Z"}
+
+    monkeypatch.setattr(app, "goout_sales_log_collection", Log())
+    assert app._sales_log_stamp() == "2026-10-16T21:00:00Z"
+    monkeypatch.setattr(app, "goout_sales_log_collection", None)
+    assert app._sales_log_stamp() is None

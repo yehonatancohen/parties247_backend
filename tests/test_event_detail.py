@@ -3,12 +3,19 @@ import types
 import app
 
 
+class _Cursor(list):
+    """find() result: app.py calls .sort() on it like a pymongo cursor."""
+
+    def sort(self, *args, **kwargs):
+        return self
+
+
 class _DummyCollection:
     def __init__(self, items):
         self._items = list(items)
 
-    def find(self):
-        return list(self._items)
+    def find(self, *args, **kwargs):
+        return _Cursor(self._items)
 
 
 class _DummyAnalytics:
@@ -74,3 +81,27 @@ def test_event_detail_api_not_found(monkeypatch):
 
     assert status == 404
     assert payload["message"] == "Event not found."
+
+
+def test_event_detail_reads_parties_from_the_shared_cache(monkeypatch):
+    # Every event page's ISR refresh calls /api/events/<slug>; a full parties
+    # scan per call over the slow Atlas link hung the backend on 2026-10-17.
+    docs = [{"_id": "1", "name": "Thursday Moon 02/10", "date": "2099-02-10T20:00:00"}]
+    collection = _DummyCollection(docs)
+    calls = []
+    original_find = collection.find
+
+    def counting_find(*args, **kwargs):
+        calls.append(args)
+        return original_find(*args, **kwargs)
+
+    monkeypatch.setattr(collection, "find", counting_find)
+    monkeypatch.setattr(app, "parties_collection", collection)
+    monkeypatch.setattr(app, "party_analytics_collection", _DummyAnalytics())
+    monkeypatch.setattr(app, "settings_collection", types.SimpleNamespace(find_one=lambda filter: None))
+
+    for _ in range(5):
+        _, status, _ = app.event_detail_api("thursday-moon-02-10")
+        assert status == 200
+
+    assert len(calls) == 1

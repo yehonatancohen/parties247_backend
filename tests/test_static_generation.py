@@ -32,12 +32,19 @@ def sample_event_doc():
     }
 
 
+class _Cursor(list):
+    """find() result: app.py calls .sort() on it like a pymongo cursor."""
+
+    def sort(self, *args, **kwargs):
+        return self
+
+
 class DummyCollection:
     def __init__(self, docs):
         self.docs = docs
 
-    def find(self):
-        return list(self.docs)
+    def find(self, *args, **kwargs):
+        return _Cursor(self.docs)
 
 
 class DummySettings:

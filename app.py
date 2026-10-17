@@ -527,7 +527,8 @@ def _fetch_parties_cached(query: dict, include_hidden: bool = False) -> list[dic
         referral = default_referral_code()
         docs = []
         for party in _find_parties(query).sort("date", 1):
-            party["_id"] = str(party["_id"])
+            if "_id" in party:
+                party["_id"] = str(party["_id"])
             slug = party.get("slug") or slugify_value(party.get("name"))
             party["slug"] = slug or ""
             apply_default_referral(party, referral)
@@ -1620,22 +1621,22 @@ def build_time_series_analytics(start: datetime, end: datetime, interval: str = 
 
 def all_events(include_hidden: bool = False) -> list[dict]:
     """Every party as the site-facing surfaces (event API, sitemaps, feeds,
-    ICS) should see it: hidden and merged listings are left out unless asked."""
+    ICS) should see it: hidden and merged listings are left out unless asked.
+
+    Served from the shared parties cache: every event page's ISR refresh hits
+    /api/events/<slug>, and re-reading the whole collection per request over
+    the slow Atlas link tied up every gunicorn thread (outage 2026-10-17).
+    The dicts are shared — callers must not mutate them."""
     if parties_collection is None:
         return []
     try:
-        docs = list(_find_parties({}))
-    except TypeError:  # pragma: no cover - compatibility with simple stubs
-        docs = list(parties_collection.find())
+        docs = _fetch_parties_cached({}, include_hidden=True)
     except Exception as exc:
         app.logger.error(f"Failed to fetch events: {exc}")
         return []
-    for doc in docs:
-        if "_id" in doc:
-            doc["_id"] = str(doc["_id"])
     if not include_hidden:
         docs = [doc for doc in docs if not listings.is_hidden(doc)]
-    return docs
+    return list(docs)
 
 
 def normalize_event(doc: dict) -> dict:
@@ -5910,7 +5911,8 @@ def clone_party():
     # keeps the Listing Guard from merging it back into its source as a duplicate.
     new_party["cloneOf"] = str(new_party.pop("_id", "") or "")
     new_party.pop("locks", None)
-    
+    new_party.pop("rankScore", None)  # derived per request, not stored
+
     new_party["slug"] = new_slug
     new_party["slugOverride"] = new_slug
     

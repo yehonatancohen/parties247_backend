@@ -109,6 +109,10 @@ TRACKING_PREFIXES = ("utm_",)
 TRACKING_KEYS = {"fbclid", "gclid", "mc_cid", "mc_eid", "ref", "aff"}
 
 REFERRAL_KEY = "referral"
+# settings doc mapping each GoOut account to its referral code. Only the admin's
+# "which account is this ref" labels read it; the scraper keeps its own codes in .env.
+ACCOUNT_REFERRALS_KEY = "accountReferrals"
+DEFAULT_ACCOUNT_REFERRALS = {"account1": "a312e1e1g1", "account2": "a3fg911a00"}
 # settings doc holding Listing Guard run state (see the routes near the bottom).
 LISTING_GUARD_KEY = "listingGuard"
 
@@ -4093,6 +4097,18 @@ OPENAPI_TEMPLATE = {
                 },
             }
         },
+        "/api/admin/account-referrals": {
+            "get": {
+                "summary": "Get each GoOut account's referral code",
+                "description": "Returns {account1, account2}. Used by the admin to label which account a referral code belongs to. Admin JWT.",
+                "responses": {"200": {"description": "Codes per account."}, "401": {"description": "Unauthorized"}},
+            },
+            "post": {
+                "summary": "Set each GoOut account's referral code",
+                "description": "Body {account1, account2}; each 1-64 chars [A-Za-z0-9_-]. Labels only: the scraper's own codes are not changed. Admin JWT.",
+                "responses": {"200": {"description": "Saved codes."}, "400": {"description": "Invalid payload"}, "401": {"description": "Unauthorized"}},
+            },
+        },
         "/api/admin/parties/commission": {
             "get": {
                 "summary": "Commission per upcoming party",
@@ -7329,6 +7345,53 @@ def set_referral():
         return jsonify({"message": "Referral updated"}), 200
     except Exception as e:
         return jsonify({"message": "Error updating referral", "error": str(e)}), 500
+
+def parse_account_referrals(payload) -> dict | None:
+    """{account1, account2} with valid codes, or None."""
+    if not isinstance(payload, dict) or set(payload) != set(DEFAULT_ACCOUNT_REFERRALS):
+        return None
+    out = {}
+    for account in DEFAULT_ACCOUNT_REFERRALS:
+        code = payload[account].strip() if isinstance(payload[account], str) else ""
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", code):
+            return None
+        out[account] = code
+    if out["account1"] == out["account2"]:
+        return None
+    return out
+
+
+def load_account_referrals() -> dict:
+    doc = settings_collection.find_one({"key": ACCOUNT_REFERRALS_KEY}) or {}
+    saved = doc.get("value") if isinstance(doc.get("value"), dict) else {}
+    return {a: (saved.get(a) or default) for a, default in DEFAULT_ACCOUNT_REFERRALS.items()}
+
+
+@app.route("/api/admin/account-referrals", methods=["GET"])
+@protect
+def get_account_referrals():
+    try:
+        return jsonify(load_account_referrals()), 200
+    except Exception as e:
+        return jsonify({"message": "Error fetching account referrals", "error": str(e)}), 500
+
+
+@app.route("/api/admin/account-referrals", methods=["POST"])
+@protect
+def set_account_referrals():
+    codes = parse_account_referrals(request.get_json(silent=True))
+    if codes is None:
+        return jsonify({"message": "Send {account1, account2}: two different codes, 1-64 chars [A-Za-z0-9_-]."}), 400
+    try:
+        settings_collection.update_one(
+            {"key": ACCOUNT_REFERRALS_KEY},
+            {"$set": {"key": ACCOUNT_REFERRALS_KEY, "value": codes}},
+            upsert=True,
+        )
+        record_admin_action("set_account_referrals", "setting", ACCOUNT_REFERRALS_KEY, codes)
+        return jsonify(codes), 200
+    except Exception as e:
+        return jsonify({"message": "Error updating account referrals", "error": str(e)}), 500
 
 # --- Holiday page curation ---
 # The site's holiday pages (/halloween, /sylvester, ...) list every party whose

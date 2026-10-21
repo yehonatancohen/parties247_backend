@@ -361,3 +361,76 @@ def test_a_different_event_down_the_street_is_not_the_same_venue():
     b = party("2", "D-TLV Bar Quest Crawl", starts="2026-10-15T22:00:00.000", lat=32.0716, lng=34.7802)
     assert 100 < listings.distance_m(a["source"], b["source"]) < 250
     assert listings.pair_level(a, b) is None
+
+
+# --- abroad + stored hides (site survey 2026-10-21) --------------------------
+
+def test_events_abroad_are_hidden_by_coordinates_or_by_the_country_in_the_address():
+    # The XXX Project (Amsterdam) led "tonight" on the home page with sales closed.
+    assert listings.auto_hide_reason({"title": "The XXX Project", "geo": {"lat": 52.39, "lng": 4.88},
+                                      "address": "Danzigerbocht 55, Amsterdam, Netherlands"}) == "abroad"
+    assert listings.is_abroad({"address": "Koumbara Beach, Ios, Greece, 84001"})
+    assert listings.is_abroad(None, "2ten, Ermou, Athens, Greece")
+    assert not listings.is_abroad({"geo": {"lat": 32.0681, "lng": 34.7622}, "address": "Moonchild, Tel Aviv-Yafo, ישראל"})
+    assert not listings.is_abroad({"geo": {"lat": 29.55, "lng": 34.95}, "address": "Eilat"})
+    # GoOut's "just Israel" placeholder point is no location, and the address says Israel.
+    assert not listings.is_abroad({"geo": {"lat": 31.046051, "lng": 34.851612}, "address": "שיטים, Israel"})
+
+
+def test_an_abroad_hide_comes_back_when_the_event_moves_home_and_never_overrides_the_admin():
+    abroad = {"title": "Ushpizin", "address": "Moxy Athens City, Stadiou, Athens, Greece"}
+    assert listings.desired_status(abroad, {"listingStatus": "live"}) == ("hidden", "abroad")
+    assert listings.desired_status(abroad, {"listingStatus": "live", "locks": ["listingStatus"]}) is None
+    home = {"title": "Ushpizin", "address": "Gagarin, Tel Aviv, Israel"}
+    assert listings.desired_status(home, {"listingStatus": "hidden", "statusReason": "abroad"}) == ("live", None)
+
+
+def test_stored_hide_reason_reads_old_listings_without_a_source_snapshot():
+    test_event = {"name": "TEST - THE ONE SHOW", "listingStatus": "live",
+                  "location": "Bulevardul Basarabia 256, Bucureşti Sectorul 3, Bucharest, Romania"}
+    assert listings.stored_hide_reason(test_event) == "test"
+    assert listings.stored_hide_reason({"name": "Pathos Club", "location": "Koumbara Beach, Ios, Greece, 84001"}) == "abroad"
+    assert listings.stored_hide_reason({"name": "Pathos", "location": {"name": "Ios, Greece"}}) == "abroad"
+    assert listings.stored_hide_reason({"name": "FRIDAY", "location": "Moonchild, תל אביב-יפו, ישראל"}) is None
+    assert listings.stored_hide_reason({**test_event, "listingStatus": "hidden"}) is None
+    assert listings.stored_hide_reason({**test_event, "locks": ["listingStatus"]}) is None
+
+
+# --- slugs -----------------------------------------------------------------
+
+def test_slug_candidates_go_from_month_to_full_date_to_goout_id():
+    assert listings.slug_candidates("AMIRA FESTIVAL", "2026-11-26T22:30:00.000", 1791650453065) == [
+        "amira-festival-november-2026", "amira-festival-2026-11-26", "amira-festival-2026-11-26-1791650453065"]
+    assert listings.slug_candidates("ישיבה", None) == ["yshybh"]
+    assert listings.slug_candidates("", "2026-11-26") == []
+
+
+def test_unique_slug_skips_taken_ones_and_falls_back_to_a_counter():
+    taken = {"amira-festival-november-2026", "amira-festival-2026-11-26"}
+    assert listings.unique_slug("AMIRA FESTIVAL", "2026-11-26T22:30:00", 1791650453065, taken) == \
+        "amira-festival-2026-11-26-1791650453065"
+    assert listings.unique_slug("X", "2026-11-26T22:30:00", None, {"x-november-2026", "x-2026-11-26"}) == "x-2026-11-26-2"
+    assert listings.unique_slug("X", "2026-11-26", None, set(), preferred="x") == "x"
+
+
+def test_long_names_keep_their_date_suffix():
+    name = "maskadelic festival 3 days in the desert with the best psytrance artists from all over the world"
+    slug = listings.slug_candidates(name, "2026-10-01T20:00:00")[1]
+    assert len(slug) <= 80 and slug.endswith("-2026-10-01")
+
+
+def test_plan_slug_renames_keeps_the_oldest_listing_on_the_shared_url():
+    """Seven D-TLV bar crawls shared one October slug on 2026-10-21."""
+    parties = [
+        {"_id": "6a03", "name": "D-TLV BAR CRAWL", "slug": "d-tlv-bar-crawl-october-2026", "date": "2026-10-08T22:00:00"},
+        {"_id": "6a01", "name": "D-TLV BAR CRAWL", "slug": "d-tlv-bar-crawl-october-2026", "date": "2026-10-01T22:00:00"},
+        {"_id": "6a02", "name": "D-TLV BAR CRAWL", "slug": "d-tlv-bar-crawl-october-2026", "date": "2026-10-01T22:00:00",
+         "goOutEventId": 99},
+        {"_id": "6a09", "name": "Other", "slug": "other-october-2026", "date": "2026-10-08T22:00:00"},
+    ]
+    renames = listings.plan_slug_renames(parties, reserved={"d-tlv-bar-crawl-2026-10-08"})
+    assert renames == [
+        {"partyId": "6a02", "old": "d-tlv-bar-crawl-october-2026", "new": "d-tlv-bar-crawl-2026-10-01"},
+        {"partyId": "6a03", "old": "d-tlv-bar-crawl-october-2026", "new": "d-tlv-bar-crawl-2026-10-08-2"},
+    ]
+

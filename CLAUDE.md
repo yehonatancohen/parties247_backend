@@ -123,5 +123,10 @@ version marker exposed by the API; confirm deploys via `/api/health` timing or a
   (fixtures are real cases). `parties` reads that feed the public site must go through
   `_fetch_parties_cached()` / `all_events()` so hidden/merged listings stay out; analytics
   joins must not filter. Never read `event["Tickets"]` from a GoOut page (placeholder).
+- Slugs are unique (since 2026-10-21): `upsert_party_doc` picks the first free of
+  `<name>-<month>-<year>` → `<name>-YYYY-MM-DD` → `+-<goOutEventId>` (`listings.unique_slug`),
+  and the audit's `run_listing_housekeeping` renames any remaining clash, the oldest listing
+  keeping the shared URL. The same pass hides test events and events outside Israel
+  (`listings.stored_hide_reason`), past ones included, since the sync only sees upcoming ones.
 - `party247` is the database name. `parties247` is a different, empty DB that caused a
   split-brain incident once.

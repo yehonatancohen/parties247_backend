@@ -209,7 +209,7 @@ def zero_tier_key(name: str) -> str:
     return re.sub(r"\s+", " ", name).strip().lower()
 
 
-AUTO_HIDE_REASONS = ("private", "test", "gone")
+AUTO_HIDE_REASONS = ("private", "test", "abroad", "gone")
 # A promoter's "test" / "בדיקה" event that was left public on GoOut.
 _TEST_TITLE_RE = re.compile(r"^\s*(?:test(?:\s+event)?|demo(?:\s+event)?|טסט|בדיקה)(?:\s|$|[-_/])", re.IGNORECASE)
 MAX_PLAUSIBLE_PRICE = 2000.0
@@ -317,6 +317,40 @@ def _km_from(lat: float, lng: float, point: tuple[float, float]) -> float:
     return (distance_m({"geo": {"lat": lat, "lng": lng}}, fake) or 0.0) / 1000
 
 
+# Israel's bounding box (Eilat to the Golan). Coarse on purpose: it only has to
+# tell a Tel Aviv club from Athens or Amsterdam.
+_ISRAEL_BOX = (29.4, 33.4, 34.2, 35.95)
+
+# Last part of a GoOut address for the countries that actually turn up there
+# (2026-10: Greece, Cyprus, Romania, the Netherlands) plus the obvious neighbours.
+_FOREIGN_COUNTRIES = {
+    "greece", "cyprus", "romania", "netherlands", "the netherlands", "germany", "spain",
+    "portugal", "italy", "france", "united kingdom", "uk", "england", "hungary", "czechia",
+    "czech republic", "bulgaria", "georgia", "turkey", "türkiye", "thailand", "india",
+    "montenegro", "albania", "croatia", "serbia", "austria", "poland", "belgium",
+    "united states", "usa", "uae", "united arab emirates", "egypt", "jordan", "morocco",
+    "יוון", "קפריסין", "רומניה", "הולנד", "גרמניה", "ספרד", "פורטוגל", "איטליה", "צרפת",
+    "אנגליה", "הונגריה", "בולגריה", "גאורגיה", "טורקיה", "תאילנד", "הודו", "מונטנגרו",
+}
+
+
+def _in_israel_box(lat: float, lng: float) -> bool:
+    south, north, west, east = _ISRAEL_BOX
+    return south <= lat <= north and west <= lng <= east
+
+
+def is_abroad(source: dict | None, location_text: str = "") -> bool:
+    """The event takes place outside Israel. GoOut's coordinates decide when
+    they are real; otherwise the country at the end of the address does
+    ("Koumbara Beach, Ios, Greece, 84001")."""
+    if has_real_geo(source):
+        return not _in_israel_box(float(source["geo"]["lat"]), float(source["geo"]["lng"]))
+    address = _text((source or {}).get("address")) or _text(location_text)
+    parts = [part.strip().lower() for part in address.split(",")]
+    parts = [part for part in parts if part and not part.replace(" ", "").isdigit()]
+    return bool(parts) and parts[-1] in _FOREIGN_COUNTRIES
+
+
 def geo_classification(source: dict | None) -> dict:
     """Region + areas from GoOut's coordinates. Returns {} when there is no
     real location or it is outside Israel, so callers fall back to the old
@@ -324,7 +358,7 @@ def geo_classification(source: dict | None) -> dict:
     if not has_real_geo(source):
         return {}
     lat, lng = float(source["geo"]["lat"]), float(source["geo"]["lng"])
-    if not (29.4 <= lat <= 33.4 and 34.2 <= lng <= 35.95):
+    if not _in_israel_box(lat, lng):
         return {}
     areas: list[str] = []
     if lat < 29.75:
@@ -383,12 +417,16 @@ def derive_fields(source: dict, price_info: dict | None = None) -> dict:
 
 def auto_hide_reason(source: dict) -> str | None:
     """Why a listing must not be on the site, decided without asking: a
-    promoter's test event, or a GoOut page that failed to load twice in a row
-    (cancelled / removed). Private-on-GoOut events stay listed (owner decision
-    2026-10-13, reversing 2026-10-10); "private" stays in AUTO_HIDE_REASONS so
-    the ones hidden under the old rule come back on their next sync."""
+    promoter's test event, an event outside Israel (site survey 2026-10-21 —
+    the site sells Israeli nightlife; relisting one from the admin locks it),
+    or a GoOut page that failed to load twice in a row (cancelled / removed).
+    Private-on-GoOut events stay listed (owner decision 2026-10-13, reversing
+    2026-10-10); "private" stays in AUTO_HIDE_REASONS so the ones hidden under
+    the old rule come back on their next sync."""
     if _TEST_TITLE_RE.search(str(source.get("title") or "")):
         return "test"
+    if is_abroad(source):
+        return "abroad"
     if int(source.get("failCount") or 0) >= 2:
         return "gone"
     return None
@@ -407,6 +445,26 @@ def desired_status(source: dict, party: dict) -> tuple[str, str | None] | None:
     if not reason and status == "hidden" and party.get("statusReason") in AUTO_HIDE_REASONS:
         return "live", None
     return None
+
+
+def stored_hide_reason(party: dict) -> str | None:
+    """auto_hide_reason for a listing the sync no longer visits (past events,
+    listings from before the Listing Guard): reads the stored name and location
+    when there is no source snapshot. Only ever hides — "the page is gone"
+    can't be judged from stored data, and nothing here un-hides."""
+    if "listingStatus" in (party.get("locks") or []):
+        return None
+    if (party.get("listingStatus") or "live") != "live":
+        return None
+    source = party.get("source") or {}
+    probe = {
+        "title": source.get("title") or party.get("name"),
+        "address": source.get("address") or _text(party.get("location") if not isinstance(party.get("location"), dict)
+                                                  else party["location"].get("name")),
+        "geo": source.get("geo"),
+    }
+    reason = auto_hide_reason(probe)
+    return reason if reason in ("test", "abroad") else None
 
 
 def _same(field: str, old, new) -> bool:
@@ -761,3 +819,96 @@ def detect_site_issues(party: dict, check: dict) -> list[dict]:
 def is_upcoming(party: dict, now: datetime) -> bool:
     start = parse_local((party.get("source") or {}).get("startsAt") or party.get("date") or party.get("startsAt"))
     return bool(start) and start >= now - timedelta(days=1)
+
+
+# --- slugs -----------------------------------------------------------------
+#
+# Slugs used to be "<name>-<month>-<year>", so every weekly series and every
+# double listing of one night shared a URL (27 slugs on 2026-10-21, up to 7
+# parties each) and only one of them could ever be opened. A slug is now
+# unique: the old form when it is free, otherwise the full date, then the
+# GoOut event id.
+
+_SLUG_MAX = 80
+
+
+def slug_base(value: str | None) -> str:
+    """Same transliteration + cleanup as app.slugify_value, kept here so the
+    slug rules have no Flask import."""
+    from_hebrew = {
+        "א": "a", "ב": "b", "ג": "g", "ד": "d", "ה": "h", "ו": "v", "ז": "z", "ח": "ch", "ט": "t",
+        "י": "y", "כ": "k", "ך": "k", "ל": "l", "מ": "m", "ם": "m", "נ": "n", "ן": "n", "ס": "s",
+        "ע": "a", "פ": "p", "ף": "f", "צ": "ts", "ץ": "ts", "ק": "k", "ר": "r", "ש": "sh", "ת": "t",
+    }
+    text = "".join(from_hebrew.get(ch, ch) for ch in str(value or ""))
+    return re.sub(r"[^0-9a-zA-Z]+", "-", text.lower()).strip("-")
+
+
+def _trim_slug(slug: str, keep_suffix: str = "") -> str:
+    room = _SLUG_MAX - len(keep_suffix)
+    if len(slug) > room:
+        slug = slug[:room].rsplit("-", 1)[0]
+    return (slug.strip("-") + keep_suffix) if keep_suffix else slug.strip("-")
+
+
+def slug_candidates(name: str | None, date, go_out_id=None) -> list[str]:
+    """Slugs to try for a new listing, best first."""
+    base = slug_base(name)
+    if not base:
+        return []
+    start = parse_local(date)
+    out = []
+    if start:
+        out.append(_trim_slug(f"{base}-{start.strftime('%B').lower()}-{start.year}"))
+        out.append(_trim_slug(base, f"-{start:%Y-%m-%d}"))
+    else:
+        out.append(_trim_slug(base))
+    if go_out_id:
+        out.append(_trim_slug(out[-1], f"-{slug_base(str(go_out_id))}"))
+    return list(dict.fromkeys(out))
+
+
+def unique_slug(name: str | None, date, go_out_id, taken: set[str], preferred: str | None = None) -> str | None:
+    """The first free slug: `preferred` (what the caller already picked) when
+    free, then slug_candidates, then the last candidate with -2, -3, ..."""
+    candidates = ([preferred] if preferred else []) + slug_candidates(name, date, go_out_id)
+    for candidate in candidates:
+        if candidate and candidate not in taken:
+            return candidate
+    if not candidates:
+        return None
+    last = candidates[-1]
+    n = 2
+    while f"{last}-{n}" in taken:
+        n += 1
+    return f"{last}-{n}"
+
+
+def _created_key(party: dict):
+    return str(party.get("_id") or "")
+
+
+def plan_slug_renames(parties: list[dict], reserved: set[str] | None = None) -> list[dict]:
+    """For every slug shared by several parties: the oldest listing (lowest
+    ObjectId — the one Google has had longest) keeps it, the others get a
+    unique slug of their own. The old URL never changes owner, so no redirect
+    is needed. `reserved` = slugs that must not be handed out (redirect sources).
+
+    Returns [{partyId, old, new}]."""
+    taken = {p.get("slug") for p in parties if p.get("slug")} | set(reserved or ())
+    by_slug: dict[str, list[dict]] = {}
+    for party in parties:
+        if party.get("slug"):
+            by_slug.setdefault(party["slug"], []).append(party)
+    renames = []
+    for slug, group in sorted(by_slug.items()):
+        if len(group) < 2:
+            continue
+        for party in sorted(group, key=_created_key)[1:]:
+            new = unique_slug(party.get("name"), party.get("date"), party.get("goOutEventId"), taken)
+            if not new:
+                continue
+            taken.add(new)
+            renames.append({"partyId": str(party.get("_id")), "old": slug, "new": new})
+    return renames
+

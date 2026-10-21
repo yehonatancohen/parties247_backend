@@ -4304,7 +4304,7 @@ OPENAPI_TEMPLATE = {
         "/api/internal/listings/audit": {
             "post": {
                 "summary": "Run the daily listing audit (service)",
-                "description": "Body {account1Referral, siteChecks: [{partyId, status, finalUrl, name, price}], dryRun?}. Detects duplicates and other issues, auto-merges the certain ones into the account1 listing and queues the rest. X-Service-Token.",
+                "description": "Body {account1Referral, siteChecks: [{partyId, status, finalUrl, name, price}], dryRun?}. Detects duplicates and other issues, auto-merges the certain ones into the account1 listing and queues the rest. Also runs housekeeping over every party, past ones included: a slug shared by several parties stays with the oldest and the others get their own, and test events / events outside Israel are hidden (response `housekeeping`: {slugRenames, hidden}). X-Service-Token.",
                 
                 "responses": {"200": {"description": "OK"}, "401": {"description": "Missing or invalid service token."}},
             }
@@ -5654,6 +5654,14 @@ def upsert_party_doc(party_data: dict, query: dict | None = None) -> tuple[str |
             or_clauses.append({"goOutUrl": party_data["goOutUrl"]})
         query = {"$or": or_clauses} if or_clauses else {"name": party_data.get("name")}
     party_data.setdefault("listingStatus", "live")
+    if parties_collection.find_one(query, {"_id": 1}) is None:
+        # A new listing never shares a URL with an existing one (weekly series
+        # used to: "<name>-<month>-<year>" for every Thursday of the month).
+        party_data["slug"] = listings.unique_slug(
+            party_data.get("name"), party_data.get("date"), party_data.get("goOutEventId"),
+            _taken_slugs_like(party_data.get("slug") or listings.slug_base(party_data.get("name"))),
+            preferred=party_data.get("slug"),
+        ) or party_data.get("slug")
     result = parties_collection.update_one(query, {"$setOnInsert": party_data}, upsert=True)
     upserted_id = getattr(result, "upserted_id", None)
     if upserted_id is not None:
@@ -8964,6 +8972,81 @@ def listing_sync():
         return jsonify({"message": str(exc)}), 500
 
 
+def _taken_slugs_like(prefix: str | None) -> set[str]:
+    """Slugs already used by a party or a redirect that start like `prefix` —
+    the only ones a new slug for that name could collide with."""
+    if not prefix:
+        return set()
+    pattern = {"$regex": "^" + re.escape(prefix[:40])}
+    try:
+        taken = {doc.get("slug") for doc in parties_collection.find({"slug": pattern}, {"slug": 1}) if doc.get("slug")}
+        if party_redirects_collection is not None:
+            taken |= {doc.get("fromSlug") for doc in party_redirects_collection.find({"fromSlug": pattern}, {"fromSlug": 1})
+                      if doc.get("fromSlug")}
+    except Exception as exc:
+        # Never block adding a party over this; the audit's housekeeping
+        # renames a clash within the hour.
+        app.logger.warning(f"[SLUG] could not check taken slugs for {prefix}: {exc}")
+        return set()
+    return taken
+
+
+HOUSEKEEPING_FIELDS = {"slug": 1, "name": 1, "date": 1, "goOutEventId": 1, "location": 1, "listingStatus": 1,
+                       "statusReason": 1, "locks": 1, "mergedInto": 1, "source.title": 1, "source.address": 1, "source.geo": 1}
+
+
+def run_listing_housekeeping(dry_run: bool = False) -> dict:
+    """Fixes over the whole collection, past listings included (the sync only
+    visits upcoming ones). Cheap (projection, ~800 docs) and idempotent, so it
+    simply runs with every audit:
+      - every party gets its own slug (listings.plan_slug_renames)
+      - a test event or an event abroad is hidden even if it already passed
+        (listings.stored_hide_reason) — the TEST event in Bucharest sat in the
+        archive and the sitemap because the sync never saw it."""
+    docs = list(parties_collection.find({}, HOUSEKEEPING_FIELDS))
+    reserved = set()
+    if party_redirects_collection is not None:
+        reserved = {doc.get("fromSlug") for doc in party_redirects_collection.find({}, {"fromSlug": 1}) if doc.get("fromSlug")}
+    renames = listings.plan_slug_renames(docs, reserved)
+    hides = [{"partyId": str(doc["_id"]), "name": doc.get("name"), "reason": reason}
+             for doc in docs for reason in [listings.stored_hide_reason(doc)] if reason]
+    summary = {"slugRenames": renames, "hidden": hides}
+    if dry_run or not (renames or hides):
+        return summary
+
+    by_id = {str(doc["_id"]): doc for doc in docs}
+    now = datetime.now(timezone.utc)
+    rows, touched = [], []
+    for rename in renames:
+        doc = by_id[rename["partyId"]]
+        parties_collection.update_one({"_id": doc["_id"]}, {"$set": {"slug": rename["new"]}})
+        rows.append({"partyId": rename["partyId"], "partyName": doc.get("name"), "field": "slug",
+                     "old": rename["old"], "new": rename["new"], "at": now,
+                     "reason": "slug shared with an older listing"})
+        touched.append({**doc, "slug": rename["new"]})
+        # Duplicates already merged into this party redirect to it by slug.
+        merged_slugs = [d.get("slug") for d in docs if d.get("mergedInto") == rename["partyId"] and d.get("slug")]
+        if merged_slugs and party_redirects_collection is not None:
+            try:
+                party_redirects_collection.update_many(
+                    {"fromSlug": {"$in": merged_slugs}, "toSlug": rename["old"]}, {"$set": {"toSlug": rename["new"]}})
+            except Exception as exc:
+                app.logger.warning(f"[LISTING] could not repoint redirects to {rename['new']}: {exc}")
+    for hide in hides:
+        parties_collection.update_one(
+            {"_id": by_id[hide["partyId"]]["_id"]},
+            {"$set": {"listingStatus": "hidden", "statusReason": hide["reason"], "statusAt": now}},
+        )
+        rows.append({"partyId": hide["partyId"], "partyName": hide["name"], "field": "listingStatus",
+                     "old": "live", "new": "hidden", "at": now, "reason": hide["reason"]})
+        touched.append(by_id[hide["partyId"]])
+    _log_listing_changes(rows)
+    _parties_cache.clear()
+    _revalidate_parties(touched)
+    app.logger.info(f"[LISTING] housekeeping: {len(renames)} slug renames, {len(hides)} hidden")
+    return summary
+
+
 def merge_listing(loser: dict, keeper: dict, reason: str):
     """Fold a duplicate into its keeper: the loser stops being listed and its
     URL 308s to the keeper (party_redirects, read by the website's proxy.ts).
@@ -9079,7 +9162,8 @@ def run_listing_audit(account1_referral: str | None, site_checks: list[dict], dr
     merges = [{**merge, "keeper": by_id[merge["keeperId"]].get("name"),
                "loser": by_id[merge["loserId"]].get("name")} for merge in plan["merges"]]
     summary = {"dryRun": dry_run, "checked": len(live), "merges": merges, "skipped": plan["skipped"],
-               "issues": list(unique.values()) if dry_run else None}
+               "issues": list(unique.values()) if dry_run else None,
+               "housekeeping": run_listing_housekeeping(dry_run)}
     if dry_run or listing_issues_collection is None:
         summary["waiting"] = len(unique)
         return summary

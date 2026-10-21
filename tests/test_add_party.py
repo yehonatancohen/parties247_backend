@@ -35,6 +35,9 @@ class FakePartiesCollection:
                 return doc.copy()
         return None
 
+    def find(self, query=None, projection=None):
+        return [doc.copy() for doc in self.docs if _matches(doc, query or {})]
+
     def update_one(self, query, update, upsert=False):
         for doc in self.docs:
             if _matches(doc, query):

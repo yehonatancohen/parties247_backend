@@ -1,6 +1,7 @@
 """Listing Guard wiring in app.py: the sync diff, public/hidden reads, the
 single ingest helper and the audit's handling of merges and issues."""
 import os
+import re
 import sys
 import types
 
@@ -150,6 +151,9 @@ class FakeParties:
         for key, value in query.items():
             if isinstance(value, dict) and "$in" in value:
                 if doc.get(key) not in value["$in"]:
+                    return False
+            elif isinstance(value, dict) and "$regex" in value:
+                if not re.match(value["$regex"], doc.get(key) or ""):
                     return False
             elif isinstance(value, dict) and "$gte" in value:
                 if not (doc.get(key) or "") >= value["$gte"]:
@@ -361,3 +365,85 @@ def test_merge_keepers_names_the_party_each_duplicate_went_into(monkeypatch):
     assert keepers["k2"]["listingStatus"] == "hidden"
     assert "gone" not in keepers
     assert app._merge_keepers([{"_id": "h1", "listingStatus": "hidden"}]) == {}
+
+
+# --- slugs + housekeeping (site survey 2026-10-21) -------------------------
+
+def test_a_new_listing_never_takes_a_slug_already_in_use(monkeypatch):
+    """DECISION FESTIVAL had two GoOut events on 22.10 (20:30 and 23:00); both
+    got decision-festival-...-october-2026 and the second one was unreachable."""
+    parties = FakeParties([{"_id": "p1", "slug": "decision-festival-october-2026", "canonicalUrl": "https://go-out.co/event/1"}])
+    monkeypatch.setattr(app, "parties_collection", parties)
+    monkeypatch.setattr(app, "party_redirects_collection", None)
+    data = {"name": "DECISION FESTIVAL", "date": "2026-10-22T23:00:00.000", "goOutEventId": 1791385543319,
+            "slug": "decision-festival-october-2026", "canonicalUrl": "https://go-out.co/event/2"}
+
+    assert app.upsert_party_doc(dict(data)) == ("p2", True)
+    assert parties.docs[1]["slug"] == "decision-festival-2026-10-22"
+    # The same party again is found, not re-slugged.
+    assert app.upsert_party_doc(dict(data)) == ("p2", False)
+    assert [d["slug"] for d in parties.docs] == ["decision-festival-october-2026", "decision-festival-2026-10-22"]
+
+
+def test_housekeeping_gives_each_shared_slug_one_owner_and_hides_past_test_and_abroad(monkeypatch):
+    docs = [
+        {"_id": "6a0000000000000000000001", "name": "PUB CRAWL", "slug": "pub-crawl-july-2026", "date": "2026-07-03T22:00:00.000"},
+        {"_id": "6a0000000000000000000002", "name": "PUB CRAWL", "slug": "pub-crawl-july-2026", "date": "2026-07-10T22:00:00.000"},
+        {"_id": "6a0000000000000000000003", "name": "TEST - THE ONE SHOW", "slug": "test-the-one-show-july-2026",
+         "date": "2026-07-03T20:00:00.0Z", "location": "Bulevardul Basarabia 256, Bucureşti Sectorul 3, Bucharest, Romania"},
+        {"_id": "6a0000000000000000000004", "name": "Maceo Plex", "slug": "maceo-plex-july-2026",
+         "date": "2026-07-03T18:00:00.000", "location": "Etko, Tsiflikoudion, Limassol, Cyprus", "locks": ["listingStatus"]},
+    ]
+    parties = FakeParties(docs)
+    monkeypatch.setattr(app, "parties_collection", parties)
+    monkeypatch.setattr(app, "party_redirects_collection", None)
+    monkeypatch.setattr(app, "listing_changes_collection", None)
+    touched = []
+    monkeypatch.setattr(app, "_revalidate_parties", lambda ps: touched.extend(p["_id"] for p in ps))
+
+    planned = app.run_listing_housekeeping(dry_run=True)
+    assert planned["slugRenames"] == [{"partyId": "6a0000000000000000000002", "old": "pub-crawl-july-2026",
+                                       "new": "pub-crawl-2026-07-10"}]
+    assert [h["reason"] for h in planned["hidden"]] == ["test"]  # Maceo Plex was relisted by hand
+    assert parties.updates == []
+
+    app.run_listing_housekeeping()
+    by_id = {d["_id"]: d for d in parties.docs}
+    assert by_id["6a0000000000000000000001"]["slug"] == "pub-crawl-july-2026"   # oldest keeps the URL
+    assert by_id["6a0000000000000000000002"]["slug"] == "pub-crawl-2026-07-10"
+    assert by_id["6a0000000000000000000003"]["listingStatus"] == "hidden"
+    assert by_id["6a0000000000000000000003"]["statusReason"] == "test"
+    assert "listingStatus" not in by_id["6a0000000000000000000004"]
+    assert sorted(touched) == ["6a0000000000000000000002", "6a0000000000000000000003"]
+
+    # Second run: nothing left to do.
+    parties.updates.clear()
+    again = app.run_listing_housekeeping()
+    assert again == {"slugRenames": [], "hidden": []} and parties.updates == []
+
+
+def test_renaming_a_merge_keeper_repoints_the_redirects_of_its_merged_duplicates(monkeypatch):
+    docs = [
+        {"_id": "6a0000000000000000000001", "name": "SHTUBY", "slug": "shtuby-october-2026", "date": "2026-10-09T22:00:00"},
+        {"_id": "6a0000000000000000000002", "name": "SHTUBY", "slug": "shtuby-october-2026", "date": "2026-10-16T22:00:00"},
+        {"_id": "6a0000000000000000000003", "name": "SHTUBY copy", "slug": "shtuby-copy-october-2026",
+         "listingStatus": "merged", "mergedInto": "6a0000000000000000000002"},
+    ]
+    redirects = []
+
+    class Redirects:
+        def find(self, query, projection=None):
+            return [{"fromSlug": "shtuby-copy-october-2026"}]
+
+        def update_many(self, query, update):
+            redirects.append((query, update))
+
+    monkeypatch.setattr(app, "parties_collection", FakeParties(docs))
+    monkeypatch.setattr(app, "party_redirects_collection", Redirects())
+    monkeypatch.setattr(app, "listing_changes_collection", None)
+    monkeypatch.setattr(app, "_revalidate_parties", lambda ps: None)
+
+    app.run_listing_housekeeping()
+    assert redirects == [({"fromSlug": {"$in": ["shtuby-copy-october-2026"]}, "toSlug": "shtuby-october-2026"},
+                          {"$set": {"toSlug": "shtuby-2026-10-16"}})]
+

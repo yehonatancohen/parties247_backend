@@ -101,6 +101,13 @@ looks more like the process getting stuck or running low on memory than pure req
 queueing. If it recurs, check Render's memory graph for that window before assuming
 this cache alone will explain it.
 
+`GET /api/admin/export?from=&to=` (admin Excel export): `load_export` runs its seven reads
+in parallel (one after another they took ~21s over the Atlas link) and `export_data.py`
+(pure, tested) joins them. Views are grouped in Mongo, never pulled raw; the click
+projection leaves out IPs and user agents, the goout_sales one takes only `ticket_stats` and
+`sales_per_date` from `endone_stats` (the rest holds buyer lists). Counting matches the
+funnel (bots included, shown separately); merged listings fold into their keeper.
+
 Every new endpoint or classifier change should come with a test in `tests/` and an
 OpenAPI entry. `test_*.py` at repo root are live scrape scripts, not unit tests.
 

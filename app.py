@@ -40,11 +40,13 @@ from pydantic import BaseModel, ValidationError
 from flask_apscheduler import APScheduler
 from flask_compress import Compress
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 
 import promo
 import wa_facts
 import listings
+import export_data
 
 # --- App setup ---
 load_dotenv()
@@ -3223,6 +3225,132 @@ def analytics_attribution():
     return jsonify(data), 200
 
 
+_EXPORT_PARTY_PROJECTION = {
+    "name": 1, "slug": 1, "date": 1, "startsAt": 1, "goOutEventId": 1, "mergedInto": 1,
+    "listingStatus": 1, "region": 1, "location": 1, "musicType": 1, "ticketPrice": 1,
+}
+# No clientIp / userAgent / full referer: the file leaves the system.
+_EXPORT_CLICK_PROJECTION = {
+    "_id": 0, "createdAt": 1, "partyId": 1, "partyName": 1, "channel": 1, "deviceType": 1,
+    "firstSource": 1, "firstMedium": 1, "firstCampaign": 1, "firstReferrerHost": 1,
+    "landingPath": 1, "waCode": 1, "sessionId": 1, "referer": 1,
+}
+# Only these two endone_stats paths: the rest holds buyer lists.
+_EXPORT_SNAPSHOT_PROJECTION = {
+    "_id": 0, "go_out_id": 1, "account_id": 1, "views": 1, "real_own_revenue": 1,
+    "endone_stats.ticket_stats": 1, "endone_stats.sales_per_date.dates": 1,
+}
+
+
+def _israel_midnight_utc(day: str) -> datetime:
+    local = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=JERUSALEM_TZ)
+    return local.astimezone(timezone.utc)
+
+
+def load_export(start: datetime | None, end: datetime) -> dict:
+    """Read the window from Mongo (views grouped there, never pulled raw) and join it."""
+    if analytics_collection is None or parties_collection is None or goout_sales_log_collection is None:
+        raise RuntimeError("Analytics datastore unavailable")
+    window = {"$gte": start, "$lt": end} if start else {"$lt": end}
+    match = {"category": "party", "createdAt": window}
+
+    def load_parties():
+        return {str(p["_id"]): p for p in fetch_all_documents(parties_collection, projection=_EXPORT_PARTY_PROJECTION)
+                if p.get("_id") is not None}
+
+    def load_view_buckets():
+        return [{
+            "partyId": doc["_id"].get("partyId"), "day": doc["_id"].get("day"),
+            "action": doc["_id"].get("action"), "channel": doc["_id"].get("channel"),
+            "bot": doc["_id"].get("bot"), "count": doc.get("count"),
+        } for doc in analytics_collection.aggregate([
+            {"$match": match},
+            {"$group": {"_id": {
+                "partyId": "$partyId", "action": "$action", "channel": "$channel",
+                "bot": {"$eq": ["$deviceType", "bot"]},
+                "day": {"$dateToString": {"format": "%Y-%m-%d", "date": "$createdAt", "timezone": "Asia/Jerusalem"}},
+            }, "count": {"$sum": 1}}},
+        ], allowDiskUse=True)]
+
+    def load_unique_sessions():
+        unique_sessions: dict[str, dict] = {}
+        for doc in analytics_collection.aggregate([
+            {"$match": {**match, "sessionId": {"$nin": [None, ""]}}},
+            {"$group": {"_id": {"partyId": "$partyId", "action": "$action", "sessionId": "$sessionId"}}},
+            {"$group": {"_id": {"partyId": "$_id.partyId", "action": "$_id.action"}, "n": {"$sum": 1}}},
+        ], allowDiskUse=True):
+            pid = doc["_id"].get("partyId")
+            if pid:
+                unique_sessions.setdefault(str(pid), {})[doc["_id"].get("action")] = doc.get("n") or 0
+        return unique_sessions
+
+    def load_clicks():
+        # Clicks from 24h before the window too, so a sale right after it opens
+        # still sees the click that led to it.
+        click_window = {"$gte": start - export_data.CLICK_TO_SALE_WINDOW, "$lt": end} if start else {"$lt": end}
+        clicks = []
+        for click in analytics_collection.find({"category": "party", "action": "redirect", "createdAt": click_window},
+                                               _EXPORT_CLICK_PROJECTION):
+            referer = click.pop("referer", None)
+            if referer and not click.get("firstReferrerHost"):
+                click["refererHost"] = urlparse(referer).hostname
+            clicks.append(click)
+        return clicks
+
+    def load_sales():
+        return list(goout_sales_log_collection.find(
+            {"recorded_at": window},
+            {"_id": 0, "account_id": 1, "go_out_id": 1, "event_name": 1, "delta_confirmed": 1,
+             "delta_event_revenue": 1, "ticket_price": 1, "revenue_earned": 1, "recorded_at": 1,
+             "source": 1, "double_count_fix": 1, "fee_change": 1},
+        ))
+
+    def load_snapshots():
+        if goout_sales_collection is None:
+            return []
+        return fetch_all_documents(goout_sales_collection, projection=_EXPORT_SNAPSHOT_PROJECTION)
+
+    # Seven independent reads over the slow Render<->Atlas link: ~21s one after
+    # another, about as long as the slowest one (the view grouping) in parallel.
+    loaders = {"parties": load_parties, "view_buckets": load_view_buckets,
+               "unique_sessions": load_unique_sessions, "clicks": load_clicks,
+               "sales": load_sales, "snapshots": load_snapshots,
+               "lifetime_by_event": lambda: _sales_totals_by_event_id(cutoff=None)}
+    with ThreadPoolExecutor(max_workers=len(loaders)) as pool:
+        futures = {name: pool.submit(fn) for name, fn in loaders.items()}
+        loaded = {name: future.result() for name, future in futures.items()}
+
+    return export_data.build_export(start=start, end=end, now=datetime.now(timezone.utc), **loaded)
+
+
+@app.route("/api/admin/export", methods=["GET"])
+@limiter.limit("10 per minute")
+@protect
+def admin_export():
+    """Everything in one window for the admin's Excel export (see export_data.py).
+    Query: from=YYYY-MM-DD (omit for all time), to=YYYY-MM-DD (inclusive, default
+    today), both Israel-local days."""
+    today = datetime.now(JERUSALEM_TZ).strftime("%Y-%m-%d")
+    raw_from = (request.args.get("from") or "").strip()
+    raw_to = (request.args.get("to") or "").strip() or today
+    try:
+        start = _israel_midnight_utc(raw_from) if raw_from else None
+        end = _israel_midnight_utc(raw_to) + timedelta(days=1)
+    except ValueError:
+        return jsonify({"message": "Dates must be YYYY-MM-DD."}), 400
+    if start and start >= end:
+        return jsonify({"message": "'from' must be on or before 'to'."}), 400
+    try:
+        data = _admin_cached(f"export:{raw_from}:{raw_to}", lambda: load_export(start, end),
+                             stamp=_sales_log_stamp())
+    except RuntimeError:
+        return jsonify({"message": "Analytics datastore unavailable."}), 503
+    except Exception as exc:
+        app.logger.error(f"Failed to build export: {exc}")
+        return jsonify({"message": "Failed to build export."}), 500
+    return jsonify(data), 200
+
+
 @app.route("/api/admin/analytics/funnel", methods=["GET"])
 @limiter.limit("30 per minute")
 @protect
@@ -4144,6 +4272,19 @@ OPENAPI_TEMPLATE = {
                 "description": "Upcoming listed parties in the order the site shows them: perTicket (our ₪ per ticket, from the party's own commission if set, else account1 flat fee / account2 6%), views/redirects (site counters), tickets (lifetime, any of our links), ticketsPer100Views (buy likelihood, shrunk toward the site average), score = perTicket x ticketsPer100Views (expected ₪ per 100 views; 0 when sold out), rankScore (0-100, the only figure the public site gets) and position.",
                 "security": [{"bearerAuth": []}],
                 "responses": {"200": {"description": "{generatedAt, defaults: {account1FlatFee, account2Percent}, parties: [...]}"}},
+            }
+        },
+        "/api/admin/export": {
+            "get": {
+                "summary": "Data export for one date range (admin Excel download)",
+                "description": "Everything that happened in the window, joined per party: site views (grouped per party per Israel day, bots counted like the dashboard and also shown separately), every click to GoOut, every sale row from goout_sales_log (with the clicks on that party in the 24h before it), per-day totals, channels, GoOut's own per-day ticket record and lifetime counters. from/to are Israel-local days, to inclusive; no from = all time. Times are Israel local. No IPs, user agents or buyer details.",
+                "security": [{"bearerAuth": []}],
+                "parameters": [
+                    {"name": "from", "in": "query", "required": False, "schema": {"type": "string", "format": "date"}},
+                    {"name": "to", "in": "query", "required": False, "schema": {"type": "string", "format": "date"}},
+                ],
+                "responses": {"200": {"description": "{range, totals, parties, sales, clicks, daily, partyDaily, channels, goOutDaily}"},
+                              "400": {"description": "Bad date."}},
             }
         },
         "/api/admin/parties/{party_id}/commission": {

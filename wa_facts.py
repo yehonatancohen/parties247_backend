@@ -14,7 +14,7 @@ split as promo.py. Two jobs live here:
    chatId): the dataset a future recommender trains on.
 
 Revenue model mirrors promo.py / the fetcher's sales_tracker.py exactly:
-account1 = flat ₪25/ticket, account2 = 6% of ticket price. Sales here are
+account1 = flat ₪15/ticket, account2 = 6% of ticket price. Sales here are
 correlational (GoOut exposes no per-link attribution) and every fact row
 says so explicitly rather than presenting a time-window count as verified.
 """

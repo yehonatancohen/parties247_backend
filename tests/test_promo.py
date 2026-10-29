@@ -53,7 +53,7 @@ def test_account_tier_and_commission():
     assert promo.account_tier((), referral_code="ref1", account1_referral="ref1") == "account1"
     assert promo.account_tier((), referral_code="ref2", account1_referral="ref1") == "account2"
 
-    assert promo.expected_commission_per_ticket("account1", 200) == 25.0
+    assert promo.expected_commission_per_ticket("account1", 200) == 15.0
     assert promo.expected_commission_per_ticket("account2", 200) == 12.0
     # unknown price falls back to the default estimate rather than zero
     assert promo.expected_commission_per_ticket("account2", None) == promo.DEFAULT_TICKET_PRICE * promo.ACCOUNT2_PCT
@@ -78,12 +78,12 @@ def test_rank_prefers_account1_and_demand_and_urgency():
     )
     ids = [c["partyId"] for c in ranked]
     assert "past" not in ids and "too-far" not in ids and "no-url" not in ids
-    # account1 with zero sales (₪25 × 1 × 1.0 = 25) beats account2 with 3 recent
-    # sales far out (₪4.8 × 4 × 1.0 = 19.2) and account2 soon (₪4.8 × 1 × 2.0 = 9.6)
-    assert ids == ["a1", "a2-far", "a2-soon"]
-    a1 = ranked[0]
-    assert a1["tier"] == "account1" and a1["expectedPerTicket"] == 25.0 and a1["score"] == 25.0
-    assert ranked[1]["ticketsLast30d"] == 3 and ranked[1]["revenueLast30d"] == 14.4
+    # account2 with 3 recent sales far out (₪4.8 × 4 × 1.0 = 19.2) beats account1 with
+    # zero sales (₪15 × 1 × 1.0 = 15), which beats account2 soon (₪4.8 × 1 × 2.0 = 9.6)
+    assert ids == ["a2-far", "a1", "a2-soon"]
+    a1 = ranked[1]
+    assert a1["tier"] == "account1" and a1["expectedPerTicket"] == 15.0 and a1["score"] == 15.0
+    assert ranked[0]["ticketsLast30d"] == 3 and ranked[0]["revenueLast30d"] == 14.4
     assert ranked[2]["daysUntil"] < 2 and ranked[2]["score"] == 9.6
     assert a1["siteUrl"] == "https://www.parties247.co.il/event/a1"
 
@@ -185,7 +185,7 @@ def test_commission_by_party_tiers_earnings_and_upcoming_only():
         account1_referral="acc1code",
     )
     assert set(out) == {"a1", "a2", "a3", "ref"}
-    assert out["a1"] == {"tier": "account1", "perTicket": 25.0, "perTicketEstimated": False, "commission": None,
+    assert out["a1"] == {"tier": "account1", "perTicket": 15.0, "perTicketEstimated": False, "commission": None,
                          "ticketPrice": 80.0, "ticketsSold": 6, "earned": 150.0}
     assert out["a2"]["tier"] == "account2" and out["a2"]["perTicket"] == 7.2 and out["a2"]["earned"] == 0.0
     assert out["a3"]["perTicketEstimated"] is True

@@ -1237,7 +1237,7 @@ def build_sales_by_party() -> list[dict]:
             "eventName": sanitize_analytics_text(doc.get("event_name")),
             "confirmedTickets": int(doc.get("confirmed_count") or 0),
             "pendingTickets": int(doc.get("pending_count") or 0),
-            # totalRevenue is OUR calculated revenue (account1: flat ₪25/ticket,
+            # totalRevenue is OUR calculated revenue (account1: flat ₪15/ticket,
             # account2: 6% of gross event revenue) via sales_tracker.py's
             # _calc_revenue — not GoOut's own revenue figures. See realOwnRevenue
             # below for GoOut's raw (informational) gross numbers.
@@ -4112,7 +4112,7 @@ OPENAPI_TEMPLATE = {
         "/api/admin/parties/commission": {
             "get": {
                 "summary": "Commission per upcoming party",
-                "description": "For every upcoming party, keyed by party id: our commission per ticket (the party's own commission deal if set, else account1 flat ₪25 / account2 6% of the ticket price; perTicketEstimated when the price is unknown) and lifetime tickets/commission from goout_sales_log.",
+                "description": "For every upcoming party, keyed by party id: our commission per ticket (the party's own commission deal if set, else account1 flat ₪15 / account2 6% of the ticket price; perTicketEstimated when the price is unknown) and lifetime tickets/commission from goout_sales_log.",
                 "security": [{"bearerAuth": []}],
                 "responses": {
                     "200": {

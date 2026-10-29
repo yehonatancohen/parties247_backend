@@ -7,7 +7,7 @@ them. The `/api/admin/promo/whatsapp` route in app.py gathers the data and calls
 in here; keeping this module import-free makes it trivially unit-testable.
 
 Revenue model (see workspace root CLAUDE.md):
-- account1 parties: flat ₪25 per ticket  -> always the top tier
+- account1 parties: flat ₪15 per ticket (₪25 until October 2026)
 - account2 parties: 6% of the ticket price
 - a party's own `commission` ({"type": "fixed"|"percent", "value"}), set in the
   admin, overrides both for that party.
@@ -25,10 +25,10 @@ from zoneinfo import ZoneInfo
 ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
 
 # Set ACCOUNT1_FLAT_FEE on Render when the account1 deal changes (the owner
-# said on 2026-10-10 it is about to drop to ₪15). This is the *expected* fee
+# moved it from ₪25 to ₪15 on 2026-10-29, for every sale from October on). This is the *expected* fee
 # used for ranking and for choosing which duplicate listing to keep; recorded
 # sales keep whatever the sales tracker logged at the time.
-ACCOUNT1_FLAT_FEE = float(os.environ.get("ACCOUNT1_FLAT_FEE") or 25.0)
+ACCOUNT1_FLAT_FEE = float(os.environ.get("ACCOUNT1_FLAT_FEE") or 15.0)
 ACCOUNT2_PCT = 0.06
 # Used only to estimate account2 commission when a party has no scraped price yet.
 DEFAULT_TICKET_PRICE = 100.0

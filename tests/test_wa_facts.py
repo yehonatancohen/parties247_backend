@@ -36,7 +36,7 @@ def test_build_party_features_snapshots_tier_and_hours_until():
         ticket_totals={"confirmed_count": 5}, now=now,
     )
     assert features["tier"] == "account1"
-    assert features["expectedPerTicket"] == 25.0
+    assert features["expectedPerTicket"] == 15.0
     assert features["ticketsSoldBefore"] == 5
     assert features["goOutEventId"] == "111"
     assert features["hoursUntilParty"] > 0  # party is in the future
@@ -204,8 +204,8 @@ def test_build_send_facts_sales_delta_and_commission_account1():
     assert s["baselineAcceptedPer24h"] == 2   # 12 - 10 over the prior 24h
     assert s["acceptedDelta6h"] == 4          # 16 - 12
     assert s["acceptedDelta24h"] == 8         # 20 - 12
-    assert s["estCommission6h"] == 100.0      # account1: 4 tickets * ₪25
-    assert s["estCommission24h"] == 200.0
+    assert s["estCommission6h"] == 60.0       # account1: 4 tickets * ₪15
+    assert s["estCommission24h"] == 120.0     # 8 tickets * ₪15
 
 
 def test_build_send_facts_sales_uses_account2_percentage():

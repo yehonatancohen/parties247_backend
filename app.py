@@ -4765,7 +4765,8 @@ OPENAPI_TEMPLATE = {
                                     "partyIds": {
                                         "type": "array",
                                         "items": {"type": "string"}
-                                    }
+                                    },
+                                    "manualOrder": {"type": "boolean"}
                                 }
                             }
                         }
@@ -5156,7 +5157,8 @@ OPENAPI_TEMPLATE = {
                     "partyIds": {
                         "type": "array",
                         "items": {"type": "string"}
-                    }
+                    },
+                    "manualOrder": {"type": "boolean", "description": "When true the site shows partyIds in saved order instead of by date."}
                 },
                 "additionalProperties": True,
             },
@@ -5510,6 +5512,10 @@ class CarouselUpdateSchema(BaseModel):
 
 class CarouselPartiesUpdateSchema(BaseModel):
     partyIds: list[str]
+    # True: the public site shows this carousel in exactly partyIds order
+    # (admin-curated). False/absent leaves the flag untouched -- the fetcher's
+    # auto-assign PUTs never send it, so they can't switch manual order off.
+    manualOrder: bool | None = None
     class Config:
         extra = "forbid"
 
@@ -6325,6 +6331,14 @@ def get_parties():
 # --- Carousels ---
 
 
+def build_carousel_parties_update(party_ids: list[str], manual_order: bool | None) -> dict:
+    """$set payload for replacing a carousel's party list (manualOrder only when given)."""
+    fields: dict = {"partyIds": party_ids}
+    if manual_order is not None:
+        fields["manualOrder"] = manual_order
+    return fields
+
+
 def serialize_carousel(doc: dict) -> dict:
     data = dict(doc or {})
     raw_id = data.pop("_id", None)
@@ -6857,11 +6871,12 @@ def update_carousel_parties(carousel_id):
             missing = [pid for pid in normalized_ids if pid not in existing_ids]
             if missing:
                 return jsonify({"message": "Some parties do not exist.", "missing": missing}), 400
-        result = carousels_collection.update_one({"_id": obj_id}, {"$set": {"partyIds": normalized_ids}})
+        set_fields = build_carousel_parties_update(normalized_ids, update.manualOrder)
+        result = carousels_collection.update_one({"_id": obj_id}, {"$set": set_fields})
         if result.matched_count == 0:
             return jsonify({"message": "Carousel not found"}), 404
         updated_doc = carousels_collection.find_one({"_id": obj_id}) or {}
-        record_admin_action("update_carousel_parties", "carousel", carousel_id, {"partyCount": len(normalized_ids)})
+        record_admin_action("update_carousel_parties", "carousel", carousel_id, {"partyCount": len(normalized_ids), "manualOrder": update.manualOrder})
         return (
             jsonify({"message": "Carousel parties updated successfully!", "carousel": serialize_carousel(updated_doc)}),
             200,

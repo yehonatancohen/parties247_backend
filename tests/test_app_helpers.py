@@ -380,3 +380,9 @@ def test_default_referral_code_is_cached(monkeypatch):
     assert app.default_referral_code() == 'cached-ref'
     assert app.default_referral_code() == 'cached-ref'
     assert calls["n"] == 1
+
+
+def test_build_carousel_parties_update_sets_manual_order_only_when_given():
+    assert app.build_carousel_parties_update(["a", "b"], None) == {"partyIds": ["a", "b"]}
+    assert app.build_carousel_parties_update(["a"], True) == {"partyIds": ["a"], "manualOrder": True}
+    assert app.build_carousel_parties_update([], False) == {"partyIds": [], "manualOrder": False}
